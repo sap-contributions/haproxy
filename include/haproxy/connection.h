@@ -696,6 +696,20 @@ static inline int conn_is_ssl(struct connection *conn)
 	return !!conn_get_ssl_sock_ctx(conn);
 }
 
+/*
+ * Prepare TLV argument for redirecting fetches.
+ * Note that it is not possible to use an argument check function
+ * as that would require us to allow arguments for functions
+ * that do not need it. Alternatively, the sample logic could be
+ * adjusted to perform checks for no arguments and allocate
+ * in the check function. However, this does not seem worth the trouble.
+ */
+static inline void set_tlv_arg(int tlv_type, struct arg *tlv_arg)
+{
+	tlv_arg->type = ARGT_SINT;
+	tlv_arg->data.sint = tlv_type;
+}
+
 #endif /* _HAPROXY_CONNECTION_H */
 
 /*
