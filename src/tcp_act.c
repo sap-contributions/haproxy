@@ -27,6 +27,7 @@
 #include <haproxy/action-t.h>
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/connection.h>
 #include <haproxy/global.h>
@@ -407,6 +408,38 @@ static enum act_return tcp_action_set_tos(struct act_rule *rule, struct proxy *p
 #endif
 
 /*
+ * Prepare the arguments for conn_set_tlv by converting the user input
+ */
+static enum act_return tcp_action_set_tlv(struct act_rule *rule, struct proxy *px,
+		struct session *sess, struct stream *s, int flags)
+{
+	struct sample *smp = NULL;
+
+	/* Fetch the argument value */
+	smp = sample_fetch_as_type(px, sess, s, 0, rule->arg.act.p[1], SMP_T_STR);
+
+	if (smp) {
+		/* Check whether the argument can be converted to a string */
+		if (sample_casts[smp->data.type][SMP_T_STR] &&
+				sample_casts[smp->data.type][SMP_T_STR](smp)) {
+			struct ist value = ist2(smp->data.u.str.area, smp->data.u.str.data);
+
+			if (conn_set_tlv(objt_conn(sess->origin), (uintptr_t)rule->arg.act.p[0], value.ptr, value.len) < 0)
+				return ACT_RET_ERR;
+		}
+	}
+	return ACT_RET_CONT;
+}
+
+/*
+ * Release the sample expr when releasing a set tlv action
+ */
+static void release_set_tlv_action(struct act_rule *rule)
+{
+	release_sample_expr(rule->arg.act.p[1]);
+}
+
+/*
  * Release the sample expr when releasing attach-srv action
  */
 static void release_attach_srv_action(struct act_rule *rule)
@@ -686,6 +719,63 @@ static enum act_parse_ret tcp_parse_silent_drop(const char **args, int *cur_arg,
 	return ACT_RET_PRS_OK;
 }
 
+/* Parse a "set-tlv" action. It takes the TLV ID as argument which can be set to a
+ * sample expression. It returns ACT_RET_PRS_OK on success, ACT_RET_PRS_ERR on error.
+ */
+static enum act_parse_ret tcp_parse_set_tlv(const char **args, int *cur_arg, struct proxy *px,
+		struct act_rule *rule, char **err)
+{
+	const char *cmd_name = args[*cur_arg-1];
+	struct sample_expr *expr = NULL;
+
+	char *error = NULL;
+	unsigned int tlv_id = 0;
+
+	expr = sample_parse_expr((char **)args, cur_arg, px->conf.args.file, px->conf.args.line, err, &px->conf.args, NULL);
+	if (!expr || !expr->fetch->val)
+		return ACT_RET_PRS_ERR;
+
+	cmd_name += strlen("set-tlv");
+
+	if (*cmd_name == '(') {
+		cmd_name++; /* skip the '(' */
+		errno = 0;
+		tlv_id = strtoul(cmd_name, &error, 0); /* convert TLV ID */
+		if (errno == EINVAL) {
+			memprintf(err, "Invalid %s. Could not find a valid number", args[*cur_arg-1]);
+			return ACT_RET_PRS_ERR;
+		}
+		if (errno != 0) {
+			memprintf(err, "Invalid %s. Could not convert TLV ID", args[*cur_arg-1]);
+			return ACT_RET_PRS_ERR;
+		}
+		if (*error != ')') {
+			memprintf(err, "Invalid %s. Expects set-tlv(<TLV ID>)", args[*cur_arg-1]);
+			return ACT_RET_PRS_ERR;
+		}
+		if (tlv_id > 0xff) {
+			memprintf(err, "Invalid TLV ID '%s'. The maximum allowed TLV ID is %d.",
+					args[*cur_arg-1], 0xff);
+			return ACT_RET_PRS_ERR;
+		}
+
+		/* prepare a custom action with the parsed sample expression and the TLV ID argument */
+		rule->arg.act.p[0] = (void *)(uintptr_t)tlv_id;
+		rule->arg.act.p[1] = (void *)(uintptr_t)expr;
+
+		rule->action = ACT_CUSTOM;
+
+		rule->action_ptr = tcp_action_set_tlv;
+		rule->release_ptr = release_set_tlv_action;
+	} else {
+		memprintf(err, "Invalid syntax '%s'. Expects set-tlv(<TLV ID>) <expr>", args[*cur_arg-1]);
+		return ACT_RET_PRS_ERR;
+	}
+
+	(*cur_arg)++;
+
+	return ACT_RET_PRS_OK;
+}
 
 static struct action_kw_list tcp_req_conn_actions = {ILH, {
 	{ "set-dst"     , tcp_parse_set_src_dst },
@@ -695,6 +785,7 @@ static struct action_kw_list tcp_req_conn_actions = {ILH, {
 	{ "set-src-port", tcp_parse_set_src_dst },
 	{ "set-tos",      tcp_parse_set_tos     },
 	{ "silent-drop",  tcp_parse_silent_drop },
+	{ "set-tlv",      tcp_parse_set_tlv, KWF_MATCH_PREFIX },
 	{ /* END */ }
 }};
 
@@ -709,6 +800,7 @@ static struct action_kw_list tcp_req_sess_actions = {ILH, {
 	{ "set-src-port", tcp_parse_set_src_dst },
 	{ "set-tos",      tcp_parse_set_tos     },
 	{ "silent-drop",  tcp_parse_silent_drop },
+	{ "set-tlv",      tcp_parse_set_tlv, KWF_MATCH_PREFIX },
 	{ /* END */ }
 }};
 
@@ -722,6 +814,7 @@ static struct action_kw_list tcp_req_cont_actions = {ILH, {
 	{ "set-mark",     tcp_parse_set_mark    },
 	{ "set-tos",      tcp_parse_set_tos     },
 	{ "silent-drop",  tcp_parse_silent_drop },
+	{ "set-tlv",      tcp_parse_set_tlv, KWF_MATCH_PREFIX },
 	{ /* END */ }
 }};
 
@@ -730,7 +823,8 @@ INITCALL1(STG_REGISTER, tcp_req_cont_keywords_register, &tcp_req_cont_actions);
 static struct action_kw_list tcp_res_cont_actions = {ILH, {
 	{ "set-mark",     tcp_parse_set_mark   },
 	{ "set-tos",      tcp_parse_set_tos     },
-	{ "silent-drop", tcp_parse_silent_drop },
+	{ "silent-drop",  tcp_parse_silent_drop },
+	{ "set-tlv",      tcp_parse_set_tlv, KWF_MATCH_PREFIX },
 	{ /* END */ }
 }};
 
@@ -744,6 +838,7 @@ static struct action_kw_list http_req_actions = {ILH, {
 	{ "set-src-port", tcp_parse_set_src_dst },
 	{ "set-tos",      tcp_parse_set_tos     },
 	{ "silent-drop",  tcp_parse_silent_drop },
+	{ "set-tlv",      tcp_parse_set_tlv, KWF_MATCH_PREFIX },
 	{ /* END */ }
 }};
 
@@ -753,6 +848,7 @@ static struct action_kw_list http_res_actions = {ILH, {
 	{ "set-mark",    tcp_parse_set_mark    },
 	{ "set-tos",     tcp_parse_set_tos    },
 	{ "silent-drop", tcp_parse_silent_drop },
+	{ "set-tlv",     tcp_parse_set_tlv, KWF_MATCH_PREFIX },
 	{ /* END */ }
 }};
 

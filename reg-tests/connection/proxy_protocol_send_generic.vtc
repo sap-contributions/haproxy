@@ -22,6 +22,10 @@ haproxy h1 -conf {
         http-request set-var(txn.custom_tlv_b) fc_pp_tlv(226)
         http-after-response set-header proxy_custom_tlv_b %[var(txn.custom_tlv_b)]
 
+        http-request set-tlv(0xE3) str("bar")
+        http-request set-var(txn.custom_tlv_c) fc_pp_tlv(0343)
+        http-after-response set-header proxy_custom_tlv_c %[var(txn.custom_tlv_c)]
+
         http-request return status 200
 } -start
 
@@ -31,4 +35,5 @@ client c1 -connect ${h1_feS_sock} {
     rxresp
     expect resp.http.proxy_custom_tlv_a == "foo"
     expect resp.http.proxy_custom_tlv_b == ""
+    expect resp.http.proxy_custom_tlv_c == "bar"
 } -run

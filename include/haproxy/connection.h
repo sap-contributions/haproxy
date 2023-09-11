@@ -451,6 +451,78 @@ static inline void conn_set_tos(const struct connection *conn, int tos)
 #endif
 }
 
+/* Adds or updates a TLV item on an existing connection.
+ * The connection is tested and if it is null, nothing is done.
+ */
+static inline int conn_set_tlv(struct connection *conn, int type, void *value, int len)
+{
+	struct conn_tlv_list *tlv = NULL, *tlv_back = NULL;
+	int reuse = 0, found = 0;
+
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS) || len > HA_PP2_MAX_ALLOC)
+		return -1;
+	/* search whether we already have a TLV of the requested type */
+	list_for_each_entry(tlv, &conn->tlv_list, list) {
+		if (tlv->type != type)
+			continue;
+		/* Set reuse flag according to whether both, new and old TLV,
+		 * are in the same interval.
+		 */
+		if (len >= 0) {
+			if (tlv->len <= HA_PP2_TLV_VALUE_128 && len <= HA_PP2_TLV_VALUE_128)
+				reuse = 1;
+			else if (tlv->len > HA_PP2_TLV_VALUE_128 && len > HA_PP2_TLV_VALUE_128) {
+				if ((tlv->len <= HA_PP2_TLV_VALUE_256 && len <= HA_PP2_TLV_VALUE_256)
+					|| (tlv->len > HA_PP2_TLV_VALUE_256 && len > HA_PP2_TLV_VALUE_256)) {
+					reuse = 1;
+				}
+			}
+		}
+		found = 1;
+		break;
+	}
+	if (found && reuse) {
+		/* We have found the TLV and it fits in the already allocated
+		 * memory, in-place editing is enough. freeing logic stays
+		 * identical since the length still maps to the old pool.
+		 */
+		memcpy(tlv->value, value, len);
+		tlv->len = len;
+		return 0;
+	}
+
+	if (found) {
+		/* first, we need to free the previous TLV item */
+		list_for_each_entry_safe(tlv, tlv_back, &conn->tlv_list, list) {
+			if (tlv->type != type)
+				continue;
+
+			LIST_DELETE(&tlv->list);
+			if (tlv->len > HA_PP2_TLV_VALUE_256)
+				free(tlv);
+			else if (tlv->len < HA_PP2_TLV_VALUE_128)
+				pool_free(pool_head_pp_tlv_128, tlv);
+			else
+				pool_free(pool_head_pp_tlv_256, tlv);
+		}
+	}
+
+	if (len > HA_PP2_TLV_VALUE_256)
+		tlv = malloc(len + sizeof(struct conn_tlv_list));
+	else if (len <= HA_PP2_TLV_VALUE_128)
+		tlv = pool_alloc(pool_head_pp_tlv_128);
+	else
+		tlv = pool_alloc(pool_head_pp_tlv_256);
+
+	if (unlikely(!tlv))
+		return -1;
+
+	tlv->len = len;
+
+	LIST_APPEND(&conn->tlv_list, &tlv->list);
+	return 0;
+}
+
 /* Sets the netfilter mark on the connection's socket. The connection is tested
  * and if it is null, nothing is done.
  */
