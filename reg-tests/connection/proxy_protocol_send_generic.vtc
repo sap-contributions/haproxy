@@ -24,6 +24,33 @@ haproxy h1 -conf {
         http-request set-var(txn.custom_tlv_b) fc_pp_tlv(0xE2)
         http-after-response set-header proxy_custom_tlv_b %[var(txn.custom_tlv_b)]
 
+        http-request set-tlv(0xE3) str("bar")
+        http-request set-var(txn.custom_tlv_c) fc_pp_tlv(0xE3)
+        http-after-response set-header proxy_custom_tlv_c %[var(txn.custom_tlv_c)]
+
+        # Check that we can alter the TLV in the connection on http-request level.
+        http-request set-tlv(0xE3) str("bar")
+        http-request set-var(txn.custom_tlv_c) fc_pp_tlv(0xE3)
+        http-after-response set-header proxy_custom_tlv_c %[var(txn.custom_tlv_c)]
+
+        # Check that we can alter the TLV in the connection on tcp-content level.
+        tcp-request content set-tlv(0xE4) str("bar")
+        http-request set-var(txn.custom_tlv_d) fc_pp_tlv(0xE4)
+        http-after-response set-header proxy_custom_tlv_d %[var(txn.custom_tlv_d)]
+
+        # Check that we can overwrite an existing TLV.
+        tcp-request content set-tlv(0xE5) str("bar")
+        http-request set-var(txn.custom_tlv_e) fc_pp_tlv(0xE5)
+        http-after-response set-header proxy_custom_tlv_e %[var(txn.custom_tlv_e)]
+
+        # Check that we can move from a small to a medium pool with length 129.
+        tcp-request content set-tlv(0xE6) str("                                                                                                                                 ")
+        http-request set-var(txn.custom_tlv_f) fc_pp_tlv(0xE6)
+        http-after-response set-header proxy_custom_tlv_f %[var(txn.custom_tlv_f),length]
+
+        # Note that we do not check for an invalid TLV ID as that would result in an
+        # parser error anway.
+
         http-request return status 200
 } -start
 
@@ -32,4 +59,8 @@ client c1 -connect ${h1_feS_sock} {
     rxresp
     expect resp.http.proxy_custom_tlv_a == "foo"
     expect resp.http.proxy_custom_tlv_b == ""
+    expect resp.http.proxy_custom_tlv_c == "bar"
+    expect resp.http.proxy_custom_tlv_d == "bar"
+    expect resp.http.proxy_custom_tlv_e == "bar"
+    expect resp.http.proxy_custom_tlv_f == 129
 } -run
