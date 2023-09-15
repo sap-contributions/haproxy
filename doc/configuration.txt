@@ -16671,6 +16671,26 @@ proxy-v2-options <option>[,<option>]*
                 generated unique ID is also used for the first HTTP request
                 within a Keep-Alive connection.
 
+  Besides, you can specify the type of TLV numerically instead.
+
+  Example 1:
+  server example 127.0.0.1:2319 send-proxy-v2 proxy-v2-options crc32c,0xEE
+
+  The following logic applies: By default, the remote frontend connection is
+  searched for the value 0xEE. If found, it is simply forwarded. Otherwise,
+  a TLV with the ID "0xEE" and empty payload is sent out. In addition, crc32c
+  is also set here.
+
+  You can also specify a key-value pair <id>=<fmt> syntax. <id> represents the
+  8 bit TLV type field in the range of 0 to 255. It can be expressed in decimal
+  or hexadecimal format (prefixed by "0x").
+
+  Example 2:
+  server example_server 127.0.0.1:2319 send-proxy-v2 proxy-v2-options 0xEE=%[str("foo")]
+
+  This will always send out the value "foo". Another common use case would be to
+  reference a variable.
+
 send-proxy-v2-ssl
   The "send-proxy-v2-ssl" parameter enforces use of the PROXY protocol version
   2 over any connection established to this server. The PROXY protocol informs
