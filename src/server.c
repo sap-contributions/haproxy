@@ -1036,7 +1036,13 @@ static int srv_parse_proto(char **args, int *cur_arg,
 static int srv_parse_proxy_v2_options(char **args, int *cur_arg,
 				      struct proxy *px, struct server *newsrv, char **err)
 {
-	char *p, *n;
+	char *p = NULL, *n = NULL, *m = NULL;
+	char *key = NULL, *val = NULL;
+	char *endp = NULL;
+	unsigned char idx = 0;
+	size_t key_length = 0, val_length = 0;
+	struct srv_pp_tlv_list *srv_tlv = NULL;
+
 	for (p = args[*cur_arg+1]; p; p = n) {
 		n = strchr(p, ',');
 		if (n)
@@ -1061,13 +1067,61 @@ static int srv_parse_proxy_v2_options(char **args, int *cur_arg,
 			newsrv->pp_opts |= SRV_PP_V2_CRC32C;
 		} else if (strcmp(p, "unique-id") == 0) {
 			newsrv->pp_opts |= SRV_PP_V2_UNIQUE_ID;
-		} else
-			goto fail;
+		} else {
+			/* reset val in case it was set before */
+			val = NULL;
+
+			/* try to split by '=' into generic pair key value pair (<id>=<expr>) */
+			m = strchr(p, '=');
+			if (m) {
+				key_length = m - p;
+				key = (char *) malloc(key_length + 1);
+				if (unlikely(!key))
+					goto fail;
+				snprintf(key, key_length + 1, "%s", p);
+
+				val_length = strlen(p) - key_length;
+				val = (char *) malloc(val_length + 1);
+				if (unlikely(!val))
+					goto fail;
+				snprintf(val, val_length + 1, "%s", m + 1);
+			}
+			else {
+				key = (char *) malloc(strlen(p) + 1);
+				if (unlikely(!key))
+					goto fail;
+				snprintf(key, strlen(p) + 1, "%s", p);
+			}
+
+			errno = 0;
+			idx = strtoul(key, &endp, 0);
+			if (unlikely((endp && *endp) != '\0' || (key == endp) || (errno != 0)))
+				goto fail;
+
+			/* processing is done in connection.c */
+			srv_tlv = malloc(sizeof(struct srv_pp_tlv_list));
+			if (unlikely(!srv_tlv))
+				goto fail;
+
+			srv_tlv->type = idx;
+			LIST_INIT(&srv_tlv->fmt);
+			if (val && unlikely(!parse_logformat_string(val, px, &srv_tlv->fmt, LOG_OPT_HTTP, PR_CAP_LISTEN, err)))
+				goto fail;
+
+			LIST_APPEND(&newsrv->pp_tlvs, &srv_tlv->list);
+			free(key);
+			free(val);
+		}
 	}
 	return 0;
- fail:
+fail:
+	free(key);
+	free(val);
+	free(srv_tlv);
+	errno = 0;
+
 	if (err)
-		memprintf(err, "'%s' : proxy v2 option not implemented", p);
+		memprintf(err, "'%s' : failed to set proxy v2 option", p);
 	return ERR_ALERT | ERR_FATAL;
 }
 
@@ -2428,6 +2482,7 @@ struct server *new_server(struct proxy *proxy)
 	LIST_APPEND(&servers_list, &srv->global_list);
 	LIST_INIT(&srv->srv_rec_item);
 	LIST_INIT(&srv->ip_rec_item);
+	LIST_INIT(&srv->pp_tlvs);
 	MT_LIST_INIT(&srv->prev_deleted);
 	event_hdl_sub_list_init(&srv->e_subs);
 	srv->rid = 0; /* rid defaults to 0 */
@@ -2495,6 +2550,8 @@ void srv_free_params(struct server *srv)
 struct server *srv_drop(struct server *srv)
 {
 	struct server *next = NULL;
+	struct srv_pp_tlv_list *srv_tlv = NULL, *srv_tlv_back = NULL;
+	struct logformat_node *node = NULL, *node_back = NULL;
 
 	if (!srv)
 		goto end;
@@ -2526,6 +2583,15 @@ struct server *srv_drop(struct server *srv)
 	event_hdl_sub_list_destroy(&srv->e_subs);
 
 	EXTRA_COUNTERS_FREE(srv->extra_counters);
+
+	list_for_each_entry_safe(srv_tlv, srv_tlv_back, &srv->pp_tlvs, list) {
+		list_for_each_entry_safe(node, node_back, &srv_tlv->fmt, list) {
+			free(node->arg);
+			free(node->expr);
+			LIST_DELETE(&node->list);
+		}
+		LIST_DELETE(&srv_tlv->list);
+	}
 
 	ha_free(&srv);
 

@@ -256,6 +256,15 @@ enum __attribute__((__packed__)) srv_ws_mode {
 	SRV_WS_H2,
 };
 
+/* Server-side TLV list, contains the types of the TLVs that should be sent out.
+ * Additionally, it can contain data, if specified in the config.
+ */
+struct srv_pp_tlv_list {
+	struct list list;
+	struct list fmt;
+	unsigned char type;
+};
+
 struct proxy;
 struct server {
 	/* mostly config or admin stuff, doesn't change often */
@@ -421,6 +430,7 @@ struct server {
 	struct list srv_rec_item;		/* to attach server to a srv record item */
 	struct list ip_rec_item;		/* to attach server to a A or AAAA record item */
 	struct ebpt_node host_dn;		/* hostdn store for srvrq and state file matching*/
+	struct list pp_tlvs;			/* to send out PROXY protocol v2 TLVs */
 	struct task *srvrq_check;               /* Task testing SRV record expiration date for this server */
 	struct {
 		const char *file;		/* file where the section appears */
