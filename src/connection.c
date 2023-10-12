@@ -198,8 +198,9 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 		}
 
 		ret = conn->mux->wake(conn);
-		if (ret < 0)
+		if (ret < 0) {
 			goto done;
+		}
 
 		if (conn_in_list) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
