@@ -387,7 +387,7 @@ int conn_update_alpn(struct connection *conn, const struct ist alpn, int force)
 #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 	size_t alpn_len = istlen(alpn);
 	char *ctx_alpn_str = NULL;
-	int ctx_alpn_len = 0, found = 0;
+	int ctx_alpn_len = 0, found = 0;    
 
 	/* if not force, first search if alpn is a subset or identical to the
 	 * parent SSL_CTX.
