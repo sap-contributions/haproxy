@@ -880,7 +880,7 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 {
 	struct sched_activity tmp_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64)));
 	struct stconn *sc = appctx_sc(appctx);
-	struct buffer *name_buffer = get_trash_chunk();
+	struct buffer *name_buffer;
 	struct sched_activity *entry;
 	const struct tasklet *tl;
 	const struct task *t;
@@ -893,6 +893,8 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	/* FIXME: Don't watch the other side ! */
 	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
 		return 1;
+
+	name_buffer = get_trash_chunk();
 
 	/* It's not possible to scan queues in small chunks and yield in the
 	 * middle of the dump and come back again. So what we're doing instead
