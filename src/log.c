@@ -376,11 +376,11 @@ int add_to_logformat_list(char *start, char *end, int type, struct list *list_fo
 
 	if (type == LF_TEXT) { /* type text */
 		struct logformat_node *node = calloc(1, sizeof(*node));
-		if (!node) {
+		str = calloc(1, end - start + 1);
+		if (unlikely(!node || !str)) {
 			memprintf(err, "out of memory error");
 			return 0;
 		}
-		str = calloc(1, end - start + 1);
 		strncpy(str, start, end - start);
 		str[end - start] = '\0';
 		node->arg = str;
@@ -762,6 +762,8 @@ int resolve_logsrv(struct logsrv *logsrv, char **msg)
 struct logsrv *dup_logsrv(struct logsrv *def)
 {
 	struct logsrv *cpy = malloc(sizeof(*cpy));
+	if (unlikely(!cpy))
+		return NULL;
 
 	/* copy everything that can be easily copied */
 	memcpy(cpy, def, sizeof(*cpy));
