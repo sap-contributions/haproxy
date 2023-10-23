@@ -198,9 +198,8 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 		}
 
 		ret = conn->mux->wake(conn);
-		if (ret < 0) {
+		if (ret < 0)
 			goto done;
-		}
 
 		if (conn_in_list) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
@@ -387,7 +386,7 @@ int conn_update_alpn(struct connection *conn, const struct ist alpn, int force)
 #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 	size_t alpn_len = istlen(alpn);
 	char *ctx_alpn_str = NULL;
-	int ctx_alpn_len = 0, found = 0;    
+	int ctx_alpn_len = 0, found = 0;
 
 	/* if not force, first search if alpn is a subset or identical to the
 	 * parent SSL_CTX.
@@ -1927,7 +1926,6 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 	const struct sockaddr_storage *dst = &null_addr;
 	const char *value = "";
 	int value_len = 0;
-	int found = 0;
 
 	if (buf_len < PP2_HEADER_LEN)
 		return 0;
@@ -2003,10 +2001,14 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 		list_for_each_entry(srv_tlv, &srv->pp_tlvs, list) {
 			replace = NULL;
 
+			/* Users will always need to provide a value, in case of forwarding, they should use fc_pp_tlv.
+			 * for generic types. Otherwise, we will send an empty TLV.
+			 */
 			if (!LIST_ISEMPTY(&srv_tlv->fmt)) {
 				replace = alloc_trash_chunk();
 				if (unlikely(!replace))
 					return 0;
+
 				replace->data = build_logline(strm, replace->area, replace->size, &srv_tlv->fmt);
 
 				if (unlikely((buf_len - ret) < sizeof(struct tlv))) {
@@ -2017,23 +2019,8 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 				free_trash_chunk(replace);
 			}
 			else {
-				found = 0;
-				/* Fall back to use TLV value from remote connection, if available */
-				if (remote) {
-					struct conn_tlv_list *remote_tlv = NULL;
-
-					/* Search in remote connection TLV list */
-					list_for_each_entry(remote_tlv, &remote->tlv_list, list) {
-						if (remote_tlv->type != srv_tlv->type)
-							continue;
-						ret += make_tlv(&buf[ret], (buf_len - ret), srv_tlv->type, remote_tlv->len, remote_tlv->value);
-						found = 1;
-						break;
-					}
-				}
-				if (!found)
-					/* Create empty TLV as no value was specified */
-					ret += make_tlv(&buf[ret], (buf_len - ret), srv_tlv->type, 0, NULL);
+				/* Create empty TLV as no value was specified */
+				ret += make_tlv(&buf[ret], (buf_len - ret), srv_tlv->type, 0, NULL);
 			}
 		}
 	}

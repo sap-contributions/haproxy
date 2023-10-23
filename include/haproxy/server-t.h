@@ -257,11 +257,12 @@ enum __attribute__((__packed__)) srv_ws_mode {
 };
 
 /* Server-side TLV list, contains the types of the TLVs that should be sent out.
- * Additionally, it can contain data, if specified in the config.
+ * Additionally, it can contain a format string, if specified in the config.
  */
 struct srv_pp_tlv_list {
 	struct list list;
 	struct list fmt;
+	char *fmt_string;
 	unsigned char type;
 };
 
