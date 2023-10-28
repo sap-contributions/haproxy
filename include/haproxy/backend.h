@@ -33,6 +33,9 @@
 int assign_server(struct stream *s);
 int assign_server_address(struct stream *s);
 int assign_server_and_queue(struct stream *s);
+int alloc_bind_address(struct sockaddr_storage **ss,
+                       struct server *srv, struct proxy *be,
+                       struct stream *s);
 int srv_redispatch_connect(struct stream *t);
 void back_try_conn_req(struct stream *s);
 void back_handle_st_req(struct stream *s);
@@ -42,6 +45,7 @@ void back_handle_st_cer(struct stream *s);
 
 const char *backend_lb_algo_str(int algo);
 int backend_parse_balance(const char **args, char **err, struct proxy *curproxy);
+int backend_parse_log_balance(const char **args, char **err, struct proxy *curproxy);
 int tcp_persist_rdp_cookie(struct stream *s, struct channel *req, int an_bit);
 
 int be_downtime(struct proxy *px);
@@ -142,6 +146,8 @@ static inline int srv_lb_status_changed(const struct server *srv)
  * change date.
  */
 void set_backend_down(struct proxy *be);
+
+unsigned int gen_hash(const struct proxy* px, const char* key, unsigned long len);
 
 #endif /* _HAPROXY_BACKEND_H */
 

@@ -42,7 +42,7 @@
 #define H2_CF_DEM_DALLOC        0x00000004  // demux blocked on lack of connection's demux buffer
 #define H2_CF_DEM_DFULL         0x00000008  // demux blocked on connection's demux buffer full
 
-/* 0x00000010  unused */
+#define H2_CF_WAIT_INLIST       0x00000010  // there is at least one stream blocked by another stream in send_list/fctl_list
 #define H2_CF_DEM_MROOM         0x00000020  // demux blocked on lack of room in mux buffer
 #define H2_CF_DEM_SALLOC        0x00000040  // demux blocked on lack of stream's request buffer
 #define H2_CF_DEM_SFULL         0x00000080  // demux blocked on stream request buffer full
@@ -54,6 +54,7 @@
 #define H2_CF_DEM_IN_PROGRESS   0x00000400  // demux in progress (dsi,dfl,dft are valid)
 
 /* other flags */
+#define H2_CF_MBUF_HAS_DATA     0x00000800  // some stream data (data, headers) still in mbuf
 #define H2_CF_GOAWAY_SENT       0x00001000  // a GOAWAY frame was successfully sent
 #define H2_CF_GOAWAY_FAILED     0x00002000  // a GOAWAY frame failed to be sent
 #define H2_CF_WAIT_FOR_HS       0x00004000  // We did check that at least a stream was waiting for handshake
@@ -80,13 +81,13 @@ static forceinline char *h2c_show_flags(char *buf, size_t len, const char *delim
 	_(0);
 	/* flags */
 	_(H2_CF_MUX_MALLOC, _(H2_CF_MUX_MFULL, _(H2_CF_DEM_DALLOC,
-	_(H2_CF_DEM_DFULL, _(H2_CF_DEM_MROOM,
+	_(H2_CF_DEM_DFULL, _(H2_CF_WAIT_INLIST, _(H2_CF_DEM_MROOM,
 	_(H2_CF_DEM_SALLOC, _(H2_CF_DEM_SFULL, _(H2_CF_DEM_TOOMANY,
-	_(H2_CF_DEM_SHORT_READ, _(H2_CF_DEM_IN_PROGRESS, _(H2_CF_GOAWAY_SENT,
-	_(H2_CF_GOAWAY_FAILED, _(H2_CF_WAIT_FOR_HS, _(H2_CF_IS_BACK,
+	_(H2_CF_DEM_SHORT_READ, _(H2_CF_DEM_IN_PROGRESS, _(H2_CF_MBUF_HAS_DATA,
+	_(H2_CF_GOAWAY_SENT, _(H2_CF_GOAWAY_FAILED, _(H2_CF_WAIT_FOR_HS, _(H2_CF_IS_BACK,
 	_(H2_CF_WINDOW_OPENED, _(H2_CF_RCVD_SHUT, _(H2_CF_END_REACHED,
 	_(H2_CF_RCVD_RFC8441, _(H2_CF_SHTS_UPDATED, _(H2_CF_DTSU_EMITTED,
-	_(H2_CF_ERR_PENDING, _(H2_CF_ERROR))))))))))))))))))))));
+	_(H2_CF_ERR_PENDING, _(H2_CF_ERROR))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;

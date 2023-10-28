@@ -38,6 +38,7 @@ THREAD_LOCAL size_t pool_cache_count = 0;                /* #cache objects   */
 
 static struct list pools __read_mostly = LIST_HEAD_INIT(pools);
 int mem_poison_byte __read_mostly = 'P';
+int pool_trim_in_progress = 0;
 uint pool_debugging __read_mostly =               /* set of POOL_DBG_* flags */
 #ifdef DEBUG_FAIL_ALLOC
 	POOL_DBG_FAIL_ALLOC |
@@ -218,6 +219,8 @@ int malloc_trim(size_t pad)
 	if (disable_trim)
 		return ret;
 
+	HA_ATOMIC_INC(&pool_trim_in_progress);
+
 	if (my_mallctl) {
 		/* here we're on jemalloc and malloc_trim() is called either
 		 * by haproxy or another dependency (the worst case that
@@ -263,6 +266,8 @@ int malloc_trim(size_t pad)
 		}
 	}
 #endif
+	HA_ATOMIC_DEC(&pool_trim_in_progress);
+
 	/* here we have ret=0 if nothing was release, or 1 if some were */
 	return ret;
 }
@@ -295,33 +300,29 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 	unsigned int align;
 	int thr __maybe_unused;
 
-	/* We need to store a (void *) at the end of the chunks. Since we know
-	 * that the malloc() function will never return such a small size,
-	 * let's round the size up to something slightly bigger, in order to
-	 * ease merging of entries. Note that the rounding is a power of two.
-	 * This extra (void *) is not accounted for in the size computation
-	 * so that the visible parts outside are not affected.
-	 *
-	 * Note: for the LRU cache, we need to store 2 doubly-linked lists.
-	 */
-
 	extra_mark = (pool_debugging & POOL_DBG_TAG) ? POOL_EXTRA_MARK : 0;
 	extra_caller = (pool_debugging & POOL_DBG_CALLER) ? POOL_EXTRA_CALLER : 0;
 	extra = extra_mark + extra_caller;
 
-	if (!(flags & MEM_F_EXACT)) {
-		align = 4 * sizeof(void *); // 2 lists = 4 pointers min
-		size  = ((size + extra + align - 1) & -align) - extra;
-	}
-
 	if (!(pool_debugging & POOL_DBG_NO_CACHE)) {
-		/* we'll store two lists there, we need the room for this. This is
-		 * guaranteed by the test above, except if MEM_F_EXACT is set, or if
-		 * the only EXTRA part is in fact the one that's stored in the cache
-		 * in addition to the pci struct.
+		/* we'll store two lists there, we need the room for this. Let's
+		 * make sure it's always OK even when including the extra word
+		 * that is stored after the pci struct.
 		 */
 		if (size + extra - extra_caller < sizeof(struct pool_cache_item))
 			size = sizeof(struct pool_cache_item) + extra_caller - extra;
+	}
+
+	/* Now we know our size is set to the strict minimum possible. It may
+	 * be OK for elements allocated with an exact size (e.g. buffers), but
+	 * we're going to round the size up 16 bytes to merge almost identical
+	 * pools together. We only round up however when we add the debugging
+	 * tag since it's used to detect overflows. Otherwise we only round up
+	 * to the size of a word to preserve alignment.
+	 */
+	if (!(flags & MEM_F_EXACT)) {
+		align = (pool_debugging & POOL_DBG_TAG) ? sizeof(void *) : 16;
+		size  = ((size + align - 1) & -align);
 	}
 
 	/* TODO: thread: we do not lock pool list for now because all pools are
@@ -804,7 +805,7 @@ void pool_gc(struct pool_head *pool_ctx)
 			while (!entry->buckets[bucket].free_list && bucket < CONFIG_HAP_POOL_BUCKETS)
 				bucket++;
 
-			if (bucket == CONFIG_HAP_POOL_BUCKETS)
+			if (bucket >= CONFIG_HAP_POOL_BUCKETS)
 				break;
 
 			temp = entry->buckets[bucket].free_list;
@@ -848,12 +849,20 @@ void *__pool_alloc(struct pool_head *pool, unsigned int flags)
 	if (likely(p)) {
 #ifdef USE_MEMORY_PROFILING
 		if (unlikely(profiling & HA_PROF_MEMORY)) {
+			extern struct memprof_stats memprof_stats[MEMPROF_HASH_BUCKETS + 1];
 			struct memprof_stats *bin;
 
 			bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_P_ALLOC);
 			_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 			_HA_ATOMIC_ADD(&bin->alloc_tot, pool->size);
 			_HA_ATOMIC_STORE(&bin->info, pool);
+			/* replace the caller with the allocated bin: this way
+			 * we'll the pool_free() call will be able to update our
+			 * entry. We only do it for non-colliding entries though,
+			 * since thse ones store the true caller location.
+			 */
+			if (bin >= &memprof_stats[0] && bin < &memprof_stats[MEMPROF_HASH_BUCKETS])
+				POOL_DEBUG_TRACE_CALLER(pool, (struct pool_cache_item *)p, bin);
 		}
 #endif
 		if (unlikely(flags & POOL_F_MUST_ZERO))
@@ -878,12 +887,22 @@ void __pool_free(struct pool_head *pool, void *ptr)
 
 #ifdef USE_MEMORY_PROFILING
 	if (unlikely(profiling & HA_PROF_MEMORY) && ptr) {
+		extern struct memprof_stats memprof_stats[MEMPROF_HASH_BUCKETS + 1];
 		struct memprof_stats *bin;
 
 		bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_P_FREE);
 		_HA_ATOMIC_ADD(&bin->free_calls, 1);
 		_HA_ATOMIC_ADD(&bin->free_tot, pool->size);
 		_HA_ATOMIC_STORE(&bin->info, pool);
+
+		/* check if the caller is an allocator, and if so, let's update
+		 * its free() count.
+		 */
+		bin = *(struct memprof_stats**)(((char *)ptr) + pool->alloc_sz - sizeof(void*));
+		if (bin >= &memprof_stats[0] && bin < &memprof_stats[MEMPROF_HASH_BUCKETS]) {
+			_HA_ATOMIC_ADD(&bin->free_calls, 1);
+			_HA_ATOMIC_ADD(&bin->free_tot, pool->size);
+		}
 	}
 #endif
 
@@ -951,8 +970,9 @@ void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item
 
 	chunk_appendf(&trash,
 		      ")\n"
+		      "  item: %p\n"
 		      "  pool: %p ('%s', size %u, real %u, users %u)\n",
-		      pool, pool->name, pool->size, pool->alloc_sz, pool->users);
+		      item, pool, pool->name, pool->size, pool->alloc_sz, pool->users);
 
 	if (pool_debugging & POOL_DBG_TAG) {
 		const void **pool_mark;
@@ -966,7 +986,10 @@ void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item
 			the_pool = pool;
 		}
 		else {
-			chunk_appendf(&trash, "Tag does not match. Possible origin pool(s):\n");
+			if (!may_access(pool_mark))
+				chunk_appendf(&trash, "Tag not accessible. ");
+			else
+				chunk_appendf(&trash, "Tag does not match (%p). ", tag);
 
 			list_for_each_entry(ph, &pools, list) {
 				pool_mark = (const void **)(((char *)item) + ph->size);
@@ -975,6 +998,9 @@ void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item
 				tag =  *pool_mark;
 
 				if (tag == ph) {
+					if (!the_pool)
+						chunk_appendf(&trash, "Possible origin pool(s):\n");
+
 					chunk_appendf(&trash, "  tag: @%p = %p (%s, size %u, real %u, users %u)\n",
 						      pool_mark, tag, ph->name, ph->size, ph->alloc_sz, ph->users);
 					if (!the_pool || the_pool->size < ph->size)
@@ -982,8 +1008,53 @@ void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item
 				}
 			}
 
-			if (!the_pool)
-				chunk_appendf(&trash, "  none found.\n");
+			if (!the_pool) {
+				const char *start, *end, *p;
+
+				pool_mark = (const void **)(((char *)item) + pool->size);
+				chunk_appendf(&trash,
+					      "Tag does not match any other pool.\n"
+					      "Contents around address %p+%lu=%p:\n",
+					      item, (ulong)((const void*)pool_mark - (const void*)item),
+					      pool_mark);
+
+				/* dump in word-sized blocks */
+				start = (const void *)(((uintptr_t)pool_mark - 32) & -sizeof(void*));
+				end   = (const void *)(((uintptr_t)pool_mark + 32 + sizeof(void*) - 1) & -sizeof(void*));
+
+				while (start < end) {
+					dump_addr_and_bytes(&trash, "  ", start, sizeof(void*));
+					chunk_strcat(&trash, " [");
+					for (p = start; p < start + sizeof(void*); p++) {
+						if (!may_access(p))
+							chunk_strcat(&trash, "*");
+						else if (isprint((unsigned char)*p))
+							chunk_appendf(&trash, "%c", *p);
+						else
+							chunk_strcat(&trash, ".");
+					}
+
+					if (may_access(start))
+						tag = *(const void **)start;
+					else
+						tag = NULL;
+
+					if (tag == pool) {
+						/* the pool can often be there so let's detect it */
+						chunk_appendf(&trash, "] [pool:%s", pool->name);
+					}
+					else if (tag) {
+						/* print pointers that resolve to a symbol */
+						size_t back_data = trash.data;
+						chunk_strcat(&trash, "] [");
+						if (!resolve_sym_name(&trash, NULL, tag))
+							trash.data = back_data;
+					}
+
+					chunk_strcat(&trash, "]\n");
+					start = p;
+				}
+			}
 		}
 	}
 
@@ -1007,7 +1078,7 @@ void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item
 			/* the pool couldn't be formally verified */
 			chunk_appendf(&trash, "Other possible callers:\n");
 			list_for_each_entry(ph, &pools, list) {
-				if (ph == (the_pool ? the_pool : pool))
+				if (ph == pool)
 					continue;
 				pool_mark = (const void **)(((char *)item) + ph->alloc_sz - sizeof(void*));
 				if (!may_access(pool_mark))

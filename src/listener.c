@@ -25,6 +25,7 @@
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/freq_ctr.h>
+#include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
@@ -996,6 +997,12 @@ int listener_backlog(const struct listener *l)
 	return 1024;
 }
 
+/* Returns true if listener <l> must check maxconn limit prior to accept. */
+static inline int listener_uses_maxconn(const struct listener *l)
+{
+	return !(l->bind_conf->options & (BC_O_UNLIMITED|BC_O_XPRT_MAXCONN));
+}
+
 /* This function is called on a read event from a listening socket, corresponding
  * to an accept. It tries to accept as many connections as possible, and for each
  * calls the listener's accept handler (generally the frontend's accept handler).
@@ -1113,19 +1120,15 @@ void listener_accept(struct listener *l)
 			} while (!_HA_ATOMIC_CAS(&p->feconn, &count, next_feconn));
 		}
 
-		if (!(l->bind_conf->options & BC_O_UNLIMITED)) {
-			do {
-				count = actconn;
-				if (unlikely(count >= global.maxconn)) {
-					/* the process was marked full or another
-					 * thread is going to do it.
-					 */
-					next_actconn = 0;
-					expire = tick_add(now_ms, 1000); /* try again in 1 second */
-					goto limit_global;
-				}
-				next_actconn = count + 1;
-			} while (!_HA_ATOMIC_CAS(&actconn, (int *)(&count), next_actconn));
+		if (listener_uses_maxconn(l)) {
+			next_actconn = increment_actconn();
+			if (!next_actconn) {
+				/* the process was marked full or another
+				 * thread is going to do it.
+				 */
+				expire = tick_add(now_ms, 1000); /* try again in 1 second */
+				goto limit_global;
+			}
 		}
 
 		/* be careful below, the listener might be shutting down in
@@ -1149,7 +1152,7 @@ void listener_accept(struct listener *l)
 				_HA_ATOMIC_DEC(&l->nbconn);
 				if (p)
 					_HA_ATOMIC_DEC(&p->feconn);
-				if (!(l->bind_conf->options & BC_O_UNLIMITED))
+				if (listener_uses_maxconn(l))
 					_HA_ATOMIC_DEC(&actconn);
 				continue;
 
@@ -1583,7 +1586,7 @@ void listener_release(struct listener *l)
 {
 	struct proxy *fe = l->bind_conf->frontend;
 
-	if (!(l->bind_conf->options & BC_O_UNLIMITED))
+	if (listener_uses_maxconn(l))
 		_HA_ATOMIC_DEC(&actconn);
 	if (fe)
 		_HA_ATOMIC_DEC(&fe->feconn);
@@ -1948,6 +1951,10 @@ struct bind_conf *bind_conf_alloc(struct proxy *fe, const char *file,
 	bind_conf->sni_ctx = EB_ROOT;
 	bind_conf->sni_w_ctx = EB_ROOT;
 #endif
+#ifdef USE_QUIC
+	/* Use connection socket for QUIC by default. */
+	bind_conf->quic_mode = QUIC_SOCK_MODE_CONN;
+#endif
 	LIST_INIT(&bind_conf->listeners);
 
 	bind_conf->reverse_srvname = NULL;
@@ -2128,6 +2135,13 @@ int bind_parse_args_list(struct bind_conf *bind_conf, char **args, int cur_arg, 
 				goto out;
 			}
 
+			if ((bind_conf->options & BC_O_REVERSE_HTTP) && !kw->rhttp_ok) {
+				ha_alert("'%s' option is not accepted for reverse HTTP\n",
+					 args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
 			code = kw->parse(args, cur_arg, bind_conf->frontend, bind_conf, &err);
 			err_code |= code;
 
@@ -2234,6 +2248,33 @@ static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct bi
 	list_for_each_entry(l, &conf->listeners, by_bind)
 		l->name = strdup(args[cur_arg + 1]);
 
+	return 0;
+}
+
+/* parse the "nbconn" bind keyword */
+static int bind_parse_nbconn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	int val;
+	const struct listener *l;
+
+	l = LIST_NEXT(&conf->listeners, struct listener *, by_bind);
+	if (l->rx.addr.ss_family != AF_CUST_REV_SRV) {
+		memprintf(err, "'%s' : only valid for reverse HTTP listeners.", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing value.", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	val = atol(args[cur_arg + 1]);
+	if (val <= 0) {
+		memprintf(err, "'%s' : invalid value %d, must be > 0.", args[cur_arg], val);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	conf->reverse_nbconn = val;
 	return 0;
 }
 
@@ -2392,17 +2433,18 @@ INITCALL1(STG_REGISTER, acl_register_keywords, &acl_kws);
  * not enabled.
  */
 static struct bind_kw_list bind_kws = { "ALL", { }, {
-	{ "accept-netscaler-cip", bind_parse_accept_netscaler_cip, 1 }, /* enable NetScaler Client IP insertion protocol */
-	{ "accept-proxy", bind_parse_accept_proxy, 0 }, /* enable PROXY protocol */
-	{ "backlog",      bind_parse_backlog,      1 }, /* set backlog of listening socket */
-	{ "id",           bind_parse_id,           1 }, /* set id of listening socket */
-	{ "maxconn",      bind_parse_maxconn,      1 }, /* set maxconn of listening socket */
-	{ "name",         bind_parse_name,         1 }, /* set name of listening socket */
-	{ "nice",         bind_parse_nice,         1 }, /* set nice of listening socket */
-	{ "process",      bind_parse_process,      1 }, /* set list of allowed process for this socket */
-	{ "proto",        bind_parse_proto,        1 }, /* set the proto to use for all incoming connections */
-	{ "shards",       bind_parse_shards,       1 }, /* set number of shards */
-	{ "thread",       bind_parse_thread,       1 }, /* set list of allowed threads for this socket */
+	{ "accept-netscaler-cip", bind_parse_accept_netscaler_cip, 1, 0 }, /* enable NetScaler Client IP insertion protocol */
+	{ "accept-proxy", bind_parse_accept_proxy, 0, 0 }, /* enable PROXY protocol */
+	{ "backlog",      bind_parse_backlog,      1, 0 }, /* set backlog of listening socket */
+	{ "id",           bind_parse_id,           1, 1 }, /* set id of listening socket */
+	{ "maxconn",      bind_parse_maxconn,      1, 0 }, /* set maxconn of listening socket */
+	{ "name",         bind_parse_name,         1, 1 }, /* set name of listening socket */
+	{ "nbconn",       bind_parse_nbconn,       1, 1 }, /* set number of connection on active preconnect */
+	{ "nice",         bind_parse_nice,         1, 0 }, /* set nice of listening socket */
+	{ "process",      bind_parse_process,      1, 0 }, /* set list of allowed process for this socket */
+	{ "proto",        bind_parse_proto,        1, 0 }, /* set the proto to use for all incoming connections */
+	{ "shards",       bind_parse_shards,       1, 0 }, /* set number of shards */
+	{ "thread",       bind_parse_thread,       1, 0 }, /* set list of allowed threads for this socket */
 	{ /* END */ },
 }};
 

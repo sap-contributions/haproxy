@@ -70,7 +70,7 @@ int be_lastsession(const struct proxy *be)
 }
 
 /* helper function to invoke the correct hash method */
-static unsigned int gen_hash(const struct proxy* px, const char* key, unsigned long len)
+unsigned int gen_hash(const struct proxy* px, const char* key, unsigned long len)
 {
 	unsigned int hash;
 
@@ -84,12 +84,23 @@ static unsigned int gen_hash(const struct proxy* px, const char* key, unsigned l
 	case BE_LB_HFCN_CRC32:
 		hash = hash_crc32(key, len);
 		break;
+	case BE_LB_HFCN_NONE:
+		/* use key as a hash */
+		{
+			const char *_key = key;
+
+			hash = read_int64(&_key, _key + len);
+		}
+		break;
 	case BE_LB_HFCN_SDBM:
 		/* this is the default hash function */
 	default:
 		hash = hash_sdbm(key, len);
 		break;
 	}
+
+	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
+		hash = full_hash(hash);
 
 	return hash;
 }
@@ -182,6 +193,10 @@ static struct server *get_server_sh(struct proxy *px, const char *addr, int len,
 		h ^= ntohl(*(unsigned int *)(&addr[l]));
 		l += sizeof (int);
 	}
+	/* FIXME: why don't we use gen_hash() here as well?
+	 * -> we don't take into account hash function from "hash_type"
+	 * options here..
+	 */
 	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
 		h = full_hash(h);
  hash_done:
@@ -237,8 +252,6 @@ static struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, co
 
 	hash = gen_hash(px, start, (end - start));
 
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -293,9 +306,6 @@ static struct server *get_server_ph(struct proxy *px, const char *uri, int uri_l
 					end++;
 				}
 				hash = gen_hash(px, start, (end - start));
-
-				if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 					return chash_get_server_hash(px, hash, avoid);
@@ -373,9 +383,6 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 					/* should we break if vlen exceeds limit? */
 				}
 				hash = gen_hash(px, start, (end - start));
-
-				if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 					return chash_get_server_hash(px, hash, avoid);
@@ -469,8 +476,7 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 		start = p;
 		hash = gen_hash(px, start, (end - start));
 	}
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
+
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -514,8 +520,6 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 	 */
 	hash = gen_hash(px, smp.data.u.str.area, len);
 
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -548,8 +552,6 @@ static struct server *get_server_expr(struct stream *s, const struct server *avo
 	 */
 	hash = gen_hash(px, smp->data.u.str.area, smp->data.u.str.data);
 
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -1061,16 +1063,24 @@ int assign_server_and_queue(struct stream *s)
 	}
 }
 
-/* Allocate an address for source binding on the specified server or backend.
- * The allocation is only performed if the connection is intended to be used
- * with transparent mode.
+/* Allocate an address if an explicit source address must be used for a backend
+ * connection.
  *
- * Returns SRV_STATUS_OK if no transparent mode or the address was successfully
- * allocated. Otherwise returns SRV_STATUS_INTERNAL. Does nothing if the
- * address was already allocated.
+ * Two parameters are taken into account to check if specific source address is
+ * configured. The first one is <srv> which is the server instance to connect
+ * to. It may be NULL when dispatching is used. The second one <be> is the
+ * backend instance which contains the target server or dispatch.
+ *
+ * A stream instance <s> can be used to set the stream owner of the backend
+ * connection. It is a required parameter if the source address is a dynamic
+ * parameter.
+ *
+ * Returns SRV_STATUS_OK if either no specific source address specified or its
+ * allocation is done correctly. On error returns SRV_STATUS_INTERNAL.
  */
-static int alloc_bind_address(struct sockaddr_storage **ss,
-                              struct server *srv, struct stream *s)
+int alloc_bind_address(struct sockaddr_storage **ss,
+                       struct server *srv, struct proxy *be,
+                       struct stream *s)
 {
 #if defined(CONFIG_HAP_TRANSPARENT)
 	const struct sockaddr_storage *addr;
@@ -1080,14 +1090,14 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
 	size_t vlen;
 #endif
 
-	if (*ss)
-		return SRV_STATUS_OK;
+	/* Ensure the function will not overwrite an allocated address. */
+	BUG_ON(*ss);
 
 #if defined(CONFIG_HAP_TRANSPARENT)
 	if (srv && srv->conn_src.opts & CO_SRC_BIND)
 		src = &srv->conn_src;
-	else if (s->be->conn_src.opts & CO_SRC_BIND)
-		src = &s->be->conn_src;
+	else if (be->conn_src.opts & CO_SRC_BIND)
+		src = &be->conn_src;
 
 	/* no transparent mode, no need to allocate an address, returns OK */
 	if (!src)
@@ -1103,6 +1113,8 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
 
 	case CO_SRC_TPROXY_CLI:
 	case CO_SRC_TPROXY_CIP:
+		BUG_ON(!s); /* Dynamic source setting requires a stream instance. */
+
 		/* FIXME: what can we do if the client connects in IPv6 or unix socket ? */
 		addr = sc_src(s->scf);
 		if (!addr)
@@ -1115,6 +1127,8 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
 		break;
 
 	case CO_SRC_TPROXY_DYN:
+		BUG_ON(!s); /* Dynamic source setting requires a stream instance. */
+
 		if (!src->bind_hdr_occ || !IS_HTX_STRM(s))
 			return SRV_STATUS_INTERNAL;
 
@@ -1262,8 +1276,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 			session_add_conn(s->sess, conn, conn->target);
 		}
 		else {
-			eb64_insert(&srv->per_thr[tid].avail_conns,
-			            &conn->hash_node->node);
+			srv_add_to_avail_list(srv, conn);
 		}
 	}
 	return conn;
@@ -1277,7 +1290,7 @@ static int do_connect_server(struct stream *s, struct connection *conn)
 	if (unlikely(!conn || !conn->ctrl || !conn->ctrl->connect))
 		return SF_ERR_INTERNAL;
 
-	if (!channel_is_empty(&s->res))
+	if (co_data(&s->res))
 		conn_flags |= CONNECT_HAS_DATA;
 	if (s->conn_retries == s->be->conn_retries)
 		conn_flags |= CONNECT_CAN_USE_TFO;
@@ -1350,7 +1363,7 @@ static int connect_server(struct stream *s)
 	if (err != SRV_STATUS_OK)
 		return SF_ERR_INTERNAL;
 
-	err = alloc_bind_address(&bind_addr, srv, s);
+	err = alloc_bind_address(&bind_addr, srv, s->be, s);
 	if (err != SRV_STATUS_OK)
 		return SF_ERR_INTERNAL;
 
@@ -1443,6 +1456,9 @@ static int connect_server(struct stream *s)
 		if (!eb_is_empty(&srv->per_thr[tid].avail_conns)) {
 			srv_conn = srv_lookup_conn(&srv->per_thr[tid].avail_conns, hash);
 			if (srv_conn) {
+				/* connection cannot be in idle list if used as an avail idle conn. */
+				BUG_ON(LIST_INLIST(&srv_conn->idle_list));
+
 				DBG_TRACE_STATE("reuse connection from avail", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 				reuse = 1;
 			}
@@ -1498,7 +1514,7 @@ static int connect_server(struct stream *s)
 		/* First, try from our own idle list */
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		if (!LIST_ISEMPTY(&srv->per_thr[tid].idle_conn_list)) {
-			tokill_conn = LIST_ELEM(&srv->per_thr[tid].idle_conn_list.n, struct connection *, idle_list);
+			tokill_conn = LIST_ELEM(srv->per_thr[tid].idle_conn_list.n, struct connection *, idle_list);
 			conn_delete_from_tree(tokill_conn);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
@@ -1527,7 +1543,7 @@ static int connect_server(struct stream *s)
 					continue;
 
 				if (!LIST_ISEMPTY(&srv->per_thr[i].idle_conn_list)) {
-					tokill_conn = LIST_ELEM(&srv->per_thr[i].idle_conn_list.n, struct connection *, idle_list);
+					tokill_conn = LIST_ELEM(srv->per_thr[i].idle_conn_list.n, struct connection *, idle_list);
 					conn_delete_from_tree(tokill_conn);
 				}
 				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
@@ -1550,9 +1566,6 @@ static int connect_server(struct stream *s)
 			int avail = srv_conn->mux->avail_streams(srv_conn);
 
 			if (avail <= 1) {
-				/* connection cannot be in idle list if used as an avail idle conn. */
-				BUG_ON(LIST_INLIST(&srv_conn->idle_list));
-
 				/* No more streams available, remove it from the list */
 				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 				conn_delete_from_tree(srv_conn);
@@ -1767,7 +1780,7 @@ skip_reuse:
 			if (srv && reuse_mode == PR_O_REUSE_ALWS &&
 			    !(srv_conn->flags & CO_FL_PRIVATE) &&
 			    srv_conn->mux->avail_streams(srv_conn) > 0) {
-				eb64_insert(&srv->per_thr[tid].avail_conns, &srv_conn->hash_node->node);
+				srv_add_to_avail_list(srv, srv_conn);
 			}
 			else if (srv_conn->flags & CO_FL_PRIVATE ||
 			         (reuse_mode == PR_O_REUSE_SAFE &&
@@ -1789,7 +1802,7 @@ skip_reuse:
 	     */
 	    ((cli_conn->flags & CO_FL_EARLY_DATA) ||
 	     ((s->be->retry_type & PR_RE_EARLY_ERROR) && !s->conn_retries)) &&
-	    !channel_is_empty(sc_oc(s->scb)) &&
+	    co_data(sc_oc(s->scb)) &&
 	    srv_conn->flags & CO_FL_SSL_WAIT_HS)
 		srv_conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
 #endif
@@ -1947,7 +1960,7 @@ static int back_may_abort_req(struct channel *req, struct stream *s)
 {
 	return ((s->scf->flags & SC_FL_ERROR) ||
 	        ((s->scb->flags & (SC_FL_SHUT_WANTED|SC_FL_SHUT_DONE)) &&  /* empty and client aborted */
-	         (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE))));
+	         (!co_data(req) || (s->be->options & PR_O_ABRT_CLOSE))));
 }
 
 /* Update back stream connector status for input states SC_ST_ASS, SC_ST_QUE,
@@ -2237,7 +2250,7 @@ void back_handle_st_con(struct stream *s)
 	/* the client might want to abort */
 	if ((s->scf->flags & SC_FL_SHUT_DONE) ||
 	    ((s->scb->flags & SC_FL_SHUT_WANTED) &&
-	     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
+	     (!co_data(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 		sc->flags |= SC_FL_NOLINGER;
 		sc_shutdown(sc);
 		s->conn_err_type |= STRM_ET_CONN_ABRT;
@@ -2460,7 +2473,7 @@ void back_handle_st_rdy(struct stream *s)
 		/* client abort ? */
 		if ((s->scf->flags & SC_FL_SHUT_DONE) ||
 		    ((s->scb->flags & SC_FL_SHUT_WANTED) &&
-		     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
+		     (!co_data(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 			/* give up */
 			sc->flags |= SC_FL_NOLINGER;
 			sc_shutdown(sc);
@@ -2807,6 +2820,53 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 	}
 	else {
 		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hdr(name)' and 'rdp-cookie(name)' options.");
+		return -1;
+	}
+	return 0;
+}
+
+/* This function parses a "balance" statement in a log backend section
+ * describing <curproxy>. It returns -1 if there is any error, otherwise zero.
+ * If it returns -1, it will write an error message into the <err> buffer which
+ * will automatically be allocated and must be passed as NULL. The trailing '\n'
+ * will not be written. The function must be called with <args> pointing to the
+ * first word after "balance".
+ */
+int backend_parse_log_balance(const char **args, char **err, struct proxy *curproxy)
+{
+	if (!*(args[0])) {
+		/* if no option is set, use round-robin by default */
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+		return 0;
+	}
+
+	if (strcmp(args[0], "roundrobin") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+	}
+	else if (strcmp(args[0], "sticky") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		/* we use ALGO_FAS as "sticky" mode in log-balance context */
+		curproxy->lbprm.algo |= BE_LB_ALGO_FAS;
+	}
+	else if (strcmp(args[0], "random") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RND;
+	}
+	else if (strcmp(args[0], "hash") == 0) {
+		if (!*args[1]) {
+			memprintf(err, "%s requires a converter list.", args[0]);
+			return -1;
+		}
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_SMP;
+
+		ha_free(&curproxy->lbprm.arg_str);
+		curproxy->lbprm.arg_str = strdup(args[1]);
+	}
+	else {
+		memprintf(err, "only supports 'roundrobin', 'sticky', 'random', 'hash' options");
 		return -1;
 	}
 	return 0;

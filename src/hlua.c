@@ -69,6 +69,20 @@
 #include <haproxy/check.h>
 #include <haproxy/mailers.h>
 
+/* Global LUA flags */
+
+enum hlua_log_opt {
+	/* tune.lua.log.loggers */
+	HLUA_LOG_LOGGERS_ON      = 0x00000001, /* forward logs to current loggers */
+
+	/* tune.lua.log.stderr */
+	HLUA_LOG_STDERR_ON       = 0x00000010, /* forward logs to stderr */
+	HLUA_LOG_STDERR_AUTO     = 0x00000020, /* forward logs to stderr if no loggers */
+	HLUA_LOG_STDERR_MASK     = 0x00000030,
+};
+/* default log options, made of flags in hlua_log_opt */
+static uint hlua_log_opts = HLUA_LOG_LOGGERS_ON | HLUA_LOG_STDERR_AUTO;
+
 /* Lua uses longjmp to perform yield or throwing errors. This
  * macro is used only for identifying the function that can
  * not return because a longjmp is executed.
@@ -278,6 +292,8 @@ struct hlua_csk_ctx {
 	struct list wake_on_read;
 	struct list wake_on_write;
 	struct appctx *appctx;
+	struct server *srv;
+	int timeout;
 	int die;
 };
 
@@ -1364,8 +1380,9 @@ const char *hlua_show_current_location(const char *pfx)
 	return NULL;
 }
 
-/* This function is used to send logs. It try to send on screen (stderr)
- * and on the default syslog server.
+/* This function is used to send logs. It tries to send them to:
+ * - the log target applicable in the current context, OR
+ * - stderr when no logger is in use for the current context
  */
 static inline void hlua_sendlog(struct proxy *px, int level, const char *msg)
 {
@@ -1390,8 +1407,28 @@ static inline void hlua_sendlog(struct proxy *px, int level, const char *msg)
 	}
 	*p = '\0';
 
-	send_log(px, level, "%s\n", trash.area);
+	if (hlua_log_opts & HLUA_LOG_LOGGERS_ON)
+		send_log(px, level, "%s\n", trash.area);
+
 	if (!(global.mode & MODE_QUIET) || (global.mode & (MODE_VERBOSE | MODE_STARTING))) {
+		if (!(hlua_log_opts & HLUA_LOG_STDERR_MASK))
+			return;
+
+		/* when logging via stderr is set to 'auto', it behaves like 'off' unless one of:
+		 * - logging via loggers is disabled
+		 * - this is a non-proxy context and there is no global logger configured
+		 * - this is a proxy context and the proxy has no logger configured
+		 */
+		if ((hlua_log_opts & (HLUA_LOG_STDERR_MASK | HLUA_LOG_LOGGERS_ON)) == (HLUA_LOG_STDERR_AUTO | HLUA_LOG_LOGGERS_ON)) {
+			/* AUTO=OFF in non-proxy context only if at least one global logger is defined */
+			if ((px == NULL) && (!LIST_ISEMPTY(&global.loggers)))
+				return;
+
+			/* AUTO=OFF in proxy context only if at least one logger is configured for the proxy */
+			if ((px != NULL) && (!LIST_ISEMPTY(&px->loggers)))
+				return;
+		}
+
 		if (level == LOG_DEBUG && !(global.mode & MODE_DEBUG))
 			return;
 
@@ -1723,6 +1760,14 @@ resume_execution:
 
 	/* out of lua processing, stop the timer */
 	hlua_timer_stop(&lua->timer);
+
+	/* reset nargs because those possibly passed to the lua_resume() call
+	 * were already consumed, and since we may call lua_resume() again
+	 * after a successful yield, we don't want to pass stale nargs hint
+	 * to the Lua API. As such, nargs should be set explicitly before each
+	 * lua_resume() (or hlua_ctx_resume()) invocation if needed.
+	 */
+	lua->nargs = 0;
 
 	switch (ret) {
 
@@ -2307,7 +2352,7 @@ static void hlua_socket_handler(struct appctx *appctx)
 		notification_wake(&ctx->wake_on_write);
 
 	/* Wake the tasks which wants to read if the buffer contains data. */
-	if (!channel_is_empty(sc_oc(sc)))
+	if (co_data(sc_oc(sc)))
 		notification_wake(&ctx->wake_on_read);
 
 	/* If write notifications are registered, we considers we want
@@ -2319,7 +2364,7 @@ static void hlua_socket_handler(struct appctx *appctx)
 
 static int hlua_socket_init(struct appctx *appctx)
 {
-	struct hlua_csk_ctx *ctx = appctx->svcctx;
+	struct hlua_csk_ctx *csk_ctx = appctx->svcctx;
 	struct stream *s;
 
 	if (appctx_finalize_startup(appctx, socket_proxy, &BUF_NULL) == -1)
@@ -2335,9 +2380,14 @@ static int hlua_socket_init(struct appctx *appctx)
 
 	/* Force destination server. */
 	s->flags |= SF_DIRECT | SF_ASSIGNED | SF_BE_ASSIGNED;
-	s->target = &socket_tcp->obj_type;
+	s->target = &csk_ctx->srv->obj_type;
 
-	ctx->appctx = appctx;
+	if (csk_ctx->timeout) {
+		s->sess->fe->timeout.connect = csk_ctx->timeout;
+		s->scf->ioto = csk_ctx->timeout;
+		s->scb->ioto = csk_ctx->timeout;
+	}
+
 	return 0;
 
   error:
@@ -2490,6 +2540,9 @@ __LJMP static int hlua_socket_receive_yield(struct lua_State *L, int status, lua
 		goto no_peer;
 
 	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected)
+		goto connection_closed;
+
 	appctx = csk_ctx->appctx;
 	s = appctx_strm(appctx);
 
@@ -2731,6 +2784,12 @@ static int hlua_socket_write_yield(struct lua_State *L,int status, lua_KContext 
 	}
 
 	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected) {
+		xref_unlock(&socket->xref, peer);
+		lua_pushinteger(L, -1);
+		return 1;
+	}
+
 	appctx = csk_ctx->appctx;
 	sc = appctx_sc(appctx);
 	s = __sc_strm(sc);
@@ -2940,6 +2999,7 @@ __LJMP static int hlua_socket_getpeername(struct lua_State *L)
 {
 	struct hlua_socket *socket;
 	struct xref *peer;
+	struct hlua_csk_ctx *csk_ctx;
 	struct appctx *appctx;
 	struct stconn *sc;
 	const struct sockaddr_storage *dst;
@@ -2962,7 +3022,14 @@ __LJMP static int hlua_socket_getpeername(struct lua_State *L)
 		return 1;
 	}
 
-	appctx = container_of(peer, struct hlua_csk_ctx, xref)->appctx;
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected) {
+		xref_unlock(&socket->xref, peer);
+		lua_pushnil(L);
+		return 1;
+	}
+
+	appctx = csk_ctx->appctx;
 	sc = appctx_sc(appctx);
 	dst = sc_dst(sc_opposite(sc));
 	if (!dst) {
@@ -2983,6 +3050,7 @@ static int hlua_socket_getsockname(struct lua_State *L)
 	struct connection *conn;
 	struct appctx *appctx;
 	struct xref *peer;
+	struct hlua_csk_ctx *csk_ctx;
 	struct stream *s;
 	int ret;
 
@@ -3003,7 +3071,14 @@ static int hlua_socket_getsockname(struct lua_State *L)
 		return 1;
 	}
 
-	appctx = container_of(peer, struct hlua_csk_ctx, xref)->appctx;
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected) {
+		xref_unlock(&socket->xref, peer);
+		lua_pushnil(L);
+		return 1;
+	}
+
+	appctx = csk_ctx->appctx;
 	s = appctx_strm(appctx);
 
 	conn = sc_conn(s->scb);
@@ -3106,7 +3181,11 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 	struct sockaddr_storage *addr;
 	struct xref *peer;
 	struct stconn *sc;
-	struct stream *s;
+
+	/* Get hlua struct, or NULL if we execute from main lua state */
+	hlua = hlua_gethlua(L);
+	if (!hlua)
+		return 0;
 
 	if (lua_gettop(L) < 2)
 		WILL_LJMP(luaL_error(L, "connect: need at least 2 arguments"));
@@ -3144,6 +3223,10 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 		return 1;
 	}
 
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->srv)
+		csk_ctx->srv = socket_tcp;
+
 	/* Parse ip address. */
 	addr = str2sa_range(ip, NULL, &low, &high, NULL, NULL, NULL, NULL, NULL, PA_O_PORT_OK | PA_O_STREAM);
 	if (!addr) {
@@ -3168,20 +3251,23 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 		}
 	}
 
-	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
 	appctx = csk_ctx->appctx;
+	if (appctx_sc(appctx)) {
+		xref_unlock(&socket->xref, peer);
+		WILL_LJMP(luaL_error(L, "connect: connect already performed\n"));
+	}
+
+	if (appctx_init(appctx) == -1) {
+		xref_unlock(&socket->xref, peer);
+		WILL_LJMP(luaL_error(L, "connect: fail to init applet."));
+	}
+
 	sc = appctx_sc(appctx);
-	s = __sc_strm(sc);
 
 	if (!sockaddr_alloc(&sc_opposite(sc)->dst, addr, sizeof(*addr))) {
 		xref_unlock(&socket->xref, peer);
 		WILL_LJMP(luaL_error(L, "connect: internal error"));
 	}
-
-	/* Get hlua struct, or NULL if we execute from main lua state */
-	hlua = hlua_gethlua(L);
-	if (!hlua)
-		return 0;
 
 	/* inform the stream that we want to be notified whenever the
 	 * connection completes.
@@ -3198,9 +3284,7 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 	}
 	xref_unlock(&socket->xref, peer);
 
-	task_wakeup(s->task, TASK_WOKEN_INIT);
 	/* Return yield waiting for connection. */
-
 	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_socket_connect_yield, TICK_ETERNITY, 0));
 
 	return 0;
@@ -3211,7 +3295,6 @@ __LJMP static int hlua_socket_connect_ssl(struct lua_State *L)
 {
 	struct hlua_socket *socket;
 	struct xref *peer;
-	struct stream *s;
 
 	MAY_LJMP(check_args(L, 3, "connect_ssl"));
 	socket  = MAY_LJMP(hlua_checksocket(L, 1));
@@ -3223,9 +3306,8 @@ __LJMP static int hlua_socket_connect_ssl(struct lua_State *L)
 		return 1;
 	}
 
-	s = appctx_strm(container_of(peer, struct hlua_csk_ctx, xref)->appctx);
+	container_of(peer, struct hlua_csk_ctx, xref)->srv = socket_ssl;
 
-	s->target = &socket_ssl->obj_type;
 	xref_unlock(&socket->xref, peer);
 	return MAY_LJMP(hlua_socket_connect(L));
 }
@@ -3242,6 +3324,8 @@ __LJMP static int hlua_socket_settimeout(struct lua_State *L)
 	int tmout;
 	double dtmout;
 	struct xref *peer;
+	struct hlua_csk_ctx *csk_ctx;
+	struct appctx *appctx;
 	struct stream *s;
 
 	MAY_LJMP(check_args(L, 2, "settimeout"));
@@ -3276,17 +3360,25 @@ __LJMP static int hlua_socket_settimeout(struct lua_State *L)
 		return 0;
 	}
 
-	s = appctx_strm(container_of(peer, struct hlua_csk_ctx, xref)->appctx);
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	csk_ctx->timeout = tmout;
+
+	appctx = csk_ctx->appctx;
+	if (!appctx_sc(appctx))
+		goto end;
+
+	s = appctx_strm(csk_ctx->appctx);
 
 	s->sess->fe->timeout.connect = tmout;
 	s->scf->ioto = tmout;
 	s->scb->ioto = tmout;
 
-	s->task->expire = tick_add_ifset(now_ms, tmout);
+	s->task->expire = (tick_is_expired(s->task->expire, now_ms) ? 0 : s->task->expire);
+	s->task->expire = tick_first(s->task->expire, tick_add_ifset(now_ms, tmout));
 	task_queue(s->task);
 
+  end:
 	xref_unlock(&socket->xref, peer);
-
 	lua_pushinteger(L, 1);
 	return 1;
 }
@@ -3329,20 +3421,16 @@ __LJMP static int hlua_socket_new(lua_State *L)
 	ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	ctx->connected = 0;
 	ctx->die = 0;
+	ctx->srv = NULL;
+	ctx->timeout = 0;
+	ctx->appctx = appctx;
 	LIST_INIT(&ctx->wake_on_write);
 	LIST_INIT(&ctx->wake_on_read);
-
-	if (appctx_init(appctx) == -1) {
-		hlua_pusherror(L, "socket: fail to init applet.");
-		goto out_fail_appctx;
-	}
 
 	/* Initialise cross reference between stream and Lua socket object. */
 	xref_create(&socket->xref, &ctx->xref);
 	return 1;
 
- out_fail_appctx:
-	appctx_free_on_early_error(appctx);
  out_fail_conf:
 	WILL_LJMP(lua_error(L));
 	return 0;
@@ -10976,6 +11064,8 @@ __LJMP static int hlua_register_action(lua_State *L)
 			akw = action_http_req_custom(trash->area);
 		} else if (strcmp(lua_tostring(L, -1), "http-res") == 0) {
 			akw = action_http_res_custom(trash->area);
+		} else if (strcmp(lua_tostring(L, -1), "http-after-res") == 0) {
+			akw = action_http_after_res_custom(trash->area);
 		} else {
 			akw = NULL;
 		}
@@ -11035,6 +11125,8 @@ __LJMP static int hlua_register_action(lua_State *L)
 			http_req_keywords_register(akl);
 		else if (strcmp(lua_tostring(L, -1), "http-res") == 0)
 			http_res_keywords_register(akl);
+		else if (strcmp(lua_tostring(L, -1), "http-after-res") == 0)
+			http_after_res_keywords_register(akl);
 		else {
 			release_hlua_function(fcn);
 			hlua_unref(L, ref);
@@ -11042,7 +11134,8 @@ __LJMP static int hlua_register_action(lua_State *L)
 				ha_free((char **)&(akl->kw[0].kw));
 			ha_free(&akl);
 			WILL_LJMP(luaL_error(L, "Lua action environment '%s' is unknown. "
-			                        "'tcp-req', 'tcp-res', 'http-req' or 'http-res' "
+			                        "'tcp-req', 'tcp-res', 'http-req', 'http-res' "
+			                        "or 'http-after-res' "
 			                        "are expected.", lua_tostring(L, -1)));
 		}
 
@@ -12373,6 +12466,43 @@ static int hlua_parse_maxmem(char **args, int section_type, struct proxy *curpx,
 	return 0;
 }
 
+static int hlua_cfg_parse_log_loggers(char **args, int section_type, struct proxy *curpx,
+                              const struct proxy *defpx, const char *file, int line,
+                              char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "on") == 0)
+		hlua_log_opts |= HLUA_LOG_LOGGERS_ON;
+	else if (strcmp(args[1], "off") == 0)
+		hlua_log_opts &= ~HLUA_LOG_LOGGERS_ON;
+	else {
+		memprintf(err, "'%s' expects either 'on' or 'off' but got '%s'.", args[0], args[1]);
+		return -1;
+	}
+	return 0;
+}
+
+static int hlua_cfg_parse_log_stderr(char **args, int section_type, struct proxy *curpx,
+                                     const struct proxy *defpx, const char *file, int line,
+                                    char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "on") == 0)
+		hlua_log_opts = (hlua_log_opts & ~HLUA_LOG_STDERR_MASK) | HLUA_LOG_STDERR_ON;
+	else if (strcmp(args[1], "auto") == 0)
+		hlua_log_opts = (hlua_log_opts & ~HLUA_LOG_STDERR_MASK) | HLUA_LOG_STDERR_AUTO;
+	else if (strcmp(args[1], "off") == 0)
+		hlua_log_opts &= ~HLUA_LOG_STDERR_MASK;
+	else {
+		memprintf(err, "'%s' expects either 'on', 'auto', or 'off' but got '%s'.", args[0], args[1]);
+		return -1;
+	}
+	return 0;
+}
 
 /* This function is called by the main configuration key "lua-load". It loads and
  * execute an lua file during the parsing of the HAProxy configuration file. It is
@@ -12622,6 +12752,8 @@ static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_GLOBAL, "tune.lua.burst-timeout",   hlua_burst_timeout },
 	{ CFG_GLOBAL, "tune.lua.forced-yield",    hlua_forced_yield },
 	{ CFG_GLOBAL, "tune.lua.maxmem",          hlua_parse_maxmem },
+	{ CFG_GLOBAL, "tune.lua.log.loggers",     hlua_cfg_parse_log_loggers },
+	{ CFG_GLOBAL, "tune.lua.log.stderr",      hlua_cfg_parse_log_stderr },
 	{ 0, NULL, NULL },
 }};
 
@@ -12864,9 +12996,9 @@ int hlua_post_init_state(lua_State *L)
 		hlua_unref(L, init->function_ref);
 
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 504
-		ret = lua_resume(L, L, 0, &nres);
+		ret = lua_resume(L, NULL, 0, &nres);
 #else
-		ret = lua_resume(L, L, 0);
+		ret = lua_resume(L, NULL, 0);
 #endif
 		kind = NULL;
 		switch (ret) {

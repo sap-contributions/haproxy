@@ -209,6 +209,9 @@ static inline void free_quic_conn_cids(struct quic_conn *conn)
 {
 	struct eb64_node *node;
 
+	if (!conn->cids)
+		return;
+
 	node = eb64_first(conn->cids);
 	while (node) {
 		struct quic_connection_id *conn_id;
@@ -618,6 +621,11 @@ static inline void quic_handle_stopping(void)
 
 int qc_set_tid_affinity(struct quic_conn *qc, uint new_tid, struct listener *new_li);
 void qc_finalize_affinity_rebind(struct quic_conn *qc);
+
+/* Function pointer that can be used to compute a hash from first generated CID (derived from ODCID) */
+extern uint64_t (*quic_hash64_from_cid)(const unsigned char *cid, int size, const unsigned char *secret, size_t secretlen);
+/* Function pointer that can be used to derive a new CID from the previously computed hash */
+extern void (*quic_newcid_from_hash64)(unsigned char *cid, int size, uint64_t hash, const unsigned char *secret, size_t secretlen);
 
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_QUIC_CONN_H */

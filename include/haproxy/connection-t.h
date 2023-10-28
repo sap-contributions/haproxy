@@ -241,6 +241,8 @@ enum {
 	CO_ER_SOCKS4_ABORT,      /* SOCKS4 Proxy handshake aborted by server */
 
 	CO_ERR_SSL_FATAL,        /* SSL fatal error during a SSL_read or SSL_write */
+
+	CO_ER_REVERSE,           /* Error during reverse connect */
 };
 
 /* error return codes for accept_conn() */
@@ -272,6 +274,7 @@ enum {
 	CO_RFL_READ_ONCE     = 0x0004,    /* don't loop even if the request/response is small */
 	CO_RFL_KEEP_RECV     = 0x0008,    /* Instruct the mux to still wait for read events  */
 	CO_RFL_BUF_NOT_STUCK = 0x0010,    /* Buffer is not stuck. Optims are possible during data copy */
+	CO_RFL_MAY_SPLICE    = 0x0020,    /* The producer can use the kernel splicing */
 };
 
 /* flags that can be passed to xprt->snd_buf() and mux->snd_buf() */
@@ -308,6 +311,7 @@ enum {
 	MX_FL_HOL_RISK    = 0x00000002, /* set if the protocol is subject the to head-of-line blocking on server */
 	MX_FL_NO_UPG      = 0x00000004, /* set if mux does not support any upgrade */
 	MX_FL_FRAMED      = 0x00000008, /* mux working on top of a framed transport layer (QUIC) */
+	MX_FL_REVERSABLE  = 0x00000010, /* mux supports connection reversal */
 };
 
 /* PROTO token registration */
@@ -384,7 +388,7 @@ struct xprt_ops {
 	size_t (*rcv_buf)(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags); /* recv callback */
 	size_t (*snd_buf)(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags); /* send callback */
 	int  (*rcv_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
-	int  (*snd_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe); /* send-to-pipe callback */
+	int  (*snd_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count); /* send-to-pipe callback */
 	void (*shutr)(struct connection *conn, void *xprt_ctx, int);    /* shutr function */
 	void (*shutw)(struct connection *conn, void *xprt_ctx, int);    /* shutw function */
 	void (*close)(struct connection *conn, void *xprt_ctx);         /* close the transport layer */
@@ -419,8 +423,10 @@ struct mux_ops {
 	int  (*wake)(struct connection *conn);        /* mux-layer callback to report activity, mandatory */
 	size_t (*rcv_buf)(struct stconn *sc, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to get data */
 	size_t (*snd_buf)(struct stconn *sc, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to send data */
-	int  (*rcv_pipe)(struct stconn *sc, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
-	int  (*snd_pipe)(struct stconn *sc, struct pipe *pipe); /* send-to-pipe callback */
+	size_t (*nego_fastfwd)(struct stconn *sc, struct buffer *input, size_t count, unsigned int may_splice); /* Callback to fill the SD iobuf */
+	void (*done_fastfwd)(struct stconn *sc); /* Callback to terminate fast data forwarding */
+	int (*fastfwd)(struct stconn *sc, unsigned int count, unsigned int flags); /* Callback to init fast data forwarding */
+	int (*resume_fastfwd)(struct stconn *sc, unsigned int flags); /* Callback to resume fast data forwarding */
 	void (*shutr)(struct stconn *sc, enum co_shr_mode);     /* shutr function */
 	void (*shutw)(struct stconn *sc, enum co_shw_mode);     /* shutw function */
 

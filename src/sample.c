@@ -1286,6 +1286,39 @@ out_error:
 }
 
 /*
+ * Helper function to process the converter list of a given sample expression
+ * <expr> using the sample <p> (which is assumed to be properly initialized)
+ * as input.
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+int sample_process_cnv(struct sample_expr *expr, struct sample *p)
+{
+	struct sample_conv_expr *conv_expr;
+
+	list_for_each_entry(conv_expr, &expr->conv_exprs, list) {
+		/* we want to ensure that p->type can be casted into
+		 * conv_expr->conv->in_type. We have 3 possibilities :
+		 *  - NULL   => not castable.
+		 *  - c_none => nothing to do (let's optimize it)
+		 *  - other  => apply cast and prepare to fail
+		 */
+		if (!sample_casts[p->data.type][conv_expr->conv->in_type])
+			return 0;
+
+		if (sample_casts[p->data.type][conv_expr->conv->in_type] != c_none &&
+		    !sample_casts[p->data.type][conv_expr->conv->in_type](p))
+			return 0;
+
+		/* OK cast succeeded */
+
+		if (!conv_expr->conv->process(conv_expr->arg_p, p, conv_expr->conv->private))
+			return 0;
+	}
+	return 1;
+}
+
+/*
  * Process a fetch + format conversion of defined by the sample expression <expr>
  * on request or response considering the <opt> parameter.
  * Returns a pointer on a typed sample structure containing the result or NULL if
@@ -1313,8 +1346,6 @@ struct sample *sample_process(struct proxy *px, struct session *sess,
                               struct stream *strm, unsigned int opt,
                               struct sample_expr *expr, struct sample *p)
 {
-	struct sample_conv_expr *conv_expr;
-
 	if (p == NULL) {
 		p = &temp_smp;
 		memset(p, 0, sizeof(*p));
@@ -1324,25 +1355,8 @@ struct sample *sample_process(struct proxy *px, struct session *sess,
 	if (!expr->fetch->process(expr->arg_p, p, expr->fetch->kw, expr->fetch->private))
 		return NULL;
 
-	list_for_each_entry(conv_expr, &expr->conv_exprs, list) {
-		/* we want to ensure that p->type can be casted into
-		 * conv_expr->conv->in_type. We have 3 possibilities :
-		 *  - NULL   => not castable.
-		 *  - c_none => nothing to do (let's optimize it)
-		 *  - other  => apply cast and prepare to fail
-		 */
-		if (!sample_casts[p->data.type][conv_expr->conv->in_type])
-			return NULL;
-
-		if (sample_casts[p->data.type][conv_expr->conv->in_type] != c_none &&
-		    !sample_casts[p->data.type][conv_expr->conv->in_type](p))
-			return NULL;
-
-		/* OK cast succeeded */
-
-		if (!conv_expr->conv->process(conv_expr->arg_p, p, conv_expr->conv->private))
-			return NULL;
-	}
+	if (!sample_process_cnv(expr, p))
+		return NULL;
 	return p;
 }
 
@@ -1761,7 +1775,7 @@ static int sample_conv_debug(const struct arg *arg_p, struct sample *smp, void *
 
  done:
 	line = ist2(buf->area, buf->data);
-	sink_write(sink, 0, &line, 1, 0, 0, NULL);
+	sink_write(sink, LOG_HEADER_NONE, 0, &line, 1);
  end:
 	free_trash_chunk(buf);
 	return 1;
@@ -2705,18 +2719,54 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
  * Optional second arg is the length to truncate */
 static int sample_conv_bytes(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	if (smp->data.u.str.data <= arg_p[0].data.sint) {
+	struct sample smp_arg0, smp_arg1;
+	long long start_idx, length;
+
+	// determine the start_idx and length of the output
+	smp_set_owner(&smp_arg0, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_sint(&arg_p[0], &smp_arg0)) {
 		smp->data.u.str.data = 0;
-		return 1;
+		return 0;
+	}
+	if (smp_arg0.data.u.sint < 0 || (smp_arg0.data.u.sint >= smp->data.u.str.data)) {
+		// empty output if the arg0 value is negative or >= the input length
+		smp->data.u.str.data = 0;
+		return 0;
+	}
+	start_idx = smp_arg0.data.u.sint;
+
+	// length comes from arg1 if present, otherwise it's the remaining length
+	if (arg_p[1].type != ARGT_STOP) {
+		smp_set_owner(&smp_arg1, smp->px, smp->sess, smp->strm, smp->opt);
+		if (!sample_conv_var2smp_sint(&arg_p[1], &smp_arg1)) {
+			smp->data.u.str.data = 0;
+			return 0;
+		}
+		if (smp_arg1.data.u.sint < 0) {
+			// empty output if the arg1 value is negative
+			smp->data.u.str.data = 0;
+			return 0;
+		}
+
+		if (smp_arg1.data.u.sint > (smp->data.u.str.data - start_idx)) {
+			// arg1 value is greater than the remaining length
+			if (smp->opt & SMP_OPT_FINAL) {
+				// truncate to remaining length
+				length = smp->data.u.str.data - start_idx;
+			} else {
+				smp->data.u.str.data = 0;
+				return 0;
+			}
+		} else {
+			length = smp_arg1.data.u.sint;
+		}
+	} else {
+		length = smp->data.u.str.data - start_idx;
 	}
 
-	if (smp->data.u.str.size)
-			smp->data.u.str.size -= arg_p[0].data.sint;
-	smp->data.u.str.data -= arg_p[0].data.sint;
-	smp->data.u.str.area += arg_p[0].data.sint;
-
-	if ((arg_p[1].type == ARGT_SINT) && (arg_p[1].data.sint < smp->data.u.str.data))
-		smp->data.u.str.data = arg_p[1].data.sint;
+	// update the output using the start_idx and length
+	smp->data.u.str.area += start_idx;
+	smp->data.u.str.data = length;
 
 	return 1;
 }
@@ -3119,7 +3169,10 @@ static int check_operator(struct arg *args, struct sample_conv *conv,
 	const char *end;
 	long long int i;
 
-	/* Try to decode a variable. */
+	/* Try to decode a variable. The 'err' variable is intentionnaly left
+	 * NULL since the operators accept an integer as argument in which case
+	 * vars_check_arg call will fail.
+	 */
 	if (vars_check_arg(&args[0], NULL))
 		return 1;
 
@@ -4159,8 +4212,15 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
 
 			return 1;
 		}
+               case MJSON_TOK_ARRAY: {
+                       // We copy the complete array, including square brackets into the return buffer
+                       // result looks like: ["manage-account","manage-account-links","view-profile"]
+                       trash->data = b_putblk(trash, token, token_size);
+                       smp->data.u.str = *trash;
+                       smp->data.type = SMP_T_STR;
+                       return 1;
+               }
 		case MJSON_TOK_NULL:
-		case MJSON_TOK_ARRAY:
 		case MJSON_TOK_OBJECT:
 			/* We cannot handle these. */
 			return 0;
@@ -4905,9 +4965,63 @@ error:
 	return 0;
 }
 
+/* bytes_{in,out} */
+static int smp_fetch_bytes(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
 
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+	if (!logs)
+		return 0;
+
+	if (kw[6] == 'i') { /* bytes_in */
+		smp->data.u.sint = logs->bytes_in;
+	} else { /* bytes_out */
+		smp->data.u.sint = logs->bytes_out;
+	}
+
+	return 1;
+}
+
+static int sample_conv_bytes_check(struct arg *args, struct sample_conv *conv,
+                          const char *file, int line, char **err)
+{
+	// arg0 is not optional, must be >= 0
+	if (!check_operator(&args[0], conv, file, line, err)) {
+		return 0;
+	}
+	if (args[0].type != ARGT_VAR) {
+		if (args[0].type != ARGT_SINT || args[0].data.sint < 0) {
+			memprintf(err, "expects a non-negative integer");
+			return 0;
+		}
+	}
+	// arg1 is optional, must be > 0
+	if (args[1].type != ARGT_STOP) {
+		if (!check_operator(&args[1], conv, file, line, err)) {
+			return 0;
+		}
+		if (args[1].type != ARGT_VAR) {
+			if (args[1].type != ARGT_SINT || args[1].data.sint <= 0) {
+				memprintf(err, "expects a positive integer");
+				return 0;
+			}
+		}
+	}
+
+	return 1;
+}
 
 static struct sample_fetch_kw_list smp_logs_kws = {ILH, {
+	{ "bytes_in",             smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "bytes_out",            smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+
 	{ "txn.timer.total",      smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Ta" */
 	{ "txn.timer.user",       smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Tu" */
 
@@ -4999,7 +5113,7 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "xxh32",   sample_conv_xxh32,        ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "xxh64",   sample_conv_xxh64,        ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "json",    sample_conv_json,         ARG1(1,STR),           sample_conv_json_check,   SMP_T_STR,  SMP_T_STR  },
-	{ "bytes",   sample_conv_bytes,        ARG2(1,SINT,SINT),     NULL,                     SMP_T_BIN,  SMP_T_BIN  },
+	{ "bytes",   sample_conv_bytes,        ARG2(1,STR,STR),       sample_conv_bytes_check,  SMP_T_BIN,  SMP_T_BIN  },
 	{ "field",   sample_conv_field,        ARG3(2,SINT,STR,SINT), sample_conv_field_check,  SMP_T_STR,  SMP_T_STR  },
 	{ "word",    sample_conv_word,         ARG3(2,SINT,STR,SINT), sample_conv_field_check,  SMP_T_STR,  SMP_T_STR  },
 	{ "param",   sample_conv_param,        ARG2(1,STR,STR),       sample_conv_param_check,  SMP_T_STR,  SMP_T_STR  },

@@ -1,6 +1,237 @@
 ChangeLog :
 ===========
 
+2023/10/20 : 2.9-dev8
+    - MINOR: ssl: add an explicit error when 'ciphersuites' are not supported
+    - BUILD: ssl: enable 'ciphersuites' for WolfSSL
+    - BUILD: ssl: add 'ssl_c_r_dn' fetch for WolfSSL
+    - BUILD: ssl: add 'secure_memcmp' converter for WolfSSL and awslc
+    - BUILD: ssl: enable keylog for awslc
+    - CLEANUP: ssl: remove compat functions for openssl < 1.0.0
+    - BUILD: ssl: enable keylog for WolfSSL
+    - REGTESTS: pki: add a pki for SSL tests
+    - REGTESTS: ssl: update common.pem with the new pki
+    - REGTESTS: ssl: disable ssl_dh.vtc for WolfSSL
+    - REGTESTS: wolfssl: temporarly disable some failing reg-tests
+    - CI: ssl: add wolfssl to build-ssl.sh
+    - CI: ssl: add git id support for wolfssl download
+    - CI: github: add a wolfssl entry to the CI
+    - CI: github: update wolfssl to git revision d83f2fa
+    - CI: github: add awslc 1.16.0 to the push CI
+    - BUG/MINOR: quic: Avoid crashing with unsupported cryptographic algos
+    - REORG: quic: cleanup traces definition
+    - BUG/MINOR: quic: reject packet with no frame
+    - BUG/MEDIUM: mux-quic: fix RESET_STREAM on send-only stream
+    - BUG/MINOR: mux-quic: support initial 0 max-stream-data
+    - BUG/MINOR: h3: strengthen host/authority header parsing
+    - CLEANUP: connection: drop an uneeded leftover cast
+    - BUG/MAJOR: connection: make sure to always remove a connection from the tree
+    - BUG/MINOR: quic: fix qc.cids access on quic-conn fail alloc
+    - BUG/MINOR: quic: fix free on quic-conn fail alloc
+    - BUG/MINOR: mux-quic: fix free on qcs-new fail alloc
+    - BUG/MEDIUM: quic-conn: free unsent frames on retransmit to prevent crash
+    - MEDIUM: tree-wide: logsrv struct becomes logger
+    - MEDIUM: log: introduce log target
+    - DOC: config: log <address> becomes log <target> in "log" related doc
+    - MEDIUM: sink/log: stop relying on AF_UNSPEC for rings
+    - MINOR: log: support explicit log target as argument in __do_send_log()
+    - MINOR: log: remove the logger dependency in do_send_log()
+    - MEDIUM: log/sink: simplify log header handling
+    - MEDIUM: sink: inherit from caller fmt in ring_write() when rings didn't set one
+    - MINOR: sink: add sink_new_from_srv() function
+    - MAJOR: log: introduce log backends
+    - MINOR: log/balance: support for the "sticky" lb algorithm
+    - MINOR: log/balance: support for the "random" lb algorithm
+    - MINOR: lbprm: support for the "none" hash-type function
+    - MINOR: lbprm: compute the hash avalanche in gen_hash()
+    - MINOR: sample: add sample_process_cnv() function
+    - MEDIUM: log/balance: support for the "hash" lb algorithm
+    - REGTEST: add a test for log-backend used as a log target
+    - MINOR: server: introduce "log-bufsize" kw
+    - BUG/MEDIUM: stconn: Report a send activity everytime data were sent
+    - BUG/MEDIUM: applet: Report a send activity everytime data were sent
+    - BUG/MINOR: mux-h1: Send a 400-bad-request on shutdown before the first request
+    - MINOR: support for http-response set-timeout
+    - BUG/MINOR: mux-h2: make up other blocked streams upon removal from list
+    - DEBUG: pool: store the memprof bin on alloc() and update it on free()
+    - BUG/MEDIUM: quic_conn: let the scheduler kill the task when needed
+    - CLEANUP: hlua: Remove dead-code on error path in hlua_socket_new()
+    - BUG/MEDIUM: mux-h1: do not forget TLR/EOT even when no data is sent
+    - BUG/MINOR: htpp-ana/stats: Specify that HTX redirect messages have a C-L header
+    - BUG/MEDIUM: mux-h2: Don't report an error on shutr if a shutw is pending
+    - MEDIUM: stconn/channel: Move pipes used for the splicing in the SE descriptors
+    - MINOR: stconn: Start to introduce mux-to-mux fast-forwarding notion
+    - MINOR: stconn: Extend iobuf to handle a buffer in addition to a pipe
+    - MINOR: connection: Add new mux callbacks to perform data fast-forwarding
+    - MINOR: stconn: Temporarily remove kernel splicing support
+    - MINOR: mux-pt: Temporarily remove splicing support
+    - MINOR: mux-h1: Temporarily remove splicing support
+    - MINOR: connection: Remove mux callbacks about splicing
+    - MEDIUM: stconn: Add mux-to-mux fast-forward support
+    - MINOR: mux-h1: Use HTX extra field only for responses with known length
+    - MEDIUM: mux-h1: Properly handle state transitions of chunked outgoing messages
+    - MEDIUM: raw-sock: Specifiy amount of data to send via snd_pipe callback
+    - MINOR: mux-h1: Add function to add size of a chunk to an outgoind message
+    - MEDIUM: mux-h1: Simplify zero-copy on sending path
+    - MEDIUM: mux-h1: Simplify payload formatting based on HTX blocks on sending path
+    - MEDIUM: mux-h1: Add fast-forwarding support
+    - MINOR: h2: Set the BODYLESS_RESP flag on the HTX start-line if necessary
+    - MEDIUM: mux-h2: Add consumer-side fast-forwarding support
+    - MEDIUM: channel: don't look at iobuf to report an empty channel
+    - MINOR: tree-wide: Only rely on co_data() to check channel emptyness
+    - REGTESTS: Reenable HTTP tests about splicing
+    - CLEAN: mux-h1: Remove useless __maybe_unused attribute on h1_make_chunk()
+    - MEDIUM: mux-pt: Add fast-forwarding support
+    - MINOR: global: Add an option to disable the zero-copy forwarding
+    - BUILD: mux-h1: Fix build without kernel splicing support
+    - REORG: stconn/muxes: Rename init step in fast-forwarding
+    - MINOR: dgram: allow to set rcv/sndbuf for dgram sockets as well
+    - BUG/MINOR: mux-h2: fix http-request and http-keep-alive timeouts again
+    - BUG/MINOR: trace: fix trace parser error reporting
+    - BUG/MEDIUM: peers: Be sure to always refresh recconnect timer in sync task
+    - BUG/MEDIUM: peers: Fix synchro for huge number of tables
+    - MINOR: cfgparse: forbid mixing reverse and standard listeners
+    - MINOR: listener: add nbconn kw for reverse connect
+    - MINOR: server: convert @reverse to rev@ standard format
+    - MINOR: cfgparse: rename "rev@" prefix to "rhttp@"
+    - REGTESTS: remove maxconn from rhttp bind line
+    - MINOR: listener: forbid most keywords for reverse HTTP bind
+    - MINOR: sample: Added support for Arrays in sample_conv_json_query in sample.c
+    - MINOR: mux-h2/traces: explicitly show the error/refused stream states
+    - MINOR: mux-h2/traces: clarify the "rejected H2 request" event
+    - BUG/MINOR: mux-h2: commit the current stream ID even on reject
+    - BUG/MINOR: mux-h2: update tracked counters with req cnt/req err
+
+2023/10/06 : 2.9-dev7
+    - MINOR: support for http-request set-timeout client
+    - BUG/MINOR: mux-quic: remove full demux flag on ncbuf release
+    - CLEANUP: freq_ctr: make all freq_ctr readers take a const
+    - CLEANUP: stream: make the dump code not depend on the CLI appctx
+    - MINOR: stream: split stats_dump_full_strm_to_buffer() in two
+    - CLEANUP: stream: use const filters in the dump function
+    - CLEANUP: stream: make strm_dump_to_buffer() take a const stream
+    - MINOR: stream: make strm_dump_to_buffer() take an arbitrary buffer
+    - MINOR: stream: make strm_dump_to_buffer() show the list of filters
+    - MINOR: stream: make stream_dump() always multi-line
+    - MINOR: streams: add support for line prefixes to strm_dump_to_buffer()
+    - MEDIUM: stream: now provide full stream dumps in case of loops
+    - MINOR: debug: use the more detailed stream dump in panics
+    - CLEANUP: stream: remove the now unused stream_dump() function
+    - Revert "BUG/MEDIUM: quic: missing check of dcid for init pkt including a token"
+    - MINOR: stream: fix output alignment of stuck thread dumps
+    - BUG/MINOR: proto_reverse_connect: fix FD leak on connection error
+    - BUG/MINOR: tcp_act: fix attach-srv rule ACL parsing
+    - MINOR: connection: define error for reverse connect
+    - MINOR: connection: define mux flag for reverse support
+    - MINOR: tcp_act: remove limitation on protocol for attach-srv
+    - BUG/MINOR: proto_reverse_connect: fix FD leak upon connect
+    - BUG/MAJOR: plock: fix major bug in pl_take_w() introduced with EBO
+    - Revert "MEDIUM: sample: Small fix in function check_operator for eror reporting"
+    - DOC: sample: Add a comment in 'check_operator' to explain why 'vars_check_arg' should ignore the 'err' buffer
+    - DEV: sslkeylogger: handle file opening error
+    - MINOR: quic: define quic-socket bind setting
+    - MINOR: quic: handle perm error on bind during runtime
+    - MINOR: backend: refactor specific source address allocation
+    - MINOR: proto_reverse_connect: support source address setting
+    - BUILD: pool: Fix GCC error about potential null pointer dereference
+    - MINOR: hlua: Set context's appctx when the lua socket is created
+    - MINOR: hlua: Don't preform operations on a not connected socket
+    - MINOR: hlua: Save the lua socket's timeout in its context
+    - MINOR: hlua: Save the lua socket's server in its context
+    - MINOR: hlua: Test the hlua struct first when the lua socket is connecting
+    - BUG/MEDIUM: hlua: Initialize appctx used by a lua socket on connect only
+    - DEBUG: mux-h1: Fix event label from trace messages about payload formatting
+    - BUG/MINOR: mux-h1: Handle read0 in rcv_pipe() only when data receipt was tried
+    - BUG/MINOR: mux-h1: Ignore C-L when sending H1 messages if T-E is also set
+    - BUG/MEDIUM: h1: Ignore C-L value in the H1 parser if T-E is also set
+    - REGTESTS: filters: Don't set C-L header in the successful response to CONNECT
+    - MINOR: mux-h1: Add flags if outgoing msg contains a header about its payload
+    - MINOR: mux-h1: Rely on H1S_F_HAVE_CHNK to add T-E in outgoing messages
+    - BUG/MEDIUM: mux-h1: Add C-L header in outgoing message if it was removed
+    - BUG/MEDIUM: mux-h1; Ignore headers modifications about payload representation
+    - BUG/MINOR: h1-htx: Keep flags about C-L/T-E during HEAD response parsing
+    - MINOR: h1-htx: Declare successful tunnel establishment as bodyless
+    - BUILD: quic: allow USE_QUIC to work with AWSLC
+    - CI: github: add USE_QUIC=1 to aws-lc build
+    - BUG/MINOR: hq-interop: simplify parser requirement
+    - MEDIUM: cache: Add "Origin" header to secondary cache key
+    - MINOR: haproxy: permit to register features during boot
+    - MINOR: tcp_rules: tcp-{request,response} requires TCP or HTTP mode
+    - MINOR: stktable: "stick" requires TCP or HTTP mode
+    - MINOR: filter: "filter" requires TCP or HTTP mode
+    - MINOR: backend/balance: "balance" requires TCP or HTTP mode
+    - MINOR: flt_http_comp: "compression" requires TCP or HTTP mode
+    - MINOR: http_htx/errors: prevent the use of some keywords when not in tcp/http mode
+    - MINOR: fcgi-app: "use-fcgi-app" requires TCP or HTTP mode
+    - MINOR: cfgparse-listen: "http-send-name-header" requires TCP or HTTP mode
+    - MINOR: cfgparse-listen: "dynamic-cookie-key" requires TCP or HTTP mode
+    - MINOR: proxy: dynamic-cookie CLIs require TCP or HTTP mode
+    - MINOR: cfgparse-listen: "http-reuse" requires TCP or HTTP mode
+    - MINOR: proxy: report a warning for max_ka_queue in proxy_cfg_ensure_no_http()
+    - MINOR: cfgparse-listen: warn when use-server rules is used in wrong mode
+    - DOC: config: unify "log" directive doc
+    - MINOR: sink/log: fix some typos around postparsing logic
+    - MINOR: sink: remove useless check after sink creation
+    - MINOR: sink: don't rely on p->parent in sink appctx
+    - MINOR: sink: don't rely on forward_px to init sink forwarding
+    - MINOR: sink: refine forward_px usage
+    - MINOR: sink: function to add new sink servers
+    - BUG/MEDIUM: stconn: Fix comparison sign in sc_need_room()
+    - BUG/MEDIUM: actions: always apply a longest match on prefix lookup
+
+2023/09/22 : 2.9-dev6
+    - BUG/MINOR: quic: fdtab array underflow access
+    - DEBUG: pools: always record the caller for uncached allocs as well
+    - DEBUG: pools: pass the caller pointer to the check functions and macros
+    - DEBUG: pools: make pool_check_pattern() take a pointer to the pool
+    - DEBUG: pools: inspect pools on fatal error and dump information found
+    - BUG/MEDIUM: quic: quic_cc_conn ->cntrs counters unreachable
+    - DEBUG: pools: also print the item's pointer when crashing
+    - DEBUG: pools: also print the value of the tag when it doesn't match
+    - DEBUG: pools: print the contents surrounding the expected tag location
+    - MEDIUM: pools: refine pool size rounding
+    - BUG/MEDIUM: hlua: don't pass stale nargs argument to lua_resume()
+    - BUG/MINOR: hlua/init: coroutine may not resume itself
+    - BUG/MEDIUM: mux-fcgi: Don't swap trash and dbuf when handling STDERR records
+    - BUG/MINOR: promex: fix backend_agg_check_status
+    - BUG/MEDIUM: master/cli: Pin the master CLI on the first thread of the group 1
+    - MAJOR: import: update mt_list to support exponential back-off
+    - CLEANUP: pools: simplify the pool expression when no pool was matched in dump
+    - MINOR: samples: implement bytes_in and bytes_out samples
+    - DOC: configuration: add %[req.ver] sample to %HV
+    - BUG/MINOR: quic: Leak of frames to send.
+    - DOC: configuration: add %[query] to %HQ
+    - BUG/MINOR: freq_ctr: fix possible negative rate with the scaled API
+    - BUG/MAJOR: mux-h2: Report a protocol error for any DATA frame before headers
+    - BUILD: quic: fix build on centos 8 and USE_QUIC_OPENSSL_COMPAT
+    - Revert "MAJOR: import: update mt_list to support exponential back-off"
+    - BUG/MINOR: server: add missing free for server->rdr_pfx
+    - REGTESTS: ssl: skip OCSP test w/ WolfSSL
+    - REGTESTS: ssl: skip generate-certificates test w/ wolfSSL
+    - MINOR: logs: clarify the check of the log range
+    - MINOR: log: remove the unused curr_idx in struct smp_log_range
+    - CLEANUP: logs: rename a confusing local variable "curr_rg" to "smp_rg"
+    - MINOR: logs: use a single index to store the current range and index
+    - MEDIUM: logs: atomically check and update the log sample index
+    - CLEANUP: ring: rename the ring lock "RING_LOCK" instead of "LOGSRV_LOCK"
+    - BUG/MEDIUM: http-ana: Try to handle response before handling server abort
+    - MEDIUM: tools/ip: v4tov6() and v6tov4() rework
+    - MINOR: pattern/ip: offload ip conversion logic to helper functions
+    - MINOR: pattern: fix pat_{parse,match}_ip() function comments
+    - MINOR: pattern/ip: simplify pat_match_ip() function
+    - BUG/MEDIUM: server/cli: don't delete a dynamic server that has streams
+    - MINOR: hlua: Add support for the "http-after-res" action
+    - BUG/MINOR: proto_reverse_connect: fix preconnect with startup name resolution
+    - MINOR: proto_reverse_connect: prevent transparent server for pre-connect
+    - CI: cirrus-ci: display gdb bt if any
+    - MEDIUM: sample: Enhances converter "bytes" to take variable names as arguments
+    - MEDIUM: sample: Small fix in function check_operator for eror reporting
+    - MINOR: quic: handle external extra CIDs generator.
+    - BUG/MINOR: proto_reverse_connect: set default maxconn
+    - MINOR: proto_reverse_connect: refactor preconnect failure
+    - MINOR: proto_reverse_connect: remove unneeded wakeup
+    - MINOR: proto_reverse_connect: emit log for preconnect
+
 2023/09/08 : 2.9-dev5
     - BUG/MEDIUM: mux-h2: fix crash when checking for reverse connection after error
     - BUILD: import: guard plock.h against multiple inclusion

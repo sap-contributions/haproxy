@@ -321,16 +321,6 @@ static inline void conn_set_private(struct connection *conn)
 	}
 }
 
-/* Used to know if a connection is in an idle list. It returns connection flag
- * corresponding to the idle list if the connection is idle (CO_FL_SAFE_LIST or
- * CO_FL_IDLE_LIST) or 0 otherwise. Note that if the connection is scheduled to
- * be removed, 0 is returned, regardless the connection flags.
- */
-static inline unsigned int conn_get_idle_flag(const struct connection *conn)
-{
-	return (!MT_LIST_INLIST(&conn->toremove_list) ? conn->flags & CO_FL_LIST_MASK : 0);
-}
-
 static inline void conn_force_unsubscribe(struct connection *conn)
 {
 	if (!conn->subs)
@@ -688,6 +678,10 @@ void list_mux_proto(FILE *out);
  * HTTP). <mux_proto> can be empty. Will fall back to the first compatible mux
  * with exactly the same <proto_mode> or with an empty name. May return
  * null if the code improperly registered the default mux to use as a fallback.
+ *
+ * <proto_mode> expects PROTO_MODE_* value only: PROXY_MODE_* values should
+ * never be used directly here (but you may use conn_pr_mode_to_proto_mode()
+ * to map proxy mode to corresponding proto mode before calling the function).
  */
 static inline const struct mux_proto_list *conn_get_best_mux_entry(
         const struct ist mux_proto,
@@ -814,6 +808,21 @@ static inline void set_tlv_arg(int tlv_type, struct arg *tlv_arg)
 {
 	tlv_arg->type = ARGT_SINT;
 	tlv_arg->data.sint = tlv_type;
+}
+
+/*
+ * Map proxy mode (PR_MODE_*) to equivalent proto_proxy_mode (PROTO_MODE_*)
+ */
+static inline int conn_pr_mode_to_proto_mode(int proxy_mode)
+{
+	int mode;
+
+	/* for now we only support TCP and HTTP proto_modes, so we
+	 * consider that if it's not HTTP, then it's TCP
+	 */
+	mode = 1 << (proxy_mode == PR_MODE_HTTP);
+
+	return mode;
 }
 
 #endif /* _HAPROXY_CONNECTION_H */

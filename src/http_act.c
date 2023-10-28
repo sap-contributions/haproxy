@@ -2192,18 +2192,7 @@ static enum act_parse_ret parse_http_set_timeout(const char **args,
 		return ACT_RET_PRS_ERR;
 	}
 
-	if (!(px->cap & PR_CAP_BE)) {
-		memprintf(err, "proxy '%s' has no backend capability", px->id);
-		return ACT_RET_PRS_ERR;
-	}
-
-	if (cfg_parse_rule_set_timeout(args, cur_arg,
-	                               &rule->arg.timeout.value,
-	                               &rule->arg.timeout.type,
-	                               &rule->arg.timeout.expr,
-	                               err,
-	                               px->conf.args.file,
-	                               px->conf.args.line, &px->conf.args) == -1) {
+	if (cfg_parse_rule_set_timeout(args, cur_arg, rule, px, err) == -1) {
 		return ACT_RET_PRS_ERR;
 	}
 
@@ -2475,6 +2464,7 @@ static struct action_kw_list http_res_actions = {
 		{ "set-status",      parse_http_set_status,     0 },
 		{ "strict-mode",     parse_http_strict_mode,    0 },
 		{ "track-sc",        parse_http_track_sc,       KWF_MATCH_PREFIX },
+		{ "set-timeout",     parse_http_set_timeout,    0 },
 		{ "wait-for-body",   parse_http_wait_for_body,  0 },
 		{ NULL, NULL }
 	}

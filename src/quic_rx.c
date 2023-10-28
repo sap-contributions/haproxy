@@ -14,6 +14,7 @@
 
 #include <haproxy/quic_rx.h>
 
+#include <haproxy/frontend.h>
 #include <haproxy/h3.h>
 #include <haproxy/list.h>
 #include <haproxy/ncbuf.h>
@@ -23,10 +24,10 @@
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_ssl.h>
 #include <haproxy/quic_tls.h>
+#include <haproxy/quic_trace.h>
 #include <haproxy/quic_tx.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/trace.h>
-
-#define TRACE_SOURCE &trace_quic
 
 DECLARE_POOL(pool_head_quic_conn_rxbuf, "quic_conn_rxbuf", QUIC_CONN_RX_BUFSZ);
 DECLARE_POOL(pool_head_quic_dgram, "quic_dgram", sizeof(struct quic_dgram));
@@ -943,6 +944,20 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	pos = pkt->data + pkt->aad_len;
 	end = pkt->data + pkt->len;
 
+	/* Packet with no frame. */
+	if (pos == end) {
+		/* RFC9000 12.4. Frames and Frame Types
+		 *
+		 * The payload of a packet that contains frames MUST contain at least
+		 * one frame, and MAY contain multiple frames and multiple frame types.
+		 * An endpoint MUST treat receipt of a packet containing no frames as a
+		 * connection error of type PROTOCOL_VIOLATION. Frames always fit within
+		 * a single QUIC packet and cannot span multiple packets.
+		 */
+		quic_set_connection_close(qc, quic_err_transport(QC_ERR_PROTOCOL_VIOLATION));
+		goto leave;
+	}
+
 	while (pos < end) {
 		if (!qc_parse_frm(&frm, pkt, &pos, end, qc)) {
 			// trace already emitted by function above
@@ -1716,8 +1731,7 @@ static int quic_retry_token_check(struct quic_rx_packet *pkt,
 	const uint64_t tokenlen = pkt->token_len;
 	unsigned char buf[128];
 	unsigned char aad[sizeof(uint32_t) + QUIC_CID_MAXLEN +
-		          sizeof(in_port_t) + sizeof(struct in6_addr) +
-			  QUIC_CID_MAXLEN];
+	                  sizeof(in_port_t) + sizeof(struct in6_addr)];
 	size_t aadlen;
 	const unsigned char *salt;
 	unsigned char key[QUIC_TLS_KEY_LEN];
@@ -1758,7 +1772,7 @@ static int quic_retry_token_check(struct quic_rx_packet *pkt,
 		goto err;
 	}
 
-	aadlen = quic_generate_retry_token_aad(aad, qv->num, &pkt->dcid, &pkt->scid, &dgram->saddr);
+	aadlen = quic_generate_retry_token_aad(aad, qv->num, &pkt->scid, &dgram->saddr);
 	salt = token + tokenlen - QUIC_RETRY_TOKEN_SALTLEN;
 	if (!quic_tls_derive_retry_token_secret(EVP_sha256(), key, sizeof key, iv, sizeof iv,
 	                                        salt, QUIC_RETRY_TOKEN_SALTLEN, sec, seclen)) {
@@ -1889,6 +1903,7 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 	struct quic_conn *qc = NULL;
 	struct proxy *prx;
 	struct quic_counters *prx_counters;
+	unsigned int next_actconn = 0, next_sslconn = 0;
 
 	TRACE_ENTER(QUIC_EV_CONN_LPKT);
 
@@ -1946,6 +1961,21 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 			pkt->saddr = dgram->saddr;
 			ipv4 = dgram->saddr.ss_family == AF_INET;
 
+			next_actconn = increment_actconn();
+			if (!next_actconn) {
+				_HA_ATOMIC_INC(&maxconn_reached);
+				TRACE_STATE("drop packet on maxconn reached",
+				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+				goto err;
+			}
+
+			next_sslconn = increment_sslconn();
+			if (!next_sslconn) {
+				TRACE_STATE("drop packet on sslconn reached",
+				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+				goto err;
+			}
+
 			/* Generate the first connection CID. This is derived from the client
 			 * ODCID and address. This allows to retrieve the connection from the
 			 * ODCID without storing it in the CID tree. This is an interesting
@@ -1963,6 +1993,18 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 				pool_free(pool_head_quic_connection_id, conn_id);
 				goto err;
 			}
+
+			/* Now quic_conn is allocated. If a future error
+			 * occurred it will be freed with quic_conn_release()
+			 * which also ensure actconn/sslconns is decremented.
+			 * Reset guard values to prevent a double decrement.
+			 */
+			next_sslconn = next_actconn = 0;
+
+			/* Compute and store into the quic_conn the hash used to compute extra CIDs */
+			if (quic_hash64_from_cid)
+				qc->hash64 = quic_hash64_from_cid(conn_id->cid.data, conn_id->cid.len,
+								  global.cluster_secret, sizeof(global.cluster_secret));
 
 			tree = &quic_cid_trees[quic_cid_tree_idx(&conn_id->cid)];
 			HA_RWLOCK_WRLOCK(QC_CID_LOCK, &tree->lock);
@@ -2008,6 +2050,13 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 		qc->cntrs.dropped_pkt++;
 	else
 		HA_ATOMIC_INC(&prx_counters->dropped_pkt);
+
+	/* Reset active conn counter if needed. */
+	if (next_actconn)
+		_HA_ATOMIC_DEC(&actconn);
+	if (next_sslconn)
+		_HA_ATOMIC_DEC(&global.sslconns);
+
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
 	return NULL;
 }

@@ -116,6 +116,10 @@ const struct quic_version quic_versions[] = {
 	},
 };
 
+/* Function pointers, can be used to compute a hash from first generated CID and to derive new CIDs */
+uint64_t (*quic_hash64_from_cid)(const unsigned char *cid, int size, const unsigned char *secret, size_t secretlen) = NULL;
+void (*quic_newcid_from_hash64)(unsigned char *cid, int size, uint64_t hash, const unsigned char *secret, size_t secretlen) = NULL;
+
 /* The total number of supported versions */
 const size_t quic_versions_nb = sizeof quic_versions / sizeof *quic_versions;
 /* Listener only preferred version */
@@ -644,8 +648,11 @@ struct quic_connection_id *new_quic_cid(struct eb_root *root,
 	conn_id->cid.len = QUIC_HAP_CID_LEN;
 
 	if (!orig) {
-		/* TODO: RAND_bytes() should be replaced */
-		if (RAND_bytes(conn_id->cid.data, conn_id->cid.len) != 1) {
+		if (quic_newcid_from_hash64)
+			quic_newcid_from_hash64(conn_id->cid.data, conn_id->cid.len, qc->hash64,
+						global.cluster_secret, sizeof(global.cluster_secret));
+		else if (RAND_bytes(conn_id->cid.data, conn_id->cid.len) != 1) {
+			/* TODO: RAND_bytes() should be replaced */
 			TRACE_ERROR("RAND_bytes() failed", QUIC_EV_CONN_TXPKT, qc);
 			goto err;
 		}
@@ -1053,7 +1060,6 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 
 	if (qc->flags & (QUIC_FL_CONN_DRAINING|QUIC_FL_CONN_TO_KILL)) {
 		TRACE_PROTO("cancelled action (draining state)", QUIC_EV_CONN_PTIMER, qc);
-		task = NULL;
 		goto out;
 	}
 
@@ -1177,6 +1183,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 
 	/* Required to call free_quic_conn_cids() from quic_conn_release() */
 	qc->cids = NULL;
+	qc->tx.cc_buf_area = NULL;
 	qc_init_fd(qc);
 
 	LIST_INIT(&qc->back_refs);
@@ -1257,7 +1264,8 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 
 	conn_id->qc = qc;
 
-	if ((global.tune.options & GTUNE_QUIC_SOCK_PER_CONN) &&
+	if (HA_ATOMIC_LOAD(&l->rx.quic_mode) == QUIC_SOCK_MODE_CONN &&
+	    (global.tune.options & GTUNE_QUIC_SOCK_PER_CONN) &&
 	    is_addr(local_addr)) {
 		TRACE_USER("Allocate a socket for QUIC connection", QUIC_EV_CONN_INIT, qc);
 		qc_alloc_fd(qc, local_addr, peer_addr);
@@ -1427,6 +1435,12 @@ void quic_conn_release(struct quic_conn *qc)
 		qc_free_ssl_sock_ctx(&qc->xprt_ctx);
 	}
 
+	/* Decrement on quic_conn free. quic_cc_conn instances are not counted
+	 * into global counters because they are designed to run for a limited
+	 * time with a limited memory.
+	 */
+	_HA_ATOMIC_DEC(&actconn);
+
 	/* in the unlikely (but possible) case the connection was just added to
 	 * the accept_list we must delete it from there.
 	 */
@@ -1526,7 +1540,33 @@ void qc_idle_timer_do_rearm(struct quic_conn *qc, int arm_ack)
 		task_wakeup(qc->idle_timer_task, TASK_WOKEN_MSG);
 	}
 	else {
-		expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
+		if (qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_DRAINING)) {
+			/* RFC 9000 10.2. Immediate Close
+			 *
+			 * The closing and draining connection states exist to ensure that
+			 * connections close cleanly and that delayed or reordered packets are
+			 * properly discarded. These states SHOULD persist for at least three
+			 * times the current PTO interval as defined in [QUIC-RECOVERY].
+			 */
+
+			/* Delay is limited to 1s which should cover most of
+			 * network conditions. The process should not be
+			 * impacted by a connection with a high RTT.
+			 */
+			expire = MIN(3 * quic_pto(qc), 1000);
+		}
+		else {
+			/* RFC 9000 10.1. Idle Timeout
+			 *
+			 * To avoid excessively small idle timeout periods, endpoints MUST
+			 * increase the idle timeout period to be at least three times the
+			 * current Probe Timeout (PTO). This allows for multiple PTOs to expire,
+			 * and therefore multiple probes to be sent and lost, prior to idle
+			 * timeout.
+			 */
+			expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
+		}
+
 		qc->idle_expire = tick_add(now_ms, MS_TO_TICKS(expire));
 		if (arm_ack) {
 			/* Arm the ack timer only if not already armed. */
@@ -1606,6 +1646,7 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 	if (qc->mux_state != QC_MUX_READY) {
 		quic_conn_release(qc);
 		qc = NULL;
+		t = NULL;
 	}
 
 	/* TODO if the quic-conn cannot be freed because of the MUX, we may at
@@ -1617,10 +1658,6 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 		TRACE_DEVEL("dec half open counter", QUIC_EV_CONN_IDLE_TIMER, qc);
 		HA_ATOMIC_DEC(&prx_counters->half_open_conn);
 	}
-
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_IDLE_TIMER, qc);
-	return NULL;
 
  requeue:
 	TRACE_LEAVE(QUIC_EV_CONN_IDLE_TIMER, qc);

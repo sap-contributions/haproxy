@@ -45,13 +45,14 @@
 #define H1C_F_SILENT_SHUT    0x00000800 /* if H1C is closed closed, silent (or dirty) shutdown must be performed */
 #define H1C_F_ABRT_PENDING   0x00001000 /* An error must be sent (previous attempt failed) and H1 connection must be closed ASAP */
 #define H1C_F_ABRTED         0x00002000 /* An error must be sent (previous attempt failed) and H1 connection must be closed ASAP */
-#define H1C_F_WANT_SPLICE    0x00004000 /* Don't read into a buffer because we want to use or we are using splicing */
+#define H1C_F_WANT_FASTFWD   0x00004000 /* Don't read into a buffer because we want to fast forward data */
 #define H1C_F_WAIT_NEXT_REQ  0x00008000 /*  waiting for the next request to start, use keep-alive timeout */
 #define H1C_F_UPG_H2C        0x00010000 /* set if an upgrade to h2 should be done */
 #define H1C_F_CO_MSG_MORE    0x00020000 /* set if CO_SFL_MSG_MORE must be set when calling xprt->snd_buf() */
 #define H1C_F_CO_STREAMER    0x00040000 /* set if CO_SFL_STREAMER must be set when calling xprt->snd_buf() */
+#define H1C_F_CANT_FASTFWD   0x00080000 /* Fast-forwarding is not supported (exclusive with WANT_FASTFWD) */
 
-/* 0x00040000 - 0x40000000 unused */
+/* 0x00100000 - 0x40000000 unused */
 #define H1C_F_IS_BACK        0x80000000 /* Set on outgoing connection */
 
 
@@ -69,8 +70,8 @@ static forceinline char *h1c_show_flags(char *buf, size_t len, const char *delim
 	_(H1C_F_IN_ALLOC, _(H1C_F_IN_FULL, _(H1C_F_IN_SALLOC,
 	_(H1C_F_EOS, _(H1C_F_ERR_PENDING, _(H1C_F_ERROR,
 	_(H1C_F_SILENT_SHUT, _(H1C_F_ABRT_PENDING, _(H1C_F_ABRTED,
-	_(H1C_F_WANT_SPLICE, _(H1C_F_WAIT_NEXT_REQ, _(H1C_F_UPG_H2C, _(H1C_F_CO_MSG_MORE,
-	_(H1C_F_CO_STREAMER, _(H1C_F_IS_BACK)))))))))))))))));
+	_(H1C_F_WANT_FASTFWD, _(H1C_F_WAIT_NEXT_REQ, _(H1C_F_UPG_H2C, _(H1C_F_CO_MSG_MORE,
+	_(H1C_F_CO_STREAMER, _(H1C_F_CANT_FASTFWD, _(H1C_F_IS_BACK))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -102,6 +103,8 @@ static forceinline char *h1c_show_flags(char *buf, size_t len, const char *delim
 #define H1S_F_HAVE_SRV_NAME  0x00002000 /* Set during output process if the server name header was added to the request */
 #define H1S_F_HAVE_O_CONN    0x00004000 /* Set during output process to know connection mode was processed */
 #define H1S_F_HAVE_WS_KEY    0x00008000 /* Set during output process to know WS key was found or generated */
+#define H1S_F_HAVE_CLEN      0x00010000 /* Set during output process to know C*L header was found or generated */
+#define H1S_F_HAVE_CHNK      0x00020000 /* Set during output process to know "T-E; chunk" header was found or generated */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -117,7 +120,8 @@ static forceinline char *h1s_show_flags(char *buf, size_t len, const char *delim
 	_(H1S_F_WANT_KAL, _(H1S_F_WANT_TUN, _(H1S_F_WANT_CLO,
 	_(H1S_F_NOT_FIRST, _(H1S_F_BODYLESS_RESP,
 	_(H1S_F_INTERNAL_ERROR, _(H1S_F_NOT_IMPL_ERROR, _(H1S_F_PARSING_ERROR, _(H1S_F_PROCESSING_ERROR,
-	_(H1S_F_HAVE_SRV_NAME, _(H1S_F_HAVE_O_CONN, _(H1S_F_HAVE_WS_KEY)))))))))))))));
+	_(H1S_F_HAVE_SRV_NAME, _(H1S_F_HAVE_O_CONN, _(H1S_F_HAVE_WS_KEY,
+	_(H1S_F_HAVE_CLEN, _(H1S_F_HAVE_CHNK)))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;

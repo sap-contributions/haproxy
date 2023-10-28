@@ -97,11 +97,26 @@ enum log_meta {
         LOG_META_FIELDS  /* must always be the last */
 };
 
+/* log header data */
+struct log_header {
+	enum log_fmt format;  /* how to format the header */
+	int level, facility;  /* used by several formats */
+	struct ist *metadata; /* optional metadata - per-format */
+};
+
+#define LOG_HEADER_NONE (struct log_header){                              \
+                                             .format = LOG_FORMAT_UNSPEC, \
+                                             .level = 0,                  \
+                                             .facility = 0,               \
+                                             .metadata = NULL             \
+                                           }
+
 /* log target types */
 enum log_tgt {
 	LOG_TARGET_DGRAM = 0, // datagram address (udp, unix socket)
 	LOG_TARGET_FD,        // file descriptor
 	LOG_TARGET_BUFFER,    // ring buffer
+	LOG_TARGET_BACKEND,   // backend with SYSLOG mode
 };
 
 /* lists of fields that can be logged, for logformat_node->type */
@@ -208,9 +223,6 @@ struct smp_log_range {
 	size_t sz;               /* The size of this range, or number of indexes in
 	                          * this range.
 	                          */
-	unsigned int curr_idx;   /* The current index used to sample this range of
-	                          *indexes.
-	                          */
 };
 
 /* Log sampling information. */
@@ -218,30 +230,41 @@ struct smp_info {
 	struct smp_log_range *smp_rgs; /* Array of ranges for log sampling. */
 	size_t smp_rgs_sz;             /* The size of <smp_rgs> array. */
 	size_t smp_sz;             /* The total number of logs to be sampled. */
-	unsigned int curr_rg;      /* The current range to be sampled. */
-	unsigned int curr_idx;     /* A counter to store the current index of the log
-	                            * already sampled.
-	                            */
+	ullong curr_rg_idx;        /* 63:32 = current range; 31:0 = current index */
 };
 
-struct logsrv {
-	struct list list;
-	struct sockaddr_storage addr;
-	struct smp_info lb;
-	struct sink *sink;
-	char *ring_name;
+enum log_target_flags {
+	LOG_TARGET_FL_NONE     = 0x00,
+	LOG_TARGET_FL_RESOLVED = 0x01
+};
+
+struct log_target {
+	struct sockaddr_storage *addr;
+	union {
+		char *ring_name;   /* type = BUFFER  - preparsing */
+		struct sink *sink; /* type = BUFFER  - postparsing */
+		char *be_name;     /* type = BACKEND - preparsing */
+		struct proxy *be;  /* type = BACKEND - postparsing */
+		char *resolv_name; /* generic        - preparsing */
+	};
 	enum log_tgt type;
+	uint16_t flags;
+};
+
+struct logger {
+	struct list list;
+	struct log_target target;
+	struct smp_info lb;
 	enum log_fmt format;
 	int facility;
 	int level;
 	int minlvl;
 	int maxlen;
-	struct logsrv *ref;
+	struct logger *ref;
 	struct {
-                char *file;                     /* file where the logsrv appears */
-                int line;                       /* line where the logsrv appears */
+                char *file;                     /* file where the logger appears */
+                int line;                       /* line where the logger appears */
         } conf;
-	__decl_thread(HA_SPINLOCK_T lock);
 };
 
 #endif /* _HAPROXY_LOG_T_H */

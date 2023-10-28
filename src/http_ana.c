@@ -985,8 +985,12 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
 	if ((s->scb->flags & SC_FL_SHUT_DONE) && co_data(req)) {
 		/* request errors are most likely due to the server aborting the
-		 * transfer. */
-		goto return_srv_abort;
+		 * transfer.Bit handle server aborts only if there is no
+		 * response. Otherwise, let a change to foward the response
+		 * first.
+		 */
+		if (htx_is_empty(htxbuf(&s->res.buf)))
+			goto return_srv_abort;
 	}
 
 	http_end_request(s);
@@ -1023,8 +1027,13 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
  waiting:
 	/* waiting for the last bits to leave the buffer */
-	if (s->scb->flags & SC_FL_SHUT_DONE)
-		goto return_srv_abort;
+	if (s->scb->flags & SC_FL_SHUT_DONE) {
+		/* Handle server aborts only if there is no response. Otherwise,
+		 * let a change to foward the response first.
+		 */
+		if (htx_is_empty(htxbuf(&s->res.buf)))
+			goto return_srv_abort;
+	}
 
 	/* When TE: chunked is used, we need to get there again to parse remaining
 	 * chunks even if the client has closed, so we don't want to set CF_DONTCLOSE.
@@ -2408,7 +2417,7 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 	htx = htx_from_buf(&res->buf);
 	/* Trim any possible response */
 	channel_htx_truncate(&s->res, htx);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), status, reason);
 	if (!sl)
 		goto fail;
@@ -4172,7 +4181,7 @@ void http_perform_server_redirect(struct stream *s, struct stconn *sc)
 	 * Create the 302 response
 	 */
 	htx = htx_from_buf(&res->buf);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags,
 			    ist("HTTP/1.1"), ist("302"), ist("Found"));
 	if (!sl)
@@ -4305,7 +4314,7 @@ static void http_end_request(struct stream *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shut_wanted to take effect.
 		 */
-		if (channel_is_empty(chn)) {
+		if (!co_data(chn)) {
 			txn->req.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}
@@ -4408,7 +4417,7 @@ static void http_end_response(struct stream *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shut_wanted to take effect.
 		 */
-		if (channel_is_empty(chn)) {
+		if (!co_data(chn)) {
 			txn->rsp.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}

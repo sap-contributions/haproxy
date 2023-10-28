@@ -159,9 +159,9 @@ DECLARE_INIT_STAGES;
 empty_t __read_mostly_align HA_SECTION("read_mostly") ALIGNED(64);
 
 #ifdef BUILD_FEATURES
-const char *build_features = BUILD_FEATURES;
+char *build_features = BUILD_FEATURES;
 #else
-const char *build_features = "";
+char *build_features = "";
 #endif
 
 /* list of config files */
@@ -178,7 +178,7 @@ struct global global = {
 	.numa_cpu_mapping = 1,
 	.nbthread = 0,
 	.req_count = 0,
-	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
+	.loggers = LIST_HEAD_INIT(global.loggers),
 	.maxzlibmem = DEFAULT_MAXZLIBMEM * 1024U * 1024U,
 	.comp_rate_lim = 0,
 	.ssl_server_verify = SSL_SERVER_VERIFY_REQUIRED,
@@ -331,6 +331,30 @@ void hap_register_build_opts(const char *str, int must_free)
 	b->str = str;
 	b->must_free = must_free;
 	LIST_APPEND(&build_opts_list, &b->list);
+}
+
+/* used to make a new feature appear in the build_features list at boot time.
+ * The feature must be in the format "XXX" without the leading "+" which will
+ * be automatically appended.
+ */
+void hap_register_feature(const char *name)
+{
+	static int must_free = 0;
+	int new_len = strlen(build_features) + 2 + strlen(name);
+	char *new_features;
+
+	new_features = malloc(new_len + 1);
+	if (!new_features)
+		return;
+
+	strlcpy2(new_features, build_features, new_len);
+	snprintf(new_features, new_len + 1, "%s +%s", build_features, name);
+
+	if (must_free)
+		ha_free(&build_features);
+
+	build_features = new_features;
+	must_free = 1;
 }
 
 #define VERSION_MAX_ELTS  7
@@ -545,13 +569,11 @@ static void display_build_opts()
 #ifdef BUILD_DEBUG
 	       "\n  DEBUG   = " BUILD_DEBUG
 #endif
-#ifdef BUILD_FEATURES
-	       "\n\nFeature list : " BUILD_FEATURES
-#endif
+	       "\n\nFeature list : %s"
 	       "\n\nDefault settings :"
 	       "\n  bufsize = %d, maxrewrite = %d, maxpollevents = %d"
 	       "\n\n",
-	       BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
+	       build_features, BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
 
 	list_for_each_entry(item, &build_opts_list, list) {
 		puts(item->str);
@@ -627,6 +649,7 @@ static void usage(char *name)
 		"        -dW fails if any warning is emitted\n"
 		"        -dD diagnostic mode : warn about suspicious configuration statements\n"
 		"        -dF disable fast-forward\n"
+		"        -dZ disable zero-copy forwarding\n"
 		"        -sf/-st [pid ]* finishes/terminates old pids.\n"
 		"        -x <unix_socket> get listening sockets from a unix socket\n"
 		"        -S <bind>[,<bind options>...] new master CLI\n"
@@ -1587,6 +1610,7 @@ static void init_args(int argc, char **argv)
 	global.tune.options |= GTUNE_STRICT_LIMITS;
 
 	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
+	global.tune.options |= GTUNE_USE_ZERO_COPY_FWD; /* Use zero-copy forwarding by default */
 
 	/* keep a copy of original arguments for the master process */
 	old_argv = copy_argv(argc, argv);
@@ -1642,6 +1666,8 @@ static void init_args(int argc, char **argv)
 				global.tune.options &= ~GTUNE_USE_FAST_FWD;
 			else if (*flag == 'd' && flag[1] == 'V')
 				global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
+			else if (*flag == 'd' && flag[1] == 'Z')
+				global.tune.options &= ~GTUNE_USE_ZERO_COPY_FWD;
 			else if (*flag == 'V')
 				arg_mode |= MODE_VERBOSE;
 			else if (*flag == 'd' && flag[1] == 'C') {
@@ -2713,7 +2739,7 @@ void deinit(void)
 	struct proxy *p = proxies_list, *p0;
 	struct wordlist *wl, *wlb;
 	struct uri_auth *uap, *ua = NULL;
-	struct logsrv *log, *logb;
+	struct logger *log, *logb;
 	struct build_opts_str *bol, *bolb;
 	struct post_deinit_fct *pdf, *pdfb;
 	struct proxy_deinit_fct *pxdf, *pxdfb;
@@ -2842,9 +2868,9 @@ void deinit(void)
 	task_destroy(idle_conn_task);
 	idle_conn_task = NULL;
 
-	list_for_each_entry_safe(log, logb, &global.logsrvs, list) {
+	list_for_each_entry_safe(log, logb, &global.loggers, list) {
 		LIST_DEL_INIT(&log->list);
-		free_logsrv(log);
+		free_logger(log);
 	}
 
 	list_for_each_entry_safe(wl, wlb, &cfg_cfgfiles, list) {

@@ -37,6 +37,11 @@ static void qcs_free_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
 	offer_buffers(NULL, 1);
 
 	*ncbuf = NCBUF_NULL;
+
+	/* Reset DEM_FULL as buffer is released. This ensures mux is not woken
+	 * up from rcv_buf stream callback when demux was previously blocked.
+	 */
+	qcs->flags &= ~QC_SF_DEM_FULL;
 }
 
 /* Free <qcs> instance. This function is reserved for internal usage : it must
@@ -107,16 +112,6 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->id = qcs->by_id.key = id;
 	eb64_insert(&qcc->streams_by_id, &qcs->by_id);
 
-	/* Allocate transport layer stream descriptor. Only needed for TX. */
-	if (!quic_stream_is_uni(id) || !quic_stream_is_remote(qcc, id)) {
-		struct quic_conn *qc = qcc->conn->handle.qc;
-		qcs->stream = qc_stream_desc_new(id, type, qcs, qc);
-		if (!qcs->stream) {
-			TRACE_ERROR("qc_stream_desc alloc failure", QMUX_EV_QCS_NEW, qcc->conn, qcs);
-			goto err;
-		}
-	}
-
 	/* If stream is local, use peer remote-limit, or else the opposite. */
 	if (quic_stream_is_bidi(id)) {
 		qcs->tx.msd = quic_stream_is_local(qcc, id) ? qcc->rfctl.msd_bidi_r :
@@ -125,6 +120,10 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	else if (quic_stream_is_local(qcc, id)) {
 		qcs->tx.msd = qcc->rfctl.msd_uni_l;
 	}
+
+	/* Properly set flow-control blocking if initial MSD is nul. */
+	if (!qcs->tx.msd)
+		qcs->flags |= QC_SF_BLK_SFCTL;
 
 	qcs->rx.ncbuf = NCBUF_NULL;
 	qcs->rx.app_buf = BUF_NULL;
@@ -148,6 +147,16 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->subs = NULL;
 
 	qcs->err = 0;
+
+	/* Allocate transport layer stream descriptor. Only needed for TX. */
+	if (!quic_stream_is_uni(id) || !quic_stream_is_remote(qcc, id)) {
+		struct quic_conn *qc = qcc->conn->handle.qc;
+		qcs->stream = qc_stream_desc_new(id, type, qcs, qc);
+		if (!qcs->stream) {
+			TRACE_ERROR("qc_stream_desc alloc failure", QMUX_EV_QCS_NEW, qcc->conn, qcs);
+			goto err;
+		}
+	}
 
 	if (qcc->app_ops->attach && qcc->app_ops->attach(qcs, qcc->ctx)) {
 		TRACE_ERROR("app proto failure", QMUX_EV_QCS_NEW, qcc->conn, qcs);
@@ -210,7 +219,7 @@ static inline int qcc_is_dead(const struct qcc *qcc)
 	/* Connection considered dead if either :
 	 * - remote error detected at tranport level
 	 * - error detected locally
-	 * - MUX timeout expired or unset
+	 * - MUX timeout expired
 	 */
 	if (qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL_DONE) ||
 	    !qcc->task) {
@@ -1265,7 +1274,6 @@ int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t f
 	 */
 	if (qcc_get_qcs(qcc, id, 1, 0, &qcs)) {
 		TRACE_ERROR("RESET_STREAM for send-only stream received", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
-		qcc_set_error(qcc, QC_ERR_STREAM_STATE_ERROR, 0);
 		goto err;
 	}
 
@@ -2472,6 +2480,7 @@ static struct task *qcc_timeout_task(struct task *t, void *ctx, unsigned int sta
 		goto out;
 	}
 
+	/* Mark timeout as triggered by setting task to NULL. */
 	qcc->task = NULL;
 
 	/* TODO depending on the timeout condition, different shutdown mode
@@ -2565,7 +2574,6 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 
 	qcc->proxy = prx;
 	/* haproxy timeouts */
-	qcc->task = NULL;
 	if (conn_is_back(qcc->conn)) {
 		qcc->timeout = prx->timeout.server;
 		qcc->shut_timeout = tick_isset(prx->timeout.serverfin) ?
@@ -2577,16 +2585,18 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 		                    prx->timeout.clientfin : prx->timeout.client;
 	}
 
-	if (tick_isset(qcc->timeout)) {
-		qcc->task = task_new_here();
-		if (!qcc->task) {
-			TRACE_ERROR("timeout task alloc failure", QMUX_EV_QCC_NEW);
-			goto fail_no_timeout_task;
-		}
-		qcc->task->process = qcc_timeout_task;
-		qcc->task->context = qcc;
-		qcc->task->expire = tick_add(now_ms, qcc->timeout);
+	/* Always allocate task even if timeout is unset. In MUX code, if task
+	 * is NULL, it indicates that a timeout has stroke earlier.
+	 */
+	qcc->task = task_new_here();
+	if (!qcc->task) {
+		TRACE_ERROR("timeout task alloc failure", QMUX_EV_QCC_NEW);
+		goto fail_no_timeout_task;
 	}
+	qcc->task->process = qcc_timeout_task;
+	qcc->task->context = qcc;
+	qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
+
 	qcc_reset_idle_start(qcc);
 	LIST_INIT(&qcc->opening_list);
 
@@ -2668,12 +2678,9 @@ static void qmux_strm_detach(struct sedesc *sd)
 		TRACE_STATE("killing dead connection", QMUX_EV_STRM_END, qcc->conn);
 		goto release;
 	}
-	else if (qcc->task) {
+	else {
 		TRACE_DEVEL("refreshing connection's timeout", QMUX_EV_STRM_END, qcc->conn);
 		qcc_refresh_timeout(qcc);
-	}
-	else {
-		TRACE_DEVEL("completed", QMUX_EV_STRM_END, qcc->conn);
 	}
 
 	TRACE_LEAVE(QMUX_EV_STRM_END, qcc->conn);
@@ -2743,9 +2750,8 @@ static size_t qmux_strm_rcv_buf(struct stconn *sc, struct buffer *buf,
 
 	/* Restart demux if it was interrupted on full buffer. */
 	if (ret && qcs->flags & QC_SF_DEM_FULL) {
-		/* There must be data left for demux if it was interrupted on
-		 * full buffer. If this assumption is incorrect wakeup is not
-		 * necessary.
+		/* Ensure DEM_FULL is only set if there is available data to
+		 * ensure we never do unnecessary wakeup here.
 		 */
 		BUG_ON(!ncb_data(&qcs->rx.ncbuf, 0));
 

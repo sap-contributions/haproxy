@@ -26,9 +26,11 @@
 #include <haproxy/log-t.h>
 #include <haproxy/namespace.h>
 #include <haproxy/net_helper.h>
+#include <haproxy/proto_reverse_connect.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
+#include <haproxy/server.h>
 #include <haproxy/session.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
@@ -78,7 +80,7 @@ struct conn_tlv_list *conn_get_tlv(struct connection *conn, int type)
  */
 void conn_delete_from_tree(struct connection *conn)
 {
-	LIST_DEL_INIT((struct list *)&conn->toremove_list);
+	LIST_DEL_INIT(&conn->idle_list);
 	eb64_delete(&conn->hash_node->node);
 }
 
@@ -107,8 +109,9 @@ int conn_create_mux(struct connection *conn)
 		 * server list.
 		 */
 		if (srv && ((srv->proxy->options & PR_O_REUSE_MASK) == PR_O_REUSE_ALWS) &&
-		    !(conn->flags & CO_FL_PRIVATE) && conn->mux->avail_streams(conn) > 0)
-			eb64_insert(&srv->per_thr[tid].avail_conns, &conn->hash_node->node);
+		    !(conn->flags & CO_FL_PRIVATE) && conn->mux->avail_streams(conn) > 0) {
+			srv_add_to_avail_list(srv, conn);
+		}
 		else if (conn->flags & CO_FL_PRIVATE) {
 			/* If it fail now, the same will be done in mux->detach() callback */
 			session_add_conn(sess, conn, conn->target);
@@ -188,7 +191,7 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 	     ((conn->flags ^ old_flags) & CO_FL_NOTIFY_DONE) ||
 	     ((old_flags & CO_FL_WAIT_XPRT) && !(conn->flags & CO_FL_WAIT_XPRT))) &&
 	    conn->mux && conn->mux->wake) {
-		uint conn_in_list = conn_get_idle_flag(conn);
+		uint conn_in_list = conn->flags & CO_FL_LIST_MASK;
 		struct server *srv = objt_server(conn->target);
 
 		if (conn_in_list) {
@@ -282,6 +285,15 @@ int conn_install_mux_fe(struct connection *conn, void *ctx)
 		if (!mux_ops)
 			return -1;
 	}
+
+	/* Ensure a valid protocol is selected if connection is targetted by a
+	 * tcp-request session attach-srv rule.
+	 */
+	if (conn->reverse.target && !(mux_ops->flags & MX_FL_REVERSABLE)) {
+		conn->err_code = CO_ER_REVERSE;
+		return -1;
+	}
+
 	return conn_install_mux(conn, mux_ops, ctx, bind_conf->frontend, conn->owner);
 }
 
@@ -580,14 +592,7 @@ void conn_free(struct connection *conn)
 
 	if (conn_reverse_in_preconnect(conn)) {
 		struct listener *l = conn_active_reverse_listener(conn);
-
-		/* For the moment reverse connection are bound only on first thread. */
-		BUG_ON(tid != 0);
-		/* Receiver must reference a reverse connection as pending. */
-		BUG_ON(!l->rx.reverse_connect.pend_conn);
-		l->rx.reverse_connect.pend_conn = NULL;
-		l->rx.reverse_connect.task->expire = MS_TO_TICKS(now_ms + 1000);
-		task_queue(l->rx.reverse_connect.task);
+		rev_notify_preconn_err(l);
 	}
 
 	conn_force_unsubscribe(conn);
@@ -732,6 +737,8 @@ const char *conn_err_code_str(struct connection *c)
 	case CO_ER_SOCKS4_ABORT:   return "SOCKS4 Proxy handshake aborted by server";
 
 	case CO_ERR_SSL_FATAL:     return "SSL fatal error";
+
+	case CO_ER_REVERSE:        return "Reverse connect failure";
 	}
 	return NULL;
 }

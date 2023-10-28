@@ -32,6 +32,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
 #include <haproxy/sc_strm.h>
+#include <haproxy/server.h>
 #include <haproxy/session-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
@@ -2363,7 +2364,7 @@ static int fcgi_strm_handle_stderr(struct fcgi_conn *fconn, struct fcgi_strm *fs
 		goto fail; // incomplete record
 
 	chunk_reset(&trash);
-	ret = b_xfer(&trash, dbuf, MIN(b_room(&trash), fconn->drl));
+	ret = b_force_xfer(&trash, dbuf, MIN(b_room(&trash), fconn->drl));
 	if (!ret)
 		goto fail;
 	fconn->drl -= ret;
@@ -2372,7 +2373,7 @@ static int fcgi_strm_handle_stderr(struct fcgi_conn *fconn, struct fcgi_strm *fs
 	trash.area[ret]   = '\n';
 	trash.area[ret+1] = '\0';
 	tag.area = fconn->app->name; tag.data = strlen(fconn->app->name);
-	app_log(&fconn->app->logsrvs, &tag, LOG_ERR, "%s", trash.area);
+	app_log(&fconn->app->loggers, &tag, LOG_ERR, "%s", trash.area);
 
 	if (fconn->drl)
 		goto fail;
@@ -2955,7 +2956,7 @@ struct task *fcgi_io_cb(struct task *t, void *ctx, unsigned int state)
 		conn = fconn->conn;
 		TRACE_POINT(FCGI_EV_FCONN_WAKE, conn);
 
-		conn_in_list = conn_get_idle_flag(conn);
+		conn_in_list = conn->flags & CO_FL_LIST_MASK;
 		if (conn_in_list)
 			conn_delete_from_tree(conn);
 
@@ -3603,8 +3604,7 @@ static void fcgi_detach(struct sedesc *sd)
 			else if (!fconn->conn->hash_node->node.node.leaf_p &&
 				 fcgi_avail_streams(fconn->conn) > 0 && objt_server(fconn->conn->target) &&
 				 !LIST_INLIST(&fconn->conn->session_list)) {
-				eb64_insert(&__objt_server(fconn->conn->target)->per_thr[tid].avail_conns,
-				            &fconn->conn->hash_node->node);
+				srv_add_to_avail_list(__objt_server(fconn->conn->target), fconn->conn);
 			}
 		}
 	}

@@ -30,6 +30,7 @@
 #include <haproxy/api-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/quic_cc-t.h>
+#include <haproxy/quic_sock-t.h>
 #include <haproxy/quic_tp-t.h>
 #include <haproxy/receiver-t.h>
 #include <haproxy/stats-t.h>
@@ -110,6 +111,8 @@ enum li_status {
 #define BC_O_ACC_CIP            0x00001000 /* find the proxied address in the NetScaler Client IP header */
 #define BC_O_UNLIMITED          0x00002000 /* listeners not subject to global limits (peers & stats socket) */
 #define BC_O_NOSTOP             0x00004000 /* keep the listeners active even after a soft stop */
+#define BC_O_REVERSE_HTTP       0x00008000 /* a reverse HTTP bind is used */
+#define BC_O_XPRT_MAXCONN       0x00010000 /* transport layer allocates its own resource prior to accept and is responsible to check maxconn limit */
 
 
 /* flags used with bind_conf->ssl_options */
@@ -183,6 +186,7 @@ struct bind_conf {
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters. */
 	struct quic_cc_algo *quic_cc_algo; /* QUIC control congestion algorithm */
+	enum quic_sock_mode quic_mode;     /* QUIC socket allocation strategy */
 #endif
 	struct proxy *frontend;    /* the frontend all these listeners belong to, or NULL */
 	const struct mux_proto_list *mux_proto; /* the mux to use for all incoming connections (specified by the "proto" keyword) */
@@ -205,7 +209,8 @@ struct bind_conf {
 	char *arg;                 /* argument passed to "bind" for better error reporting */
 	char *file;                /* file where the section appears */
 	int line;                  /* line where the section appears */
-	char *reverse_srvname;     /* name of server when using "rev@" address */
+	char *reverse_srvname;     /* name of server when using "rhttp@" address */
+	int reverse_nbconn;        /* count of connections to initiate in parallel */
 	__decl_thread(HA_RWLOCK_T sni_lock); /* lock the SNI trees during add/del operations */
 	struct thread_set thread_set; /* entire set of the allowed threads (0=no restriction) */
 	struct rx_settings settings; /* all the settings needed for the listening socket */
@@ -268,6 +273,7 @@ struct bind_kw {
 	const char *kw;
 	int (*parse)(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err);
 	int skip; /* nb of args to skip */
+	int rhttp_ok; /* non-zero if kw is support for reverse HTTP bind */
 };
 
 /* same as bind_kw but for crtlist keywords */
