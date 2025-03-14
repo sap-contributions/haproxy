@@ -35,6 +35,7 @@ struct proto_fam proto_fam_inet4 = {
 	.name = "inet4",
 	.sock_domain = PF_INET,
 	.sock_family = AF_INET,
+	.real_family = AF_INET,
 	.sock_addrlen = sizeof(struct sockaddr_in),
 	.l3_addrlen = 32/8,
 	.addrcmp = sock_inet4_addrcmp,
@@ -48,6 +49,7 @@ struct proto_fam proto_fam_inet6 = {
 	.name = "inet6",
 	.sock_domain = PF_INET6,
 	.sock_family = AF_INET6,
+	.real_family = AF_INET6,
 	.sock_addrlen = sizeof(struct sockaddr_in6),
 	.l3_addrlen = 128/8,
 	.addrcmp = sock_inet6_addrcmp,
@@ -76,6 +78,12 @@ int sock_inet6_v6only_default = 0;
 /* Default TCPv4/TCPv6 MSS settings. -1=unknown. */
 int sock_inet_tcp_maxseg_default = -1;
 int sock_inet6_tcp_maxseg_default = -1;
+
+/* Default MPTCPv4/MPTCPv6 MSS settings. -1=unknown. */
+#ifdef HA_HAVE_MPTCP
+int sock_inet_mptcp_maxseg_default = -1;
+int sock_inet6_mptcp_maxseg_default = -1;
+#endif
 
 /* Compares two AF_INET sockaddr addresses. Returns 0 if they match or non-zero
  * if they do not match.
@@ -494,6 +502,30 @@ static void sock_inet_prepare()
 #endif
 		close(fd);
 	}
+
+#ifdef HA_HAVE_MPTCP
+	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+	if (fd >= 0) {
+#ifdef TCP_MAXSEG
+		/* retrieve the OS' default mss for MPTCPv4 */
+		len = sizeof(val);
+		if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &val, &len) == 0)
+			sock_inet_mptcp_maxseg_default = val;
+#endif
+		close(fd);
+	}
+
+	fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_MPTCP);
+	if (fd >= 0) {
+#ifdef TCP_MAXSEG
+		/* retrieve the OS' default mss for MPTCPv6 */
+		len = sizeof(val);
+		if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &val, &len) == 0)
+			sock_inet6_mptcp_maxseg_default = val;
+#endif
+		close(fd);
+	}
+#endif
 }
 
 INITCALL0(STG_PREPARE, sock_inet_prepare);

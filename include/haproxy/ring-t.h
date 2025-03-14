@@ -27,7 +27,7 @@
 #include <haproxy/thread.h>
 
 /* The code below handles circular buffers with single-producer and multiple
- * readers (up to 255). The buffer storage area must remain always allocated.
+ * readers (up to 254). The buffer storage area must remain always allocated.
  * It's made of series of payload blocks followed by a readers count (RC).
  * There is always a readers count at the beginning of the buffer as well. Each
  * payload block is composed of a varint-encoded size (VI) followed by the
@@ -96,11 +96,62 @@
 #define RING_WF_WAIT_MODE  0x00000001   /* wait for new contents */
 #define RING_WF_SEEK_NEW   0x00000002   /* seek to new contents  */
 
+/* ring flags */
+#define RING_FL_MAPPED     0x00000001 /* mmapped area, must not free() */
+
+/* keep values below in decimal, they may be dumped in error messages */
+#define RING_WRITING_SIZE  255  /* the next message's size is being written */
+#define RING_MAX_READERS   254  /* highest supported value for RC */
+
+/* mask used to lock the tail */
+#define RING_TAIL_LOCK     (1ULL << ((sizeof(size_t) * 8) - 1))
+
+/* A cell describing a waiting thread.
+ * ->next is initialized to 0x1 before the pointer is set, so that any
+ * leader thread can see that the pointer is not set yet. This allows
+ * to enqueue all waiting threads very quickly using XCHG() on the head
+ * without having to rely on a flaky CAS, while threads finish their setup
+ * in parallel. The pointer will turn to NULL again once the thread is
+ * released.
+ */
+struct ring_wait_cell {
+	size_t to_send_self;         // size needed to serialize this msg
+	size_t needed_tot;           // size needed to serialize pending msgs
+	size_t maxlen;               // msg truncated to this size
+	const struct ist *pfx;       // prefixes
+	size_t npfx;                 // #prefixes
+	const struct ist *msg;       // message parts
+	size_t nmsg;                 // #message parts
+	struct ring_wait_cell *next; // next waiting thread
+};
+
+/* this is the mmapped part */
+struct ring_storage {
+	size_t size;         // storage size
+	size_t rsvd;         // header length (used for file-backed maps)
+	THREAD_PAD(64 - 2 * sizeof(size_t));
+	size_t tail;         // storage tail
+	THREAD_PAD(64 - sizeof(size_t));
+	size_t head;         // storage head
+	THREAD_PAD(64 - sizeof(size_t));
+	char area[0];        // storage area begins immediately here
+};
+
+/* this is the ring definition, config, waiters etc */
 struct ring {
-	struct buffer buf;   // storage area
-	struct list waiters; // list of waiters, for now, CLI "show event"
-	__decl_thread(HA_RWLOCK_T lock);
+	struct ring_storage *storage; // the mapped part
+	struct mt_list waiters;       // list of waiters, for now, CLI "show event"
 	int readers_count;
+	uint flags;             // RING_FL_*
+	uint pending;           // new writes that have not yet been subject to a wakeup
+	uint waking;            // indicates a thread is currently waking up readers
+
+	/* keep the queue in a separate cache line below */
+	THREAD_PAD(64 - 3*sizeof(void*) - 4*sizeof(int));
+	struct {
+		struct ring_wait_cell *ptr;
+		THREAD_PAD(64 - sizeof(void*));
+	} queue[RING_WAIT_QUEUES + 1]; // wait queue + 1 spacer
 };
 
 #endif /* _HAPROXY_RING_T_H */

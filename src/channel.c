@@ -324,7 +324,7 @@ int co_getword(const struct channel *chn, char *str, int len, char sep)
 int co_getline(const struct channel *chn, char *str, int len)
 {
 	int ret, max;
-	char *p;
+	size_t ofs;
 
 	ret = 0;
 	max = len;
@@ -336,20 +336,30 @@ int co_getline(const struct channel *chn, char *str, int len)
 		goto out;
 	}
 
-	p = co_head(chn);
-
 	if (max > co_data(chn)) {
 		max = co_data(chn);
 		str[max-1] = 0;
 	}
-	while (max) {
-		*str++ = *p;
-		ret++;
-		max--;
 
-		if (*p == '\n')
+	ofs = 0;
+
+	while (max) {
+		size_t contig = b_contig_data(&chn->buf, ofs);
+		size_t len = MIN(max, contig);
+		const char *beg = b_peek(&chn->buf, ofs);
+		const char *lf = memchr(beg, '\n', len);
+
+		if (lf) /* take the LF with it before stopping */
+			len = lf + 1 - beg;
+
+		memcpy(str, beg, len);
+		ret += len;
+		str += len;
+		ofs += len;
+		max -= len;
+
+		if (lf)
 			break;
-		p = b_next(&chn->buf, p);
 	}
 	if (ret > 0 && ret < len &&
 	    (ret < co_data(chn) || channel_may_recv(chn)) &&
@@ -547,6 +557,36 @@ int ci_getline_nc(const struct channel *chn,
 	/* No LF yet and not shut yet */
 	return 0;
 }
+
+/* Inserts <str> at position <pos> relative to channel <c>'s  * input head. The
+ * <len> argument informs about the length of string <str> so that we don't have
+ * to measure it. <str> must be a valid pointer.
+ *
+ * The number of bytes added is returned on success. 0 is returned on failure.
+ */
+int ci_insert(struct channel *c, int pos, const char *str, int len)
+{
+	struct buffer *b = &c->buf;
+	char *dst = c_ptr(c, pos);
+
+	if (__b_tail(b) + len >= b_wrap(b))
+		return 0;  /* no space left */
+
+	if (b_data(b) &&
+	    b_tail(b) + len > b_head(b) &&
+	    b_head(b) >= b_tail(b))
+		return 0;  /* no space left before wrapping data */
+
+	/* first, protect the end of the buffer */
+	memmove(dst + len, dst, b_tail(b) - dst);
+
+	/* now, copy str over dst */
+	memcpy(dst, str, len);
+
+	b_add(b, len);
+	return len;
+}
+
 
 /* Inserts <str> followed by "\r\n" at position <pos> relative to channel <c>'s
  * input head. The <len> argument informs about the length of string <str> so

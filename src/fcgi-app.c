@@ -134,7 +134,7 @@ static void fcgi_release_rule(struct fcgi_rule *rule)
 	if (!rule)
 		return;
 
-	free_logformat_list(&rule->value);
+	lf_expr_deinit(&rule->value);
 	/* ->cond and ->name are not owned by the rule */
 	free(rule);
 }
@@ -247,7 +247,7 @@ static int fcgi_flt_check(struct proxy *px, struct flt_conf *fconf)
 		rule->type = crule->type;
 		rule->name = ist(crule->name);
 		rule->cond = crule->cond;
-		LIST_INIT(&rule->value);
+		lf_expr_init(&rule->value);
 
 		if (crule->value) {
 			if (!parse_logformat_string(crule->value, px, &rule->value, LOG_OPT_HTTP,
@@ -311,7 +311,6 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 	struct eb_root hdr_rules = EB_ROOT;
 	struct htx *htx;
 	struct http_hdr_ctx ctx;
-	int ret;
 
 	htx = htxbuf(&msg->chn->buf);
 
@@ -368,16 +367,8 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 		goto end;
 
 	list_for_each_entry(rule, &fcgi_conf->param_rules, list) {
-		if (rule->cond) {
-			ret = acl_exec_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			/* the rule does not match */
-			if (!ret)
-				continue;
-		}
+		if (!acl_match_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
 		param_rule = NULL;
 		node = ebis_lookup_len(&param_rules, rule->name.ptr, rule->name.len);
@@ -398,16 +389,8 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 	}
 
 	list_for_each_entry(rule, &fcgi_conf->hdr_rules, list) {
-		if (rule->cond) {
-			ret = acl_exec_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			/* the rule does not match */
-			if (!ret)
-				continue;
-		}
+		if (!acl_match_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
 		hdr_rule = NULL;
 		node = ebis_lookup_len(&hdr_rules, rule->name.ptr, rule->name.len);
@@ -606,6 +589,8 @@ static int proxy_parse_use_fcgi_app(char **args, int section, struct proxy *curp
 	if (!fcgi_conf)
 		goto err;
 	fcgi_conf->name = strdup(args[1]);
+	if (!fcgi_conf->name)
+		goto err;
 	LIST_INIT(&fcgi_conf->param_rules);
 	LIST_INIT(&fcgi_conf->hdr_rules);
 
@@ -642,7 +627,7 @@ static int cfg_fcgi_apps_postparser()
 		struct fcgi_flt_conf *fcgi_conf = find_px_fcgi_conf(px);
 		int nb_fcgi_srv = 0;
 
-		if (px->mode == PR_MODE_TCP && fcgi_conf) {
+		if (px->mode != PR_MODE_HTTP && fcgi_conf) {
 			ha_alert("proxy '%s': FCGI application cannot be used in non-HTTP mode.\n",
 				 px->id);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -691,7 +676,7 @@ static int cfg_fcgi_apps_postparser()
 			curapp->maxreqs = 1;
 		}
 
-		err_code |= postresolve_logger_list(&curapp->loggers, "fcgi-app", curapp->name);
+		err_code |= postresolve_logger_list(NULL, &curapp->loggers, "fcgi-app", curapp->name);
 	}
 
   end:

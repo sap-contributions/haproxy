@@ -53,7 +53,7 @@ extern struct mux_stopping_data mux_stopping_data[MAX_THREADS];
 /* receive a PROXY protocol header over a connection */
 int conn_recv_proxy(struct connection *conn, int flag);
 int conn_send_proxy(struct connection *conn, unsigned int flag);
-int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm);
+int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm, struct session *sess);
 struct conn_tlv_list *conn_get_tlv(struct connection *conn, int type);
 
 int conn_append_debug_info(struct buffer *buf, const struct connection *conn, const char *pfx);
@@ -89,6 +89,8 @@ void conn_delete_from_tree(struct connection *conn);
 void conn_init(struct connection *conn, void *target);
 struct connection *conn_new(void *target);
 void conn_free(struct connection *conn);
+void conn_release(struct connection *conn);
+void conn_set_errno(struct connection *conn, int err);
 struct conn_hash_node *conn_alloc_hash_node(struct connection *conn);
 struct sockaddr_storage *sockaddr_alloc(struct sockaddr_storage **sap, const struct sockaddr_storage *orig, socklen_t len);
 void sockaddr_free(struct sockaddr_storage **sap);
@@ -96,15 +98,27 @@ void sockaddr_free(struct sockaddr_storage **sap);
 
 /* connection hash stuff */
 uint64_t conn_calculate_hash(const struct conn_hash_params *params);
-uint64_t conn_hash_prehash(char *buf, size_t size);
+uint64_t conn_hash_prehash(const char *buf, size_t size);
 
 int conn_reverse(struct connection *conn);
 
+const char *conn_err_code_name(struct connection *c);
 const char *conn_err_code_str(struct connection *c);
 int xprt_add_hs(struct connection *conn);
 void register_mux_proto(struct mux_proto_list *list);
 
+static inline void conn_report_term_evt(struct connection *conn, enum term_event_loc loc, unsigned char type);
+
 extern struct idle_conns idle_conns[MAX_THREADS];
+
+/* set conn->err_code to any CO_ER_* code if it was not set yet, otherwise
+ * does nothing.
+ */
+static inline void conn_set_errcode(struct connection *conn, int err_code)
+{
+	if (!conn->err_code)
+		conn->err_code = err_code;
+}
 
 /* returns true if the transport layer is ready */
 static inline int conn_xprt_ready(const struct connection *conn)
@@ -242,6 +256,7 @@ static inline void conn_sock_shutw(struct connection *c, int clean)
 		if (!(c->flags & CO_FL_SOCK_RD_SH) && clean)
 			shutdown(c->handle.fd, SHUT_WR);
 	}
+	conn_report_term_evt(c, tevt_loc_fd, fd_tevt_type_shutw);
 }
 
 static inline void conn_xprt_shutw(struct connection *c)
@@ -432,7 +447,7 @@ static inline void conn_set_mark(const struct connection *conn, int mark)
 	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
 		return;
 
-	sock_set_mark(conn->handle.fd, mark);
+	sock_set_mark(conn->handle.fd, conn->ctrl->fam->sock_family, mark);
 }
 
 /* Sets adjust the TCP quick-ack feature on the connection's socket. The
@@ -721,12 +736,79 @@ static inline int conn_pr_mode_to_proto_mode(int proxy_mode)
 {
 	int mode;
 
-	/* for now we only support TCP and HTTP proto_modes, so we
-	 * consider that if it's not HTTP, then it's TCP
-	 */
-	mode = 1 << (proxy_mode == PR_MODE_HTTP);
+	mode = ((proxy_mode == PR_MODE_HTTP) ? PROTO_MODE_HTTP :
+		(proxy_mode == PR_MODE_SPOP) ? PROTO_MODE_SPOP :
+		PROTO_MODE_TCP);
 
 	return mode;
+}
+
+/* Must be used to report add an event in <_evt> termination events log.
+ * For now, it only handles 32-bits integers.
+ */
+#define tevt_report_event(_evts, loc, type) ({			\
+								\
+	unsigned int _evt = ((loc) << 4) | (type);		\
+								\
+	if (!((_evts) & 0xff000000) &&				\
+	    (unsigned char)_evt != (unsigned char)(_evts)) {	\
+		(_evts) <<= 8;					\
+		(_evts) |= (loc) << 4;				\
+		(_evts) |= (type);				\
+	}							\
+	(_evts);						\
+})
+
+/* Function to convert a termination events log to a string */
+static THREAD_LOCAL char tevt_evts_str[9];
+static inline const char *tevt_evts2str(uint32_t evts)
+{
+	uint32_t evt_msk = 0xff000000;
+	unsigned int evt_bits = 24;
+	int idx = 0;
+
+	/* no events: do nothing */
+	if (!evts)
+		goto end;
+
+	/* -1 means the feature is not supported for the location or the entity does not exist. print a dash */
+	if (evts == UINT_MAX) {
+		tevt_evts_str[idx++] = '-';
+		goto end;
+	}
+
+	for (; evt_msk; evt_msk >>= 8, evt_bits -= 8) {
+		unsigned char evt = (evts & evt_msk) >> evt_bits;
+		unsigned int is_back;
+
+		if (!evt)
+			continue;
+
+		/* Backend location are displayed in captial letter */
+		is_back = !!((evt >> 4) & 0x8);
+		switch ((enum term_event_loc)((evt >> 4) & ~0x8)) {
+			case tevt_loc_fd:   tevt_evts_str[idx++] = (is_back ? 'F' : 'f'); break;
+			case tevt_loc_hs:   tevt_evts_str[idx++] = (is_back ? 'H' : 'h'); break;
+			case tevt_loc_xprt: tevt_evts_str[idx++] = (is_back ? 'X' : 'x'); break;
+			case tevt_loc_muxc: tevt_evts_str[idx++] = (is_back ? 'M' : 'm'); break;
+			case tevt_loc_se:   tevt_evts_str[idx++] = (is_back ? 'E' : 'e'); break;
+			case tevt_loc_strm: tevt_evts_str[idx++] = (is_back ? 'S' : 's'); break;
+			default:            tevt_evts_str[idx++] = '-';
+		}
+
+		tevt_evts_str[idx++] = hextab[evt & 0xf];
+	}
+  end:
+	tevt_evts_str[idx] = '\0';
+	return tevt_evts_str;
+}
+
+/* Report a connection event. <loc> may be "tevt_loc_fd", "tevt_loc_hs" or "tevt_loc_xprt" */
+static inline void conn_report_term_evt(struct connection *conn, enum term_event_loc loc, unsigned char type)
+{
+	if (conn_is_back(conn))
+		loc |= 0x08;
+	conn->term_evts_log = tevt_report_event(conn->term_evts_log, loc, type);
 }
 
 #endif /* _HAPROXY_CONNECTION_H */

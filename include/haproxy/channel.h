@@ -44,6 +44,7 @@ int ci_putblk(struct channel *chn, const char *str, int len);
 int ci_putchr(struct channel *chn, char c);
 int ci_getline_nc(const struct channel *chn, char **blk1, size_t *len1, char **blk2, size_t *len2);
 int ci_getblk_nc(const struct channel *chn, char **blk1, size_t *len1, char **blk2, size_t *len2);
+int ci_insert(struct channel *c, int pos, const char *str, int len);
 int ci_insert_line2(struct channel *c, int pos, const char *str, int len);
 int co_inject(struct channel *chn, const char *msg, int len);
 int co_getchar(const struct channel *chn, char *c);
@@ -693,7 +694,7 @@ static inline int channel_htx_recv_limit(const struct channel *chn, const struct
 	unsigned int transit;
 	int reserve;
 
-	/* return zeor if not allocated */
+	/* return zero if not allocated */
 	if (!htx->size)
 		return 0;
 
@@ -915,12 +916,17 @@ static inline int ci_space_for_replace(const struct channel *chn)
  */
 static inline int channel_alloc_buffer(struct channel *chn, struct buffer_wait *wait)
 {
-	if (b_alloc(&chn->buf) != NULL)
+	int force_noqueue;
+
+	/* If the producer has been notified of recent availability, we must
+	 * not check the queue again.
+	 */
+	force_noqueue = !!(chn_prod(chn)->flags & SC_FL_HAVE_BUFF);
+
+	if (b_alloc(&chn->buf, DB_CHANNEL | (force_noqueue ? DB_F_NOQUEUE : 0)) != NULL)
 		return 1;
 
-	if (!LIST_INLIST(&wait->list))
-		LIST_APPEND(&th_ctx->buffer_wq, &wait->list);
-
+	b_requeue(DB_CHANNEL, wait);
 	return 0;
 }
 

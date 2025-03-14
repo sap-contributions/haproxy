@@ -12,19 +12,27 @@
 #include <haproxy/mux_quic-t.h>
 #include <haproxy/stconn.h>
 
+#define qcc_report_glitch(qcc, inc, ...) ({		\
+		COUNT_GLITCH(__VA_ARGS__);		\
+		_qcc_report_glitch(qcc, inc); 		\
+	})
+
 void qcc_set_error(struct qcc *qcc, int err, int app);
+int _qcc_report_glitch(struct qcc *qcc, int inc);
 struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi);
-struct stconn *qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin);
+void qcs_send_metadata(struct qcs *qcs);
+int qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin);
 int qcs_is_close_local(struct qcs *qcs);
 int qcs_is_close_remote(struct qcs *qcs);
 
 int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es);
 void qcs_notify_recv(struct qcs *qcs);
 void qcs_notify_send(struct qcs *qcs);
-int qcc_notify_buf(struct qcc *qcc);
+void qcc_notify_buf(struct qcc *qcc, uint64_t free_size);
 
 struct buffer *qcc_get_stream_rxbuf(struct qcs *qcs);
-struct buffer *qcc_get_stream_txbuf(struct qcs *qcs, int *err);
+struct buffer *qcc_get_stream_txbuf(struct qcs *qcs, int *err, int small);
+struct buffer *qcc_realloc_stream_txbuf(struct qcs *qcs);
 int qcc_realign_stream_txbuf(const struct qcs *qcs, struct buffer *out);
 int qcc_release_stream_txbuf(struct qcs *qcs);
 int qcc_stream_can_send(const struct qcs *qcs);
@@ -37,7 +45,14 @@ int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
 int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t final_size);
 int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err);
-void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset);
+
+static inline int qmux_stream_rx_bufsz(void)
+{
+	return global.tune.bufsize - NCB_RESERVED_SZ;
+}
+
+/* Number of buffers usable on Rx per QCS instance. */
+#define QMUX_STREAM_RX_BUF_FACTOR    90
 
 /* Bit shift to get the stream sub ID for internal use which is obtained
  * shifting the stream IDs by this value, knowing that the
@@ -116,6 +131,8 @@ static inline void qcs_wait_http_req(struct qcs *qcs)
 }
 
 void qcc_show_quic(struct qcc *qcc);
+
+void qcc_wakeup(struct qcc *qcc);
 
 #endif /* USE_QUIC */
 

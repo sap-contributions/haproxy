@@ -60,7 +60,7 @@ static int quic_generate_retry_token_aad(unsigned char *aad,
 	unsigned char *p;
 
 	p = aad;
-	*(uint32_t *)p = htonl(version);
+	write_u32(p, htonl(version));
 	p += sizeof version;
 	p += quic_saddr_cpy(p, addr);
 	memcpy(p, cid->data, cid->len);
@@ -92,8 +92,12 @@ int quic_generate_retry_token(unsigned char *token, size_t len,
 	unsigned char iv[QUIC_TLS_IV_LEN];
 	const unsigned char *sec = global.cluster_secret;
 	size_t seclen = sizeof global.cluster_secret;
-	EVP_CIPHER_CTX *ctx = NULL;
-	const EVP_CIPHER *aead = EVP_aes_128_gcm();
+	QUIC_AEAD_CTX *ctx = NULL;
+#ifdef QUIC_AEAD_API
+	const QUIC_AEAD *aead = EVP_aead_aes_128_gcm();
+#else
+	const QUIC_AEAD *aead = EVP_aes_128_gcm();
+#endif
 	uint32_t timestamp = (uint32_t)date.tv_sec;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT);
@@ -141,7 +145,7 @@ int quic_generate_retry_token(unsigned char *token, size_t len,
 	p += QUIC_TLS_TAG_LEN;
 	memcpy(p, salt, sizeof salt);
 	p += sizeof salt;
-	EVP_CIPHER_CTX_free(ctx);
+	QUIC_AEAD_CTX_free(ctx);
 
 	ret = p - token;
  leave:
@@ -150,7 +154,7 @@ int quic_generate_retry_token(unsigned char *token, size_t len,
 
  err:
 	if (ctx)
-		EVP_CIPHER_CTX_free(ctx);
+		QUIC_AEAD_CTX_free(ctx);
 	goto leave;
 }
 
@@ -242,24 +246,22 @@ int quic_retry_token_check(struct quic_rx_packet *pkt,
 	unsigned char iv[QUIC_TLS_IV_LEN];
 	const unsigned char *sec = global.cluster_secret;
 	size_t seclen = sizeof global.cluster_secret;
-	EVP_CIPHER_CTX *ctx = NULL;
-	const EVP_CIPHER *aead = EVP_aes_128_gcm();
+	QUIC_AEAD_CTX *ctx = NULL;
 	const struct quic_version *qv = qc ? qc->original_version :
 	                                     pkt->version;
+#ifdef QUIC_AEAD_API
+	const QUIC_AEAD *aead = EVP_aead_aes_128_gcm();
+#else
+	const QUIC_AEAD *aead = EVP_aes_128_gcm();
+#endif
 
 	TRACE_ENTER(QUIC_EV_CONN_LPKT, qc);
 
 	/* The caller must ensure this. */
-	BUG_ON(!pkt->token_len);
+	BUG_ON(!pkt->token_len || *pkt->token != QUIC_TOKEN_FMT_RETRY);
 
 	prx = l->bind_conf->frontend;
 	prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
-
-	if (*pkt->token != QUIC_TOKEN_FMT_RETRY) {
-		/* TODO: New token check */
-		TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, qc, NULL, NULL, pkt->version);
-		goto leave;
-	}
 
 	if (sizeof buf < tokenlen) {
 		TRACE_ERROR("too short buffer", QUIC_EV_CONN_LPKT, qc);
@@ -301,7 +303,7 @@ int quic_retry_token_check(struct quic_rx_packet *pkt,
 		goto err;
 	}
 
-	EVP_CIPHER_CTX_free(ctx);
+	QUIC_AEAD_CTX_free(ctx);
 
 	ret = 1;
 	HA_ATOMIC_INC(&prx_counters->retry_validated);
@@ -313,7 +315,7 @@ int quic_retry_token_check(struct quic_rx_packet *pkt,
  err:
 	HA_ATOMIC_INC(&prx_counters->retry_error);
 	if (ctx)
-		EVP_CIPHER_CTX_free(ctx);
+		QUIC_AEAD_CTX_free(ctx);
 	goto leave;
 }
 

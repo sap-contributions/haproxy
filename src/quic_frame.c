@@ -138,7 +138,7 @@ void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm)
 		chunk_appendf(&trace_buf, " uni=%d fin=%d id=%llu off=%llu len=%llu",
 		              !!(strm_frm->id & QUIC_STREAM_FRAME_ID_DIR_BIT),
 		              !!(frm->type & QUIC_STREAM_FRAME_TYPE_FIN_BIT),
-		              (ull)strm_frm->id, (ull)strm_frm->offset.key, (ull)strm_frm->len);
+		              (ull)strm_frm->id, (ull)strm_frm->offset, (ull)strm_frm->len);
 		break;
 	}
 	case QUIC_FT_MAX_DATA:
@@ -473,7 +473,8 @@ static int quic_parse_crypto_frame(struct quic_frame *frm, struct quic_conn *qc,
 	return 1;
 }
 
-/* Encode a NEW_TOKEN frame at <pos> buffer position.
+/* Server only function.
+ * Encode a NEW_TOKEN frame at <pos> buffer position.
  * Returns 1 if succeeded (enough room at <pos> buffer position to encode the frame), 0 if not.
  */
 static int quic_build_new_token_frame(unsigned char **pos, const unsigned char *end,
@@ -485,11 +486,13 @@ static int quic_build_new_token_frame(unsigned char **pos, const unsigned char *
 		return 0;
 
 	memcpy(*pos, new_token_frm->data, new_token_frm->len);
+	*pos += new_token_frm->len;
 
 	return 1;
 }
 
-/* Parse a NEW_TOKEN frame at <pos> buffer position with <end> as end into <frm> frame.
+/* Client only function.
+ * Parse a NEW_TOKEN frame at <pos> buffer position with <end> as end into <frm> frame.
  * Return 1 if succeeded (enough room at <pos> buffer position to parse this frame), 0 if not.
  */
 static int quic_parse_new_token_frame(struct quic_frame *frm, struct quic_conn *qc,
@@ -497,10 +500,11 @@ static int quic_parse_new_token_frame(struct quic_frame *frm, struct quic_conn *
 {
 	struct qf_new_token *new_token_frm = &frm->new_token;
 
-	if (!quic_dec_int(&new_token_frm->len, pos, end) || end - *pos < new_token_frm->len)
+	if (!quic_dec_int(&new_token_frm->len, pos, end) || end - *pos < new_token_frm->len ||
+	    sizeof(new_token_frm->data) < new_token_frm->len)
 		return 0;
 
-	new_token_frm->data = *pos;
+	memcpy(new_token_frm->data, *pos, new_token_frm->len);
 	*pos += new_token_frm->len;
 
 	return 1;
@@ -517,10 +521,10 @@ static int quic_build_stream_frame(unsigned char **pos, const unsigned char *end
 
 	/* Caller must set OFF bit if and only if a non-null offset is used. */
 	BUG_ON(!!(frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) !=
-	       !!strm_frm->offset.key);
+	       !!strm_frm->offset);
 
 	if (!quic_enc_int(pos, end, strm_frm->id) ||
-	    ((frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) && !quic_enc_int(pos, end, strm_frm->offset.key)) ||
+	    ((frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) && !quic_enc_int(pos, end, strm_frm->offset)) ||
 	    ((frm->type & QUIC_STREAM_FRAME_TYPE_LEN_BIT) &&
 	     (!quic_enc_int(pos, end, strm_frm->len) || end - *pos < strm_frm->len)))
 		return 0;
@@ -559,10 +563,9 @@ static int quic_parse_stream_frame(struct quic_frame *frm, struct quic_conn *qc,
 		return 0;
 
 	/* Offset parsing */
-	if (!(frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT)) {
-		strm_frm->offset.key = 0;
-	}
-	else if (!quic_dec_int((uint64_t *)&strm_frm->offset.key, pos, end))
+	if (!(frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT))
+		strm_frm->offset = 0;
+	else if (!quic_dec_int((uint64_t *)&strm_frm->offset, pos, end))
 		return 0;
 
 	/* Length parsing */
@@ -1096,6 +1099,53 @@ const struct quic_frame_parser quic_frame_parsers[] = {
 	[QUIC_FT_HANDSHAKE_DONE]       = { .func = quic_parse_handshake_done_frame,       .flags = QUIC_FL_RX_PACKET_ACK_ELICITING, .mask = QUIC_FT_PKT_TYPE____1_BITMASK, },
 };
 
+/* Extra frame types with their associated builder and parser instances.
+ * Complete quic_frame_type_is_known() and both qf_builder()/qf_parser() to use them.
+ *
+ * Definition example:
+ *
+ * const uint64_t QUIC_FT_MY_CUSTOM_FRM = 0x01020304;
+ * const struct quic_frame_builder qf_ft_qs_tp_builder = {
+ *     .func = quic_build_my_custom_frm,
+ *     .mask = 0,
+ *     .flags = 0,
+ * };
+ * const struct quic_frame_parser qf_ft_qs_tp_parser = {
+ *     .func = quic_parse_my_custom_frm,
+ *     .mask = 0,
+ *     .flags = 0,
+ * };
+ */
+
+/* Returns true if frame <type> is supported. */
+static inline int quic_frame_type_is_known(uint64_t type)
+{
+	/* Complete here for extra frame types greater than QUIC_FT_MAX. */
+	return type < QUIC_FT_MAX;
+}
+
+static const struct quic_frame_parser *qf_parser(uint64_t type)
+{
+	if (type < QUIC_FT_MAX)
+		return &quic_frame_parsers[type];
+
+	/* Complete here for extra frame types greater than QUIC_FT_MAX. */
+
+	ABORT_NOW();
+	return NULL;
+}
+
+const struct quic_frame_builder *qf_builder(uint64_t type)
+{
+	if (type < QUIC_FT_MAX)
+		return &quic_frame_builders[type];
+
+	/* Complete here for extra frame types greater than QUIC_FT_MAX. */
+
+	ABORT_NOW();
+	return NULL;
+}
+
 /* Decode a QUIC frame at <pos> buffer position into <frm> frame.
  * Returns 1 if succeeded (enough data at <pos> buffer position to parse the frame), 0 if not.
  */
@@ -1112,8 +1162,8 @@ int qc_parse_frm(struct quic_frame *frm, struct quic_rx_packet *pkt,
 		goto leave;
 	}
 
-	frm->type = *(*pos)++;
-	if (frm->type >= QUIC_FT_MAX) {
+	quic_dec_int(&frm->type, pos, end);
+	if (!quic_frame_type_is_known(frm->type)) {
 		/* RFC 9000 12.4. Frames and Frame Types
 		 *
 		 * An endpoint MUST treat the receipt of a frame of unknown type as a
@@ -1124,7 +1174,7 @@ int qc_parse_frm(struct quic_frame *frm, struct quic_rx_packet *pkt,
 		goto leave;
 	}
 
-	parser = &quic_frame_parsers[frm->type];
+	parser = qf_parser(frm->type);
 	if (!(parser->mask & (1U << pkt->type))) {
 		TRACE_DEVEL("unauthorized frame", QUIC_EV_CONN_PRSFRM, qc, frm);
 		goto leave;
@@ -1159,21 +1209,20 @@ int qc_build_frm(unsigned char **pos, const unsigned char *end,
 	unsigned char *p = *pos;
 
 	TRACE_ENTER(QUIC_EV_CONN_BFRM, qc);
-	builder = &quic_frame_builders[frm->type];
+	builder = qf_builder(frm->type);
 	if (!(builder->mask & (1U << pkt->type))) {
 		/* XXX This it a bug to send an unauthorized frame with such a packet type XXX */
 		TRACE_ERROR("unauthorized frame", QUIC_EV_CONN_BFRM, qc, frm);
 		BUG_ON(!(builder->mask & (1U << pkt->type)));
 	}
 
-	if (end <= p) {
+	if (!quic_enc_int(&p, end, frm->type)) {
 		TRACE_DEVEL("not enough room", QUIC_EV_CONN_BFRM, qc, frm);
 		goto leave;
 	}
 
 	TRACE_PROTO("TX frm", QUIC_EV_CONN_BFRM, qc, frm);
-	*p++ = frm->type;
-	if (!quic_frame_builders[frm->type].func(&p, end, frm, qc)) {
+	if (!builder->func(&p, end, frm, qc)) {
 		TRACE_ERROR("frame building error", QUIC_EV_CONN_BFRM, qc, frm);
 		goto leave;
 	}
@@ -1238,6 +1287,12 @@ void qc_release_frm(struct quic_conn *qc, struct quic_frame *frm)
 	uint64_t pn;
 	struct quic_frame *origin, *f, *tmp;
 
+	/* <frm> will be detached from its Tx packet via origin->reflist loop
+	 * implemented below. It is thus expected that its pkt field is not
+	 * NULL or else it may free the frame too soon.
+	 */
+	BUG_ON(!frm->pkt);
+
 	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc, frm);
 
 	/* Identify this frame: a frame copy or one of its copies */
@@ -1277,3 +1332,123 @@ void qc_release_frm(struct quic_conn *qc, struct quic_frame *frm)
 	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
 }
 
+/* Calculate the length of <frm> frame header and payload using a buffer of
+ * <room> size as destination. This helper function can deal both with STREAM
+ * and CRYPTO frames. If input frame payload is too big for <room>, it must be
+ * truncated to <split> offset output parameter.
+ *
+ * Returns the total frame length, or 0 if not enough space.
+ */
+size_t quic_strm_frm_fillbuf(size_t room, struct quic_frame *frm, size_t *split)
+{
+	size_t total = 0; /* Length of frame header and payload. */
+	size_t payload; /* Input payload length. */
+
+	*split = 0;
+
+	if (frm->type >= QUIC_FT_STREAM_8 && frm->type <= QUIC_FT_STREAM_F) {
+		total = 1;
+		total += quic_int_getsize(frm->stream.id);
+		if (frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT)
+			total += quic_int_getsize(frm->stream.offset);
+		payload = frm->stream.len;
+	}
+	else if (frm->type == QUIC_FT_CRYPTO) {
+		total = 1;
+		total += quic_int_getsize(frm->crypto.offset);
+		payload = frm->crypto.len;
+	}
+	else {
+		/* Function must only be used with STREAM or CRYPTO frames. */
+		ABORT_NOW();
+	}
+
+	if (total > room) {
+		/* Header (without Length) already too large. */
+		return 0;
+	}
+	room -= total;
+
+	if (payload) {
+		/* Payload requested, determine Length field varint size. */
+
+		/* Optimal length value if whole room is used. */
+		const size_t room_data = quic_int_cap_length(room);
+		if (!room_data) {
+			/* Not enough space to encode a varint length first. */
+			return 0;
+		}
+
+		if (payload > room_data) {
+			total += quic_int_getsize(room_data);
+			total += room_data;
+			*split = room_data;
+		}
+		else {
+			total += quic_int_getsize(payload);
+			total += payload;
+		}
+	}
+
+	return total;
+}
+
+/* Split a STREAM or CRYPTO <frm> frame payload at <split> bytes. A newly
+ * allocated frame will point to the original payload head up to the split.
+ * Input frame payload is reduced to contains the remaining data only.
+ *
+ * Returns the newly allocated frame or NULL on error.
+ */
+struct quic_frame *quic_strm_frm_split(struct quic_frame *frm, uint64_t split)
+{
+	struct quic_frame *new;
+	struct buffer stream_buf;
+
+	new = qc_frm_alloc(frm->type);
+	if (!new)
+		return NULL;
+
+	if (frm->type >= QUIC_FT_STREAM_8 && frm->type <= QUIC_FT_STREAM_F) {
+		new->stream.stream = frm->stream.stream;
+		new->stream.buf = frm->stream.buf;
+		new->stream.id = frm->stream.id;
+		new->stream.offset = frm->stream.offset;
+		new->stream.len = split;
+		new->type |= QUIC_STREAM_FRAME_TYPE_LEN_BIT;
+		new->type &= ~QUIC_STREAM_FRAME_TYPE_FIN_BIT;
+		new->stream.data = frm->stream.data;
+		new->stream.dup = frm->stream.dup;
+
+		/* Advance original frame to point to the remaining data. */
+		frm->type |= QUIC_STREAM_FRAME_TYPE_OFF_BIT;
+		stream_buf = b_make(b_orig(frm->stream.buf),
+		                    b_size(frm->stream.buf),
+		                    (char *)frm->stream.data - b_orig(frm->stream.buf), 0);
+		frm->stream.len -= split;
+		frm->stream.offset += split;
+		frm->stream.data = (unsigned char *)b_peek(&stream_buf, split);
+	}
+	else if (frm->type == QUIC_FT_CRYPTO) {
+		new->crypto.qel = frm->crypto.qel;
+		new->crypto.offset = frm->crypto.offset;
+		new->crypto.len = split;
+
+		/* Advance original frame to point to the remaining data. */
+		frm->crypto.len -= split;
+		frm->crypto.offset += split;
+	}
+	else {
+		/* Function must only be used with STREAM or CRYPTO frames. */
+		ABORT_NOW();
+	}
+
+	/* Detach <frm> from its origin if it was duplicated. */
+	if (frm->origin) {
+		LIST_APPEND(&frm->origin->reflist, &new->ref);
+		new->origin = frm->origin;
+		LIST_DEL_INIT(&frm->ref);
+		frm->origin = NULL;
+	}
+
+	return new;
+}

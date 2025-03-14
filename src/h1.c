@@ -16,9 +16,16 @@
 
 #include <haproxy/api.h>
 #include <haproxy/base64.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/h1.h>
 #include <haproxy/http-hdr.h>
 #include <haproxy/tools.h>
+
+/* by default, RFC9112#6.1 applies, t-e combined with c-l represents a risk of
+ * smuggling if it crosses another 1.0 agent so we must close at the end of the
+ * transaction. But it may cause difficulties to some very old broken devices.
+ */
+int h1_do_not_close_on_insecure_t_e = 0;
 
 /* Parse the Content-Length header field of an HTTP/1 request. The function
  * checks all possible occurrences of a comma-delimited value, and verifies
@@ -121,13 +128,21 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
  * H1_MF_TE_OTHER flag is set if any other encoding is found. The H1_MF_XFER_ENC
  * flag is always set. The H1_MF_CHNK is set when "chunked" encoding is the last
  * one. Note that transfer codings are case-insensitive (cf RFC7230#4). This
- * function returns <0 if a error is found, 0 if the whole header can be dropped
- * (not used yet), or >0 if the value can be indexed.
+ * function returns -2 for a fatal error, -1 for an error that may be hiidden by
+ * config, 0 if the whole header can be dropped (not used yet), or >0 if the
+ * value can be indexed.
  */
 int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 {
 	char *e, *n;
 	struct ist word;
+	int ret = 1;
+
+	/* Reject empty header */
+	if (istptr(value) == istend(value)) {
+		ret = -1;
+		goto end;
+	}
 
 	h1m->flags |= H1_MF_XFER_ENC;
 
@@ -140,6 +155,10 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 			continue;
 
 		n = http_find_hdr_value_end(word.ptr, e); // next comma or end of line
+
+		/* a comma at the end means the last value is empty */
+		if (n+1 == e)
+			ret = -1;
 		word.len = n - word.ptr;
 
 		/* trim trailing blanks */
@@ -147,14 +166,18 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 			word.len--;
 
 		h1m->flags &= ~H1_MF_CHNK;
-		if (isteqi(word, ist("chunked"))) {
+
+		/* empty values are forbidden */
+		if (!word.len)
+			ret = -1;
+		else if (isteqi(word, ist("chunked"))) {
 			if (h1m->flags & H1_MF_TE_CHUNKED) {
 				/* cf RFC7230#3.3.1 : A sender MUST NOT apply
 				 * chunked more than once to a message body
 				 * (i.e., chunking an already chunked message is
 				 * not allowed)
 				 */
-				goto fail;
+				ret = -1;
 			}
 			h1m->flags |= (H1_MF_TE_CHUNKED|H1_MF_CHNK);
 		}
@@ -166,7 +189,8 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 				 * as the final transfer coding to ensure that
 				 * the message is properly framed.
 				 */
-				goto fail;
+				ret = -2;
+				goto end;
 			}
 			h1m->flags |= H1_MF_TE_OTHER;
 		}
@@ -174,20 +198,19 @@ int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
 		word.ptr = n;
 	}
 
-	return 1;
-  fail:
-	return -1;
+  end:
+	return ret;
 }
 
 /* Validate the authority and the host header value for CONNECT method. If there
  * is hast header, its value is normalized. 0 is returned on success, -1 if the
  * authority is invalid and -2 if the host is invalid.
  */
-static int h1_validate_connect_authority(struct ist authority, struct ist *host_hdr)
+static int h1_validate_connect_authority(struct ist scheme, struct ist authority, struct ist *host_hdr)
 {
 	struct ist uri_host, uri_port, host, host_port;
 
-	if (!isttest(authority))
+	if (isttest(scheme) || !isttest(authority))
 		goto invalid_authority;
 	uri_host = authority;
 	uri_port = http_get_host_port(authority);
@@ -345,13 +368,14 @@ void h1_parse_connection_header(struct h1m *h1m, struct ist *value)
 
 /* Parse the Upgrade: header of an HTTP/1 request.
  * If "websocket" is found, set H1_MF_UPG_WEBSOCKET flag
+ * If "h2c" or "h2" found, set H1_MF_UPG_H2C flag.
  */
 void h1_parse_upgrade_header(struct h1m *h1m, struct ist value)
 {
 	char *e, *n;
 	struct ist word;
 
-	h1m->flags &= ~H1_MF_UPG_WEBSOCKET;
+	h1m->flags &= ~(H1_MF_UPG_WEBSOCKET|H1_MF_UPG_H2C);
 
 	word.ptr = value.ptr - 1; // -1 for next loop's pre-increment
 	e = istend(value);
@@ -370,6 +394,8 @@ void h1_parse_upgrade_header(struct h1m *h1m, struct ist value)
 
 		if (isteqi(word, ist("websocket")))
 			h1m->flags |= H1_MF_UPG_WEBSOCKET;
+		else if (isteqi(word, ist("h2c")) || isteqi(word, ist("h2")))
+			h1m->flags |= H1_MF_UPG_H2C;
 
 		word.ptr = n;
 	}
@@ -575,12 +601,7 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 #ifdef HA_UNALIGNED_LE
 		/* speedup: skip bytes not between 0x24 and 0x7e inclusive */
 		while (ptr <= end - sizeof(int)) {
-			int x = *(int *)ptr - 0x24242424;
-			if (x & 0x80808080)
-				break;
-
-			x -= 0x5b5b5b5b;
-			if (!(x & 0x80808080))
+			if (is_char4_outside(*(uint *)ptr, 0x24, 0x7e))
 				break;
 
 			ptr += sizeof(int);
@@ -607,7 +628,7 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 		}
 		if (likely((unsigned char)*ptr >= 128)) {
 			/* non-ASCII chars are forbidden unless option
-			 * accept-invalid-http-request is enabled in the frontend.
+			 * accept-unsafe-violations-in-http-request is enabled in the frontend.
 			 * In any case, we capture the faulty char.
 			 */
 			if (h1m->err_pos < -1)
@@ -930,14 +951,14 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 		 */
 #ifdef HA_UNALIGNED_LE64
 		while (ptr <= end - sizeof(long)) {
-			if ((*(long *)ptr - 0x0e0e0e0e0e0e0e0eULL) & 0x8080808080808080ULL)
+			if (is_char8_below_opt(*(ulong *)ptr, 0x0e))
 				goto http_msg_hdr_val2;
 			ptr += sizeof(long);
 		}
 #endif
 #ifdef HA_UNALIGNED_LE
 		while (ptr <= end - sizeof(int)) {
-			if ((*(int*)ptr - 0x0e0e0e0e) & 0x80808080)
+			if (is_char4_below_opt(*(uint *)ptr, 0x0e))
 				goto http_msg_hdr_val2;
 			ptr += sizeof(int);
 		}
@@ -1017,9 +1038,15 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 				if (isteqi(n, ist("transfer-encoding"))) {
 					ret = h1_parse_xfer_enc_header(h1m, v);
 					if (ret < 0) {
-						state = H1_MSG_HDR_L2_LWS;
-						ptr = v.ptr; /* Set ptr on the error */
-						goto http_msg_invalid;
+						/* For the response only, don't report error if PR_O2_RSPBUG_OK is set
+						 * and the error can be hidden */
+						if (ret == -2 || !(h1m->flags & H1_MF_RESP) || (h1m->err_pos < -1)) {
+							state = H1_MSG_HDR_L2_LWS;
+							ptr = v.ptr; /* Set ptr on the error */
+							goto http_msg_invalid;
+						}
+						if (h1m->err_pos == -1)
+							h1m->err_pos = ptr - start + skip;
 					}
 					else if (ret == 0) {
 						/* skip it */
@@ -1105,46 +1132,88 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 		if (!(h1m->flags & (H1_MF_HDRS_ONLY|H1_MF_RESP))) {
 			struct http_uri_parser parser = http_uri_parser_init(sl.rq.u);
-			struct ist scheme, authority;
+			struct ist scheme, authority = IST_NULL;
 			int ret;
 
-			scheme = http_parse_scheme(&parser);
-			authority = http_parse_authority(&parser, 1);
-			if (sl.rq.meth == HTTP_METH_CONNECT) {
-				struct ist *host = ((host_idx != -1) ? &hdr[host_idx].v : NULL);
+			/* WT: gcc seems to see a path where sl.rq.u.ptr was used
+			 * uninitialized, but it doesn't know that the function is
+			 * called with initial states making this impossible.
+			 */
+			ALREADY_CHECKED(sl.rq.u.ptr);
+			switch (parser.format) {
+			case URI_PARSER_FORMAT_ASTERISK:
+				/* We must take care "PRI * HTTP/2.0" is supported here. check for OTHER methods here is enough */
+				if ((sl.rq.meth != HTTP_METH_OTHER && sl.rq.meth != HTTP_METH_OPTIONS) || istlen(sl.rq.u) != 1) {
+					ptr = sl.rq.u.ptr; /* Set ptr on the error */
+					goto http_msg_invalid;
+				}
+				break;
 
-				ret = h1_validate_connect_authority(authority, host);
-				if (ret < 0) {
-					if (h1m->err_pos < -1) {
-						state = H1_MSG_LAST_LF;
-						/* WT: gcc seems to see a path where sl.rq.u.ptr was used
-						 * uninitialized, but it doesn't know that the function is
-						 * called with initial states making this impossible.
-						 */
-						ALREADY_CHECKED(sl.rq.u.ptr);
-						ptr = ((ret == -1) ? sl.rq.u.ptr : host->ptr); /* Set ptr on the error */
+			case URI_PARSER_FORMAT_ABSPATH:
+				if (sl.rq.meth == HTTP_METH_CONNECT) {
+					ptr = sl.rq.u.ptr; /* Set ptr on the error */
+					goto http_msg_invalid;
+				}
+				break;
+
+			case URI_PARSER_FORMAT_ABSURI_OR_AUTHORITY:
+				scheme = http_parse_scheme(&parser);
+				if (!isttest(scheme)) { /* scheme not found: MUST be an authority */
+					struct ist *host = NULL;
+
+					if (sl.rq.meth != HTTP_METH_CONNECT) {
+						ptr = sl.rq.u.ptr; /* Set ptr on the error */
 						goto http_msg_invalid;
 					}
-					if (h1m->err_pos == -1) /* capture the error pointer */
-						h1m->err_pos = ((ret == -1) ? sl.rq.u.ptr : host->ptr) - start + skip; /* >= 0 now */
-				}
-			}
-			else if (host_idx != -1 && istlen(authority)) {
-				struct ist host = hdr[host_idx].v;
-
-				/* For non-CONNECT method, the authority must match the host header value */
-				if (!isteqi(authority, host)) {
-					ret = h1_validate_mismatch_authority(scheme, authority, host);
+					if (host_idx != -1)
+						host = &hdr[host_idx].v;
+					authority = http_parse_authority(&parser, 1);
+					ret = h1_validate_connect_authority(scheme, authority, host);
 					if (ret < 0) {
 						if (h1m->err_pos < -1) {
 							state = H1_MSG_LAST_LF;
-							ptr = host.ptr; /* Set ptr on the error */
+							/* WT: gcc seems to see a path where sl.rq.u.ptr was used
+							 * uninitialized, but it doesn't know that the function is
+							 * called with initial states making this impossible.
+							 */
+							ALREADY_CHECKED(sl.rq.u.ptr);
+							ptr = ((ret == -1) ? sl.rq.u.ptr : host->ptr); /* Set ptr on the error */
 							goto http_msg_invalid;
 						}
 						if (h1m->err_pos == -1) /* capture the error pointer */
-							h1m->err_pos = v.ptr - start + skip; /* >= 0 now */
+							h1m->err_pos = ((ret == -1) ? sl.rq.u.ptr : host->ptr) - start + skip; /* >= 0 now */
 					}
 				}
+				else { /* Scheme found:  MUST be an absolute-URI */
+					struct ist host = IST_NULL;
+
+					if (sl.rq.meth == HTTP_METH_CONNECT) {
+						ptr = sl.rq.u.ptr; /* Set ptr on the error */
+						goto http_msg_invalid;
+					}
+
+					if (host_idx != -1)
+						host = hdr[host_idx].v;
+					authority = http_parse_authority(&parser, 1);
+					/* For non-CONNECT method, the authority must match the host header value */
+					if (isttest(host) && !isteqi(authority, host)) {
+						ret = h1_validate_mismatch_authority(scheme, authority, host);
+						if (ret < 0) {
+							if (h1m->err_pos < -1) {
+								state = H1_MSG_LAST_LF;
+								ptr = host.ptr; /* Set ptr on the error */
+								goto http_msg_invalid;
+							}
+							if (h1m->err_pos == -1) /* capture the error pointer */
+								h1m->err_pos = v.ptr - start + skip; /* >= 0 now */
+						}
+					}
+				}
+				break;
+
+			default:
+				ptr = sl.rq.u.ptr; /* Set ptr on the error */
+				goto http_msg_invalid;
 			}
 		}
 
@@ -1152,7 +1221,9 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 		if (h1m->flags & H1_MF_XFER_ENC) {
 			if (h1m->flags & H1_MF_CLEN) {
 				/* T-E + C-L: force close and remove C-L */
-				h1m->flags |= H1_MF_CONN_CLO;
+				if (!h1_do_not_close_on_insecure_t_e)
+					h1m->flags |= H1_MF_CONN_CLO;
+
 				h1m->flags &= ~H1_MF_CLEN;
 				h1m->curr_len = h1m->body_len = 0;
 				hdr_count = http_del_hdr(hdr, ist("content-length"));
@@ -1266,3 +1337,23 @@ void h1_calculate_ws_output_key(const char *key, char *result)
 	/* encode in base64 the hash */
 	a2base64(hash_out, 20, result, 29);
 }
+
+/* config parser for global "h1-do-not-close-on-insecure-transfer-encoding" */
+static int cfg_parse_h1_do_not_close_insecure_t_e(char **args, int section_type, struct proxy *curpx,
+                                                const struct proxy *defpx, const char *file, int line,
+                                                char **err)
+{
+	if (too_many_args(0, args, err, NULL))
+		return -1;
+
+	h1_do_not_close_on_insecure_t_e = 1;
+	return 0;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {{ }, {
+	{ CFG_GLOBAL, "h1-do-not-close-on-insecure-transfer-encoding", cfg_parse_h1_do_not_close_insecure_t_e },
+	{ 0, NULL, NULL },
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);

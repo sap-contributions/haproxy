@@ -73,8 +73,8 @@
 /* used only for keep-alive purposes, to indicate we're on a second transaction */
 #define TX_NOT_FIRST	0x00040000	/* the transaction is not the first one */
 
-#define TX_L7_RETRY     0x000800000     /* The transaction may attempt L7 retries */
-#define TX_D_L7_RETRY   0x001000000     /* Disable L7 retries on this transaction, even if configured to do it */
+#define TX_L7_RETRY     0x00080000      /* The transaction may attempt L7 retries */
+#define TX_D_L7_RETRY   0x00100000      /* Disable L7 retries on this transaction, even if configured to do it */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -167,6 +167,8 @@ enum {
 	REDIRECT_FLAG_APPEND_SLASH = 2,	/* append a slash if missing at the end */
 	REDIRECT_FLAG_FROM_REQ = 4,     /* redirect rule on the request path */
 	REDIRECT_FLAG_IGNORE_EMPTY = 8, /* silently ignore empty location expressions */
+	REDIRECT_FLAG_KEEP_QS = 16,	/* append the query string to location, if any */
+	REDIRECT_FLAG_COOKIE_FMT = 32,  /* The cookie value is a log-format stirng*/
 };
 
 /* Redirect types (location, prefix, extended ) */
@@ -188,6 +190,7 @@ enum {
 enum rule_result {
 	HTTP_RULE_RES_CONT = 0,  /* nothing special, continue rules evaluation */
 	HTTP_RULE_RES_YIELD,     /* call me later because some data is missing. */
+	HTTP_RULE_RES_FYIELD,    /* forced yield, not because of missing data */
 	HTTP_RULE_RES_STOP,      /* stopped processing on an accept */
 	HTTP_RULE_RES_DENY,      /* deny (or tarpit if TX_CLTARPIT)  */
 	HTTP_RULE_RES_ABRT,      /* abort request, msg already sent (eg: auth) */

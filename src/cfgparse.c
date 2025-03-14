@@ -64,12 +64,15 @@
 #include <haproxy/lb_fwlc.h>
 #include <haproxy/lb_fwrr.h>
 #include <haproxy/lb_map.h>
+#include <haproxy/lb_ss.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/sink.h>
 #include <haproxy/mailers.h>
 #include <haproxy/namespace.h>
+#include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/peers-t.h>
@@ -89,7 +92,7 @@
 #include <haproxy/tcpcheck.h>
 #include <haproxy/thread.h>
 #include <haproxy/tools.h>
-#include <haproxy/uri_auth-t.h>
+#include <haproxy/uri_auth.h>
 
 
 /* Used to chain configuration sections definitions. This list
@@ -118,7 +121,7 @@ static enum default_path_mode {
 	DEFAULT_PATH_ORIGIN,       /* "origin": paths are relative to default_path_origin */
 } default_path_mode;
 
-static char initial_cwd[PATH_MAX];
+char initial_cwd[PATH_MAX];
 static char current_cwd[PATH_MAX];
 
 /* List head of all known configuration keywords */
@@ -157,7 +160,7 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 
 		ss2 = str2sa_range(str, NULL, &port, &end, &fd, &proto, NULL, err,
 		                   (curproxy == global.cli_fe || curproxy == mworker_proxy) ? NULL : global.unix_bind.prefix,
-		                   NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_PORT_RANGE |
+		                   NULL, NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_PORT_RANGE |
 		                          PA_O_SOCKET_FD | PA_O_STREAM | PA_O_XPRT);
 		if (!ss2)
 			goto fail;
@@ -243,7 +246,7 @@ int str2receiver(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 
 		ss2 = str2sa_range(str, NULL, &port, &end, &fd, &proto, NULL, err,
 		                   curproxy == global.cli_fe ? NULL : global.unix_bind.prefix,
-		                   NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_PORT_RANGE |
+		                   NULL, NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_PORT_RANGE |
 		                          PA_O_SOCKET_FD | PA_O_DGRAM | PA_O_XPRT);
 		if (!ss2)
 			goto fail;
@@ -573,8 +576,8 @@ static int init_peers_frontend(const char *file, int linenum,
  out:
 	if (id && !p->id)
 		p->id = strdup(id);
-	free(p->conf.file);
-	p->conf.args.file = p->conf.file = strdup(file);
+	drop_file_name(&p->conf.file);
+	p->conf.args.file = p->conf.file = copy_file_name(file);
 	if (linenum != -1)
 		p->conf.args.line = p->conf.line = linenum;
 
@@ -657,6 +660,7 @@ static struct peer *cfg_peers_add_peer(struct peers *peers,
 int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 {
 	static struct peers *curpeers = NULL;
+	static struct sockaddr_storage *bind_addr = NULL;
 	static int nb_shards = 0;
 	struct peer *newpeer = NULL;
 	const char *err;
@@ -727,12 +731,20 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			 * Newly allocated listener is at the end of the list
 			 */
 			l = LIST_ELEM(bind_conf->listeners.p, typeof(l), by_bind);
+			bind_addr = &l->rx.addr;
 
 			global.maxsock++; /* for the listening socket */
 
 			bind_line = 1;
 			if (cfg_peers->local) {
+				/* Local peer already defined using "server" line has no
+				 * address yet, we should update its server's addr:port
+				 * settings
+				 */
 				newpeer = cfg_peers->local;
+				BUG_ON(!newpeer->srv);
+				newpeer->srv->addr = *bind_addr;
+				newpeer->srv->svc_port = get_host_port(bind_addr);
 			}
 			else {
 				/* This peer is local.
@@ -775,14 +787,17 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	else if (strcmp(args[0], "peers") == 0) { /* new peers section */
 		/* Initialize these static variables when entering a new "peers" section*/
 		bind_line = peer_line = 0;
+		bind_addr = NULL;
 		if (!*args[1]) {
 			ha_alert("parsing [%s:%d] : missing name for peers section.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
 
-		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
 			goto out;
+		}
 
 		err = invalid_char(args[1]);
 		if (err) {
@@ -820,6 +835,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	}
 	else if (strcmp(args[0], "peer") == 0 ||
 	         strcmp(args[0], "server") == 0) { /* peer or server definition */
+		struct server *prev_srv;
 		int local_peer, peer;
 		int parse_addr = 0;
 
@@ -870,19 +886,52 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		 * or if we are parsing a "server" line and the current peer is not the local one.
 		 */
 		parse_addr = (peer || !local_peer) ? SRV_PARSE_PARSE_ADDR : 0;
+		prev_srv = curpeers->peers_fe->srv;
 		err_code |= parse_server(file, linenum, args, curpeers->peers_fe, NULL,
 		                         SRV_PARSE_IN_PEER_SECTION|parse_addr|SRV_PARSE_INITIAL_RESOLVE);
-		if (!curpeers->peers_fe->srv) {
-			/* Remove the newly allocated peer. */
-			if (newpeer != curpeers->local) {
-				struct peer *p;
+		if (curpeers->peers_fe->srv == prev_srv) {
+			/* parse_server didn't add a server:
+			 * Remove the newly allocated peer.
+			 */
+			struct peer *p;
 
-				p = curpeers->remote;
-				curpeers->remote = curpeers->remote->next;
-				free(p->id);
-				free(p);
+			/* while it is tolerated to have a "server" line without address, it isn't
+			 * the case for a "peer" line
+			 */
+			if (peer) {
+				ha_warning("parsing [%s:%d] : '%s %s' : ignoring invalid peer definition (missing address:port)\n",
+				           file, linenum, args[0], args[1]);
+				err_code |= ERR_WARN;
+			}
+			else {
+				ha_diag_warning("parsing [%s:%d] : '%s %s' : ignoring server (not a local peer, valid address:port is expected)\n",
+				                file, linenum, args[0], args[1]);
+			}
+
+			p = curpeers->remote;
+			curpeers->remote = curpeers->remote->next;
+			free(p->id);
+			free(p);
+			if (local_peer) {
+				/* we only get there with incomplete "peer"
+				 * line for local peer (missing address):
+				 *
+				 * reset curpeers and curpeers fields
+				 * that are local peer related
+				 */
+				curpeers->local = NULL;
+				ha_free(&curpeers->peers_fe->id);
 			}
 			goto out;
+		}
+
+		if (!parse_addr && bind_addr) {
+			/* local peer declared using "server": has name but no
+			 * address: we use the known "bind" line addr settings
+			 * as implicit server's addr and port.
+			 */
+			curpeers->peers_fe->srv->addr = *bind_addr;
+			curpeers->peers_fe->srv->svc_port = get_host_port(bind_addr);
 		}
 
 		if (nb_shards && curpeers->peers_fe->srv->shard > nb_shards) {
@@ -1165,7 +1214,7 @@ int cfg_parse_mailers(const char *file, int linenum, char **args, int kwm)
 		newmailer->id = strdup(args[1]);
 
 		sk = str2sa_range(args[2], NULL, &port1, &port2, NULL, &proto, NULL,
-		                  &errmsg, NULL, NULL,
+		                  &errmsg, NULL, NULL, NULL,
 		                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
 		if (!sk) {
 			ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
@@ -1237,14 +1286,6 @@ int cfg_parse_mailers(const char *file, int linenum, char **args, int kwm)
 out:
 	free(errmsg);
 	return err_code;
-}
-
-void free_email_alert(struct proxy *p)
-{
-	ha_free(&p->email_alert.mailers.name);
-	ha_free(&p->email_alert.from);
-	ha_free(&p->email_alert.to);
-	ha_free(&p->email_alert.myhostname);
 }
 
 
@@ -1393,6 +1434,15 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 
 		while (*args[cur_arg]) {
 			if (strcmp(args[cur_arg], "users") == 0) {
+				if (ag->groupusers) {
+					ha_alert("parsing [%s:%d]: 'users' option already defined in '%s' name '%s'.\n",
+						 file, linenum, args[0], args[1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					free(ag->groupusers);
+					free(ag->name);
+					free(ag);
+					goto out;
+				}
 				ag->groupusers = strdup(args[cur_arg + 1]);
 				cur_arg += 2;
 				continue;
@@ -1705,9 +1755,113 @@ static int cfg_parse_global_def_path(char **args, int section_type, struct proxy
 	return ret;
 }
 
+/* append a copy of string <filename>, ptr to some allocated memory at the at
+ * the end of the list <li>.
+ * On failure : return 0 and <err> filled with an error message.
+ * The caller is responsible for freeing the <err> and <filename> copy
+ * memory area using free().
+ */
+int list_append_cfgfile(struct list *li, const char *filename, char **err)
+{
+	struct cfgfile *entry = NULL;
+
+	entry = calloc(1, sizeof(*entry));
+	if (!entry) {
+		memprintf(err, "out of memory");
+		goto fail_entry;
+	}
+
+	entry->filename = strdup(filename);
+	if (!entry->filename) {
+		memprintf(err, "out of memory");
+		goto fail_entry_name;
+	}
+
+	LIST_APPEND(li, &entry->list);
+
+	return 1;
+
+fail_entry_name:
+	free(entry->filename);
+fail_entry:
+	free(entry);
+	return 0;
+}
+
+/* loads the content of the given file in memory. On success, returns the number
+ * of bytes successfully stored at *cfg_content until EOF. On error, emits
+ * alerts, performs needed clean-up routines and returns -1.
+ */
+ssize_t load_cfg_in_mem(char *filename, char **cfg_content)
+{
+	size_t bytes_to_read = LINESIZE;
+	size_t chunk_size = 0;
+	size_t read_bytes = 0;
+	struct stat file_stat;
+	char *new_area;
+	size_t ret = 0;
+	FILE *f;
+
+	/* let's try to obtain the size, if regular file */
+	if (stat(filename, &file_stat) != 0) {
+		ha_alert("stat() failed for configuration file %s : %s\n",
+			 filename, strerror(errno));
+		return -1;
+	}
+
+	if (file_stat.st_size > chunk_size)
+		bytes_to_read = file_stat.st_size;
+
+
+	if ((f = fopen(filename,"r")) == NULL) {
+		ha_alert("Could not open configuration file %s : %s\n",
+			 filename, strerror(errno));
+		return -1;
+	}
+
+	*cfg_content = NULL;
+
+	while (1) {
+		if (!file_stat.st_size && ((read_bytes + bytes_to_read) > MAX_CFG_SIZE)) {
+			ha_alert("Loading %s: input is too large %ldMB, limited to %dMB. Exiting.\n",
+				 filename, (long)(read_bytes + bytes_to_read)/(1024*1024),
+				 MAX_CFG_SIZE/(1024*1024));
+			goto free_mem;
+		}
+
+		if (read_bytes + bytes_to_read > chunk_size) {
+			chunk_size = (read_bytes + bytes_to_read) * 2;
+			new_area  = realloc(*cfg_content, chunk_size);
+			if (new_area == NULL) {
+				ha_alert("Loading %s: file too long, cannot allocate memory.\n",
+					 filename);
+				goto free_mem;
+			}
+			*cfg_content = new_area;
+		}
+
+		bytes_to_read = chunk_size - read_bytes;
+		ret = fread(*cfg_content + read_bytes, sizeof(char), bytes_to_read, f);
+		read_bytes += ret;
+
+		if (!ret || feof(f) || ferror(f))
+			break;
+	}
+
+	fclose(f);
+
+	return read_bytes;
+
+free_mem:
+	ha_free(cfg_content);
+	fclose(f);
+
+	return -1;
+}
+
 /*
- * This function reads and parses the configuration file given in the argument.
- * Returns the error code, 0 if OK, -1 if the config file couldn't be opened,
+ * This function parses the configuration file given in the argument.
+ * Returns the error code, 0 if OK, -1 if we are run out of memory,
  * or any combination of :
  *  - ERR_ABORT: must abort ASAP
  *  - ERR_FATAL: we can continue parsing but not start the service
@@ -1716,11 +1870,10 @@ static int cfg_parse_global_def_path(char **args, int section_type, struct proxy
  * Only the two first ones can stop processing, the two others are just
  * indicators.
  */
-int readcfgfile(const char *file)
+int parse_cfg(const struct cfgfile *cfg)
 {
 	char *thisline = NULL;
 	int linesize = LINESIZE;
-	FILE *f = NULL;
 	int linenum = 0;
 	int err_code = 0;
 	struct cfg_section *cs = NULL, *pcs = NULL;
@@ -1734,17 +1887,14 @@ int readcfgfile(const char *file)
 	int nested_cond_lvl = 0;
 	enum nested_cond_state nested_conds[MAXNESTEDCONDS];
 	char *errmsg = NULL;
+	const char *cur_position = cfg->content;
+	char *file = cfg->filename;
 
 	global.cfg_curr_line = 0;
 	global.cfg_curr_file = file;
 
 	if ((thisline = malloc(sizeof(*thisline) * linesize)) == NULL) {
 		ha_alert("Out of memory trying to allocate a buffer for a configuration line.\n");
-		err_code = -1;
-		goto err;
-	}
-
-	if ((f = fopen(file,"r")) == NULL) {
 		err_code = -1;
 		goto err;
 	}
@@ -1758,7 +1908,8 @@ int readcfgfile(const char *file)
 	}
 
 next_line:
-	while (fgets(thisline + readbytes, linesize - readbytes, f) != NULL) {
+	while (fgets_from_mem(thisline + readbytes, linesize - readbytes,
+			      &cur_position, cfg->content + cfg->size)) {
 		int arg, kwm = KWM_STD;
 		char *end;
 		char *args[MAX_LINE_ARGS + 1];
@@ -1928,7 +2079,10 @@ next_line:
 
 				/* if a word is in sections list, is_sect = 1 */
 				list_for_each_entry(sect, &sections, list) {
-					if (strcmp(args[0], sect->section_name) == 0) {
+					/* look for a section_name, but also a section_parser, because there might be
+					 * only a post_section_parser */
+					if (strcmp(args[0], sect->section_name) == 0 &&
+					    sect->section_parser) {
 						is_sect = 1;
 						break;
 					}
@@ -2187,7 +2341,7 @@ next_line:
 		/* end of config dump */
 
 		/* empty line */
-		if (!**args)
+		if (!*args || !**args)
 			continue;
 
 		/* check for config macros */
@@ -2438,7 +2592,7 @@ next_line:
 
 		/* detect section start */
 		list_for_each_entry(ics, &sections, list) {
-			if (strcmp(args[0], ics->section_name) == 0) {
+			if (strcmp(args[0], ics->section_name) == 0 && ics->section_parser) {
 				cursection = ics->section_name;
 				pcs = cs;
 				cs = ics;
@@ -2449,25 +2603,47 @@ next_line:
 			}
 		}
 
-		if (pcs && pcs->post_section_parser) {
+		if (pcs) {
+			struct cfg_section *psect;
 			int status;
 
-			status = pcs->post_section_parser();
-			err_code |= status;
-			if (status & ERR_FATAL)
-				fatal++;
 
-			if (err_code & ERR_ABORT)
-				goto err;
+			/* look for every post_section_parser for the previous section name */
+			list_for_each_entry(psect, &sections, list) {
+				if (strcmp(pcs->section_name, psect->section_name) == 0 &&
+						psect->post_section_parser) {
+
+					/* don't call post_section_parser in MODE_DISCOVERY */
+					if (global.mode & MODE_DISCOVERY)
+						goto section_parser;
+
+					status = psect->post_section_parser();
+					err_code |= status;
+					if (status & ERR_FATAL)
+						fatal++;
+
+					if (err_code & ERR_ABORT)
+						goto err;
+				}
+			}
 		}
 		pcs = NULL;
 
+section_parser:
 		if (!cs) {
+			/* ignore unknown section names during the first read in MODE_DISCOVERY */
+			if (global.mode & MODE_DISCOVERY)
+				continue;
 			ha_alert("parsing [%s:%d]: unknown keyword '%s' out of section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			fatal++;
 		} else {
 			int status;
+
+			/* read only the "global" and "program" sections in MODE_DISCOVERY */
+			if (((global.mode & MODE_DISCOVERY) && (strcmp(cs->section_name, "global") != 0)
+			     && (strcmp(cs->section_name, "program") != 0)))
+				continue;
 
 			status = cs->section_parser(file, linenum, args, kwm);
 			err_code |= status;
@@ -2486,17 +2662,35 @@ next_line:
 	}
 
 	ha_free(&global.cfg_curr_section);
-	if (cs && cs->post_section_parser)
-		err_code |= cs->post_section_parser();
+
+	/* call post_section_parser of the last section when there is no more lines */
+	if (cs) {
+		struct cfg_section *psect;
+		int status;
+
+		/* don't call post_section_parser in MODE_DISCOVERY */
+		if (!(global.mode & MODE_DISCOVERY)) {
+			list_for_each_entry(psect, &sections, list) {
+				if (strcmp(cs->section_name, psect->section_name) == 0 &&
+				     psect->post_section_parser) {
+
+					status = psect->post_section_parser();
+					if (status & ERR_FATAL)
+						fatal++;
+
+					err_code |= status;
+
+					if (err_code & ERR_ABORT)
+						goto err;
+
+				}
+			}
+		}
+	}
 
 	if (nested_cond_lvl) {
 		ha_alert("parsing [%s:%d]: non-terminated '.if' block.\n", file, linenum);
 		err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
-	}
-
-	if (*initial_cwd && chdir(initial_cwd) == -1) {
-		ha_alert("Impossible to get back to initial directory '%s' : %s\n", initial_cwd, strerror(errno));
-		err_code |= ERR_ALERT | ERR_FATAL;
 	}
 
 err:
@@ -2506,9 +2700,6 @@ err:
 	free(outline);
 	global.cfg_curr_line = 0;
 	global.cfg_curr_file = NULL;
-
-	if (f)
-		fclose(f);
 
 	return err_code;
 }
@@ -2685,10 +2876,10 @@ static int numa_detect_topology()
 int check_config_validity()
 {
 	int cfgerr = 0;
-	struct proxy *curproxy = NULL;
 	struct proxy *init_proxies_list = NULL;
 	struct stktable *t;
 	struct server *newsrv = NULL;
+	struct mt_list back;
 	int err_code = 0;
 	unsigned int next_pxid = 1;
 	struct bind_conf *bind_conf;
@@ -2711,6 +2902,13 @@ int check_config_validity()
 	if (!global.tune.requri_len)
 		global.tune.requri_len = REQURI_LEN;
 
+	if (!global.thread_limit)
+		global.thread_limit = MAX_THREADS;
+
+#if defined(USE_THREAD)
+	if (thread_cpus_enabled_at_boot > global.thread_limit)
+		thread_cpus_enabled_at_boot = global.thread_limit;
+#endif
 	if (!global.nbthread) {
 		/* nbthread not set, thus automatic. In this case, and only if
 		 * running on a single process, we enable the same number of
@@ -2734,12 +2932,23 @@ int check_config_validity()
 				global.nbtgroups = 1;
 
 			if (global.nbthread > MAX_THREADS_PER_GROUP * global.nbtgroups) {
-				ha_diag_warning("nbthread not set, found %d CPUs, limiting to %d threads (maximum is %d per thread group). Please set nbthreads and/or increase thread-groups in the global section to silence this warning.\n",
-					   global.nbthread, MAX_THREADS_PER_GROUP * global.nbtgroups, MAX_THREADS_PER_GROUP);
+				if (global.nbthread <= global.thread_limit)
+					ha_diag_warning("nbthread not set, found %d CPUs, limiting to %d threads (maximum is %d per thread group). "
+							"Please set nbthreads and/or increase thread-groups in the global section to silence this warning.\n",
+							global.nbthread, MAX_THREADS_PER_GROUP * global.nbtgroups, MAX_THREADS_PER_GROUP);
 				global.nbthread = MAX_THREADS_PER_GROUP * global.nbtgroups;
 			}
+
+			if (global.nbthread > global.thread_limit)
+				global.nbthread = global.thread_limit;
 		}
 #endif
+	}
+	else if (global.nbthread > global.thread_limit) {
+		ha_warning("nbthread forced to a higher value (%d) than the configured thread-hard-limit (%d), enforcing the limit. "
+			   "Please fix either value to remove this warning.\n",
+			   global.nbthread, global.thread_limit);
+		global.nbthread = global.thread_limit;
 	}
 
 	if (!global.nbtgroups)
@@ -2865,8 +3074,7 @@ init_proxies_list_stage1:
 #ifdef USE_OPENSSL
 			/* no-alpn ? If so, it's the right moment to remove it */
 			if (bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.alpn_len) {
-				free(bind_conf->ssl_conf.alpn_str);
-				bind_conf->ssl_conf.alpn_str = NULL;
+				ha_free(&bind_conf->ssl_conf.alpn_str);
 			}
 #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 			else if (!bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.npn_str &&
@@ -2913,12 +3121,33 @@ init_proxies_list_stage1:
 			} /* HTTP && bufsize < 16384 */
 #endif
 
+#ifdef USE_QUIC
+			if (bind_conf->xprt == xprt_get(XPRT_QUIC)) {
+				const struct quic_cc_algo *cc_algo = bind_conf->quic_cc_algo ?
+				  bind_conf->quic_cc_algo : default_quic_cc_algo;
+
+				if (!(cc_algo->flags & QUIC_CC_ALGO_FL_OPT_PACING) &&
+				    quic_tune.options & QUIC_TUNE_NO_PACING) {
+					ha_warning("Binding [%s:%d] for %s %s: using the selected congestion algorithm without pacing may cause slowdowns or high loss rates during transfers.\n",
+					           bind_conf->file, bind_conf->line,
+					           proxy_type_str(curproxy), curproxy->id);
+					err_code |= ERR_WARN;
+				}
+			}
+#endif /* USE_QUIC */
+
 			/* finish the bind setup */
 			ret = bind_complete_thread_setup(bind_conf, &err_code);
 			if (ret != 0) {
 				cfgerr += ret;
 				if (err_code & ERR_FATAL)
 					goto out;
+			}
+
+			if (bind_generate_guid(bind_conf)) {
+				cfgerr++;
+				err_code |= ERR_FATAL | ERR_ALERT;
+				goto out;
 			}
 		}
 
@@ -2941,6 +3170,11 @@ init_proxies_list_stage1:
 		case PR_MODE_SYSLOG:
 			/* this mode is initialized as the classic tcp proxy */
 			cfgerr += proxy_cfg_ensure_no_http(curproxy);
+			break;
+
+		case PR_MODE_SPOP:
+			cfgerr += proxy_cfg_ensure_no_http(curproxy);
+			cfgerr += proxy_cfg_ensure_no_log(curproxy);
 			break;
 
 		case PR_MODE_PEERS:
@@ -3011,7 +3245,7 @@ init_proxies_list_stage1:
 				ha_warning("'%s' will be ignored for %s '%s' (requires 'option httpchk').\n",
 					   "send-state", proxy_type_str(curproxy), curproxy->id);
 				err_code |= ERR_WARN;
-				curproxy->options &= ~PR_O2_CHK_SNDST;
+				curproxy->options2 &= ~PR_O2_CHK_SNDST;
 			}
 		}
 
@@ -3033,7 +3267,7 @@ init_proxies_list_stage1:
 			}
 		}
 
-		if (curproxy->email_alert.set) {
+		if (curproxy->email_alert.flags & PR_EMAIL_ALERT_SET) {
 		    if (!(curproxy->email_alert.mailers.name && curproxy->email_alert.from && curproxy->email_alert.to)) {
 			    ha_warning("'email-alert' will be ignored for %s '%s' (the presence any of "
 				       "'email-alert from', 'email-alert level' 'email-alert mailers', "
@@ -3127,7 +3361,7 @@ init_proxies_list_stage1:
 			 * parsing is cancelled and be.name is restored to be resolved.
 			 */
 			pxname = rule->be.name;
-			LIST_INIT(&rule->be.expr);
+			lf_expr_init(&rule->be.expr);
 			curproxy->conf.args.ctx = ARGC_UBK;
 			curproxy->conf.args.file = rule->file;
 			curproxy->conf.args.line = rule->line;
@@ -3139,10 +3373,10 @@ init_proxies_list_stage1:
 				cfgerr++;
 				continue;
 			}
-			node = LIST_NEXT(&rule->be.expr, struct logformat_node *, list);
+			node = LIST_NEXT(&rule->be.expr.nodes.list, struct logformat_node *, list);
 
-			if (!LIST_ISEMPTY(&rule->be.expr)) {
-				if (node->type != LOG_FMT_TEXT || node->list.n != &rule->be.expr) {
+			if (!lf_expr_isempty(&rule->be.expr)) {
+				if (node->type != LOG_FMT_TEXT || node->list.n != &rule->be.expr.nodes.list) {
 					rule->dynamic = 1;
 					free(pxname);
 					/* backend is not yet known so we cannot assume its type,
@@ -3155,8 +3389,7 @@ init_proxies_list_stage1:
 				/* Only one element in the list, a simple string: free the expression and
 				 * fall back to static rule
 				 */
-				LIST_DELETE(&node->list);
-				free_logformat_node(node);
+				lf_expr_deinit(&rule->be.expr);
 			}
 
 			rule->dynamic = 0;
@@ -3204,7 +3437,7 @@ init_proxies_list_stage1:
 			 * to a static rule, thus the parsing is cancelled and we fall back to setting srv.ptr.
 			 */
 			server_name = srule->srv.name;
-			LIST_INIT(&srule->expr);
+			lf_expr_init(&srule->expr);
 			curproxy->conf.args.ctx = ARGC_USRV;
 			err = NULL;
 			if (!parse_logformat_string(server_name, curproxy, &srule->expr, 0, SMP_VAL_FE_HRQ_HDR, &err)) {
@@ -3214,10 +3447,10 @@ init_proxies_list_stage1:
 				cfgerr++;
 				continue;
 			}
-			node = LIST_NEXT(&srule->expr, struct logformat_node *, list);
+			node = LIST_NEXT(&srule->expr.nodes.list, struct logformat_node *, list);
 
-			if (!LIST_ISEMPTY(&srule->expr)) {
-				if (node->type != LOG_FMT_TEXT || node->list.n != &srule->expr) {
+			if (!lf_expr_isempty(&srule->expr)) {
+				if (node->type != LOG_FMT_TEXT || node->list.n != &srule->expr.nodes.list) {
 					srule->dynamic = 1;
 					free(server_name);
 					continue;
@@ -3225,8 +3458,7 @@ init_proxies_list_stage1:
 				/* Only one element in the list, a simple string: free the expression and
 				 * fall back to static rule
 				 */
-				LIST_DELETE(&node->list);
-				free_logformat_node(node);
+				lf_expr_deinit(&srule->expr);
 			}
 
 			srule->dynamic = 0;
@@ -3336,7 +3568,7 @@ init_proxies_list_stage1:
 			}
 		}
 
-		if (curproxy->uri_auth && !(curproxy->uri_auth->flags & STAT_CONVDONE) &&
+		if (curproxy->uri_auth && !(curproxy->uri_auth->flags & STAT_F_CONVDONE) &&
 		    !LIST_ISEMPTY(&curproxy->uri_auth->http_req_rules) &&
 		    (curproxy->uri_auth->userlist || curproxy->uri_auth->auth_realm )) {
 			ha_alert("%s '%s': stats 'auth'/'realm' and 'http-request' can't be used at the same time.\n",
@@ -3346,7 +3578,7 @@ init_proxies_list_stage1:
 		}
 
 		if (curproxy->uri_auth && curproxy->uri_auth->userlist &&
-		    (!(curproxy->uri_auth->flags & STAT_CONVDONE) ||
+		    (!(curproxy->uri_auth->flags & STAT_F_CONVDONE) ||
 		     LIST_ISEMPTY(&curproxy->uri_auth->http_req_rules))) {
 			const char *uri_auth_compat_req[10];
 			struct act_rule *rule;
@@ -3377,16 +3609,16 @@ init_proxies_list_stage1:
 			if (curproxy->uri_auth->auth_realm) {
 				ha_free(&curproxy->uri_auth->auth_realm);
 			}
-			curproxy->uri_auth->flags |= STAT_CONVDONE;
+			curproxy->uri_auth->flags |= STAT_F_CONVDONE;
 		}
 out_uri_auth_compat:
 
 		/* check whether we have a logger that uses RFC5424 log format */
 		list_for_each_entry(tmplogger, &curproxy->loggers, list) {
 			if (tmplogger->format == LOG_FORMAT_RFC5424) {
-				if (!curproxy->conf.logformat_sd_string) {
+				if (!curproxy->logformat_sd.str) {
 					/* set the default logformat_sd_string */
-					curproxy->conf.logformat_sd_string = default_rfc5424_sd_log_format;
+					curproxy->logformat_sd.str = default_rfc5424_sd_log_format;
 				}
 				break;
 			}
@@ -3394,31 +3626,21 @@ out_uri_auth_compat:
 
 		/* compile the log format */
 		if (!(curproxy->cap & PR_CAP_FE)) {
-			if (curproxy->conf.logformat_string != default_http_log_format &&
-			    curproxy->conf.logformat_string != default_tcp_log_format &&
-			    curproxy->conf.logformat_string != clf_http_log_format)
-				free(curproxy->conf.logformat_string);
-			curproxy->conf.logformat_string = NULL;
-			ha_free(&curproxy->conf.lfs_file);
-			curproxy->conf.lfs_line = 0;
-
-			if (curproxy->conf.logformat_sd_string != default_rfc5424_sd_log_format)
-				free(curproxy->conf.logformat_sd_string);
-			curproxy->conf.logformat_sd_string = NULL;
-			ha_free(&curproxy->conf.lfsd_file);
-			curproxy->conf.lfsd_line = 0;
+			lf_expr_deinit(&curproxy->logformat);
+			lf_expr_deinit(&curproxy->logformat_sd);
 		}
 
-		if (curproxy->conf.logformat_string) {
+		if (curproxy->logformat.str) {
 			curproxy->conf.args.ctx = ARGC_LOG;
-			curproxy->conf.args.file = curproxy->conf.lfs_file;
-			curproxy->conf.args.line = curproxy->conf.lfs_line;
+			curproxy->conf.args.file = curproxy->logformat.conf.file;
+			curproxy->conf.args.line = curproxy->logformat.conf.line;
 			err = NULL;
-			if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
+			if (!lf_expr_compile(&curproxy->logformat, &curproxy->conf.args,
 			                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-			                            SMP_VAL_FE_LOG_END, &err)) {
+			                            SMP_VAL_FE_LOG_END, &err) ||
+			    !lf_expr_postcheck(&curproxy->logformat, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse log-format : %s.\n",
-					 curproxy->conf.lfs_file, curproxy->conf.lfs_line, err);
+					 curproxy->logformat.conf.file, curproxy->logformat.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3426,21 +3648,18 @@ out_uri_auth_compat:
 			curproxy->conf.args.line = 0;
 		}
 
-		if (curproxy->conf.logformat_sd_string) {
+		if (curproxy->logformat_sd.str) {
 			curproxy->conf.args.ctx = ARGC_LOGSD;
-			curproxy->conf.args.file = curproxy->conf.lfsd_file;
-			curproxy->conf.args.line = curproxy->conf.lfsd_line;
+			curproxy->conf.args.file = curproxy->logformat_sd.conf.file;
+			curproxy->conf.args.line = curproxy->logformat_sd.conf.line;
 			err = NULL;
-			if (!parse_logformat_string(curproxy->conf.logformat_sd_string, curproxy, &curproxy->logformat_sd,
+			if (!lf_expr_compile(&curproxy->logformat_sd, &curproxy->conf.args,
 			                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-			                            SMP_VAL_FE_LOG_END, &err)) {
+			                            SMP_VAL_FE_LOG_END, &err) ||
+			    !add_to_logformat_list(NULL, NULL, LF_SEPARATOR, &curproxy->logformat_sd, &err) ||
+			    !lf_expr_postcheck(&curproxy->logformat_sd, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse log-format-sd : %s.\n",
-					 curproxy->conf.lfs_file, curproxy->conf.lfs_line, err);
-				free(err);
-				cfgerr++;
-			} else if (!add_to_logformat_list(NULL, NULL, LF_SEPARATOR, &curproxy->logformat_sd, &err)) {
-				ha_alert("Parsing [%s:%d]: failed to parse log-format-sd : %s.\n",
-					 curproxy->conf.lfs_file, curproxy->conf.lfs_line, err);
+					 curproxy->logformat_sd.conf.file, curproxy->logformat_sd.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3448,21 +3667,22 @@ out_uri_auth_compat:
 			curproxy->conf.args.line = 0;
 		}
 
-		if (curproxy->conf.uniqueid_format_string) {
+		if (curproxy->format_unique_id.str) {
 			int where = 0;
 
 			curproxy->conf.args.ctx = ARGC_UIF;
-			curproxy->conf.args.file = curproxy->conf.uif_file;
-			curproxy->conf.args.line = curproxy->conf.uif_line;
+			curproxy->conf.args.file = curproxy->format_unique_id.conf.file;
+			curproxy->conf.args.line = curproxy->format_unique_id.conf.line;
 			err = NULL;
 			if (curproxy->cap & PR_CAP_FE)
 				where |= SMP_VAL_FE_HRQ_HDR;
 			if (curproxy->cap & PR_CAP_BE)
 				where |= SMP_VAL_BE_HRQ_HDR;
-			if (!parse_logformat_string(curproxy->conf.uniqueid_format_string, curproxy, &curproxy->format_unique_id,
-			                            LOG_OPT_HTTP|LOG_OPT_MERGE_SPACES, where, &err)) {
+			if (!lf_expr_compile(&curproxy->format_unique_id, &curproxy->conf.args,
+			                            LOG_OPT_HTTP|LOG_OPT_MERGE_SPACES, where, &err) ||
+			    !lf_expr_postcheck(&curproxy->format_unique_id, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse unique-id : %s.\n",
-					 curproxy->conf.uif_file, curproxy->conf.uif_line, err);
+					 curproxy->format_unique_id.conf.file, curproxy->format_unique_id.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3470,16 +3690,17 @@ out_uri_auth_compat:
 			curproxy->conf.args.line = 0;
 		}
 
-		if (curproxy->conf.error_logformat_string) {
+		if (curproxy->logformat_error.str) {
 			curproxy->conf.args.ctx = ARGC_LOG;
-			curproxy->conf.args.file = curproxy->conf.elfs_file;
-			curproxy->conf.args.line = curproxy->conf.elfs_line;
+			curproxy->conf.args.file = curproxy->logformat_error.conf.file;
+			curproxy->conf.args.line = curproxy->logformat_error.conf.line;
 			err = NULL;
-			if (!parse_logformat_string(curproxy->conf.error_logformat_string, curproxy, &curproxy->logformat_error,
+			if (!lf_expr_compile(&curproxy->logformat_error, &curproxy->conf.args,
 			                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-			                            SMP_VAL_FE_LOG_END, &err)) {
+			                            SMP_VAL_FE_LOG_END, &err) ||
+			    !lf_expr_postcheck(&curproxy->logformat_error, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse error-log-format : %s.\n",
-					 curproxy->conf.elfs_file, curproxy->conf.elfs_line, err);
+					 curproxy->logformat_error.conf.file, curproxy->logformat_error.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3624,16 +3845,23 @@ out_uri_auth_compat:
 		 * in order to avoid combinatory explosion if all servers have the same
 		 * name. We do that only for servers which do not have an explicit ID,
 		 * because these IDs were made also for distinguishing them and we don't
-		 * want to annoy people who correctly manage them.
+		 * want to annoy people who correctly manage them. Since servers names
+		 * are stored in a tree before landing here, we simply have to check for
+		 * the current server's duplicates to spot conflicts.
 		 */
 		for (newsrv = curproxy->srv; newsrv; newsrv = newsrv->next) {
 			struct server *other_srv;
 
-			if (newsrv->puid)
+			/* Note: internal servers are not always registered and
+			 * they do not conflict.
+			 */
+			if (!newsrv->conf.name.node.leaf_p)
 				continue;
 
-			for (other_srv = curproxy->srv; other_srv && other_srv != newsrv; other_srv = other_srv->next) {
-				if (!other_srv->puid && strcmp(other_srv->id, newsrv->id) == 0) {
+			for (other_srv = newsrv;
+			     (other_srv = container_of_safe(ebpt_prev_dup(&other_srv->conf.name),
+			                                    struct server, conf.name)); ) {
+				if (!newsrv->puid && !other_srv->puid) {
 					ha_alert("parsing [%s:%d] : %s '%s', another server named '%s' was already defined at line %d, please use distinct names.\n",
 						   newsrv->conf.file, newsrv->conf.line,
 						   proxy_type_str(curproxy), curproxy->id,
@@ -3641,6 +3869,11 @@ out_uri_auth_compat:
 					cfgerr++;
 					break;
 				}
+
+				ha_warning("parsing [%s:%d] : %s '%s', another server named '%s' was already defined at line %d. This is dangerous and will not be supported anymore in version 3.3. Please use distinct names.\n",
+					   newsrv->conf.file, newsrv->conf.line,
+					   proxy_type_str(curproxy), curproxy->id,
+					   newsrv->id, other_srv->conf.line);
 			}
 		}
 
@@ -3722,12 +3955,6 @@ out_uri_auth_compat:
 		 * on what LB algorithm was chosen.
 		 */
 
-		if (curproxy->mode == PR_MODE_SYSLOG) {
-			/* log load-balancing requires special init that is performed
-			 * during log-postparsing step
-			 */
-			goto skip_server_lb_init;
-		}
 		curproxy->lbprm.algo &= ~(BE_LB_LKUP | BE_LB_PROP_DYN);
 		switch (curproxy->lbprm.algo & BE_LB_KIND) {
 		case BE_LB_KIND_RR:
@@ -3766,8 +3993,13 @@ out_uri_auth_compat:
 				init_server_map(curproxy);
 			}
 			break;
+		case BE_LB_KIND_SA:
+			if ((curproxy->lbprm.algo & BE_LB_PARM) == BE_LB_SA_SS) {
+				curproxy->lbprm.algo |= BE_LB_PROP_DYN;
+				init_server_ss(curproxy);
+			}
+			break;
 		}
- skip_server_lb_init:
 		HA_RWLOCK_INIT(&curproxy->lbprm.lock);
 
 		if (curproxy->options & PR_O_LOGASAP)
@@ -3775,7 +4007,7 @@ out_uri_auth_compat:
 
 		if (!(curproxy->cap & PR_CAP_INT) && (curproxy->mode == PR_MODE_TCP || curproxy->mode == PR_MODE_HTTP) &&
 		    (curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->loggers) &&
-		    (!LIST_ISEMPTY(&curproxy->logformat) || !LIST_ISEMPTY(&curproxy->logformat_sd))) {
+		    (!lf_expr_isempty(&curproxy->logformat) || !lf_expr_isempty(&curproxy->logformat_sd))) {
 			ha_warning("log format ignored for %s '%s' since it has no log address.\n",
 				   proxy_type_str(curproxy), curproxy->id);
 			err_code |= ERR_WARN;
@@ -3788,6 +4020,7 @@ out_uri_auth_compat:
 				ha_warning("'stats' statement ignored for %s '%s' as it requires HTTP mode.\n",
 					   proxy_type_str(curproxy), curproxy->id);
 				err_code |= ERR_WARN;
+				stats_uri_auth_drop(curproxy->uri_auth);
 				curproxy->uri_auth = NULL;
 			}
 
@@ -3893,6 +4126,8 @@ out_uri_auth_compat:
 
 			if ((curproxy->mode != PR_MODE_HTTP) && (curproxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR)
 				curproxy->options &= ~PR_O_REUSE_MASK;
+			if (curproxy->mode == PR_MODE_SPOP)
+				curproxy->options |= PR_O_REUSE_ALWS;
 
 			if ((curproxy->mode != PR_MODE_HTTP) && newsrv->flags & SRV_F_RHTTP) {
 				ha_alert("%s '%s' : server %s uses reverse HTTP addressing which can only be used with HTTP mode.\n",
@@ -4101,7 +4336,7 @@ out_uri_auth_compat:
 
 	/* we must finish to initialize certain things on the servers */
 
-	list_for_each_entry(newsrv, &servers_list, global_list) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(newsrv, &servers_list, global_list, back) {
 		/* initialize idle conns lists */
 		if (srv_init_per_thr(newsrv) == -1) {
 			ha_alert("parsing [%s:%d] : failed to allocate per-thread lists for server '%s'.\n",
@@ -4156,6 +4391,7 @@ init_proxies_list_stage2:
 		struct listener *listener;
 		unsigned int next_id;
 
+		proxy_init_per_thr(curproxy);
 		/* Configure SSL for each bind line.
 		 * Note: if configuration fails at some point, the ->ctx member
 		 * remains NULL so that listeners can later detach.
@@ -4186,6 +4422,11 @@ init_proxies_list_stage2:
 				/* listener ID not set, use automatic numbering with first
 				 * spare entry starting with next_luid.
 				 */
+				if (listener->by_fe.p != &curproxy->conf.listeners) {
+					struct listener *prev_li = LIST_PREV(&listener->by_fe, typeof(prev_li), by_fe);
+					if (prev_li->luid)
+						next_id = prev_li->luid + 1;
+				}
 				next_id = get_next_id(&curproxy->conf.used_listener_id, next_id);
 				listener->conf.id.key = listener->luid = next_id;
 				eb32_insert(&curproxy->conf.used_listener_id, &listener->conf.id);
@@ -4533,10 +4774,13 @@ int cfg_register_section(char *section_name,
 {
 	struct cfg_section *cs;
 
-	list_for_each_entry(cs, &sections, list) {
-		if (strcmp(cs->section_name, section_name) == 0) {
-			ha_alert("register section '%s': already registered.\n", section_name);
-			return 0;
+	if (section_parser) {
+		/* only checks if we register a section parser, not a post section callback */
+		list_for_each_entry(cs, &sections, list) {
+			if (strcmp(cs->section_name, section_name) == 0 && cs->section_parser) {
+				ha_alert("register section '%s': already registered.\n", section_name);
+				return 0;
+			}
 		}
 	}
 
@@ -4795,6 +5039,7 @@ REGISTER_CONFIG_SECTION("userlist",       cfg_parse_users,     NULL);
 REGISTER_CONFIG_SECTION("peers",          cfg_parse_peers,     NULL);
 REGISTER_CONFIG_SECTION("mailers",        cfg_parse_mailers,   NULL);
 REGISTER_CONFIG_SECTION("namespace_list", cfg_parse_netns,     NULL);
+REGISTER_CONFIG_SECTION("traces",         cfg_parse_traces,    NULL);
 
 static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_GLOBAL, "default-path",     cfg_parse_global_def_path },

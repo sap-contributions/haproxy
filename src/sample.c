@@ -19,11 +19,13 @@
 #include <import/mjson.h>
 #include <import/sha1.h>
 
+#include <haproxy/acl.h>
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/auth.h>
 #include <haproxy/base64.h>
 #include <haproxy/buf.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/chunk.h>
 #include <haproxy/clock.h>
 #include <haproxy/errors.h>
@@ -31,6 +33,7 @@
 #include <haproxy/global.h>
 #include <haproxy/hash.h>
 #include <haproxy/http.h>
+#include <haproxy/http_ana-t.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/mqtt.h>
 #include <haproxy/net_helper.h>
@@ -38,6 +41,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/sink.h>
 #include <haproxy/stick_table.h>
 #include <haproxy/time.h>
@@ -69,7 +73,7 @@ int type_to_smp(const char *type)
 	int it = 0;
 
 	while (it < SMP_TYPES) {
-		if (!strcmp(type, smp_to_type[it]))
+		if (strcmp(type, smp_to_type[it]) == 0)
 			break; // found
 		it += 1;
 	}
@@ -1318,12 +1322,14 @@ int sample_process_cnv(struct sample_expr *expr, struct sample *p)
 		 *  - c_none => nothing to do (let's optimize it)
 		 *  - other  => apply cast and prepare to fail
 		 */
-		if (!sample_casts[p->data.type][conv_expr->conv->in_type])
-			return 0;
+		if (p->data.type != conv_expr->conv->in_type) {
+			if (!sample_casts[p->data.type][conv_expr->conv->in_type])
+				return 0;
 
-		if (sample_casts[p->data.type][conv_expr->conv->in_type] != c_none &&
-		    !sample_casts[p->data.type][conv_expr->conv->in_type](p))
-			return 0;
+			if (sample_casts[p->data.type][conv_expr->conv->in_type] != c_none &&
+			    !sample_casts[p->data.type][conv_expr->conv->in_type](p))
+				return 0;
+		}
 
 		/* OK cast succeeded */
 
@@ -1442,6 +1448,20 @@ int smp_resolve_args(struct proxy *p, char **err)
 		pname = p->id;
 
 		switch (arg->type) {
+		case ARGT_ID:
+			err2 = NULL;
+
+			if (arg->resolve_ptr && !arg->resolve_ptr(arg, &err2)) {
+				memprintf(err, "%sparsing [%s:%d]: error in identifier '%s' in arg %d of %s%s%s%s '%s' %s proxy '%s' : %s.\n",
+					  *err ? *err : "", cur->file, cur->line,
+					 arg->data.str.area,
+					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err2);
+				ha_free(&err2);
+				cfgerr++;
+				continue;
+			}
+			break;
+
 		case ARGT_SRV:
 			if (!arg->data.str.data) {
 				memprintf(err, "%sparsing [%s:%d]: missing server name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
@@ -1636,6 +1656,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 					  *err ? *err : "", cur->file, cur->line,
 					 arg->data.str.area,
 					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err2);
+				ha_free(&err2);
 				cfgerr++;
 				continue;
 			}
@@ -1690,12 +1711,14 @@ struct sample *sample_fetch_as_type(struct proxy *px, struct session *sess,
 		return NULL;
 	}
 
-	if (!sample_casts[smp->data.type][smp_type])
-		return NULL;
+	if (smp->data.type != smp_type) {
+		if (!sample_casts[smp->data.type][smp_type])
+			return NULL;
 
-	if (sample_casts[smp->data.type][smp_type] != c_none &&
-	    !sample_casts[smp->data.type][smp_type](smp))
-		return NULL;
+		if (sample_casts[smp->data.type][smp_type] != c_none &&
+		    !sample_casts[smp->data.type][smp_type](smp))
+			return NULL;
+	}
 
 	smp->flags &= ~SMP_F_MAY_CHANGE;
 	return smp;
@@ -1815,9 +1838,9 @@ static int smp_check_debug(struct arg *args, struct sample_conv *conv,
 	if (args[1].type == ARGT_STR)
 		name = args[1].data.str.area;
 
-	sink = sink_find(name);
+	sink = sink_find_early(name, "debug converter", file, line);
 	if (!sink) {
-		memprintf(err, "No such sink '%s'", name);
+		memprintf(err, "Memory error while setting up sink '%s'", name);
 		return 0;
 	}
 
@@ -3823,6 +3846,177 @@ static int sample_conv_iif(const struct arg *arg_p, struct sample *smp, void *pr
 	return 1;
 }
 
+enum {
+	WHEN_COND_STOPPING,
+	WHEN_COND_NORMAL,
+	WHEN_COND_ERROR,
+	WHEN_COND_FORWARDED,
+	WHEN_COND_TOAPPLET,
+	WHEN_COND_PROCESSED,
+	WHEN_COND_ACL,
+	WHEN_COND_CONDITIONS
+};
+
+const char *when_cond_kw[WHEN_COND_CONDITIONS] = {
+	[WHEN_COND_STOPPING]    = "stopping",
+	[WHEN_COND_NORMAL]      = "normal",
+	[WHEN_COND_ERROR]       = "error",
+	[WHEN_COND_FORWARDED]	= "forwarded",
+	[WHEN_COND_TOAPPLET]	= "toapplet",
+	[WHEN_COND_PROCESSED]	= "processed",
+	[WHEN_COND_ACL]         = "acl",
+};
+
+/* Evaluates a condition and decides whether or not to pass the input sample
+ * to the output. The purpose is to hide some info when certain conditions are
+ * (not) met. These conditions belong to a fixed list that can verify internal
+ * states (debug mode, too high load, reloading, server down, stream in error
+ * etc). The condition's sign is placed in arg_p[0].data.int. 0=direct, 1=inv.
+ * The condition keyword is in arg_p[1].data.int (WHEN_COND_*).
+ */
+static int sample_conv_when(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct session *sess = smp->sess;
+	struct stream *strm = smp->strm;
+	int neg  = arg_p[0].data.sint;
+	int cond = arg_p[1].data.sint;
+	struct acl_sample *acl_sample;
+	int ret = 0;
+
+	switch (cond) {
+	case WHEN_COND_STOPPING:
+		ret = !!stopping;
+		break;
+
+	case WHEN_COND_NORMAL:
+		neg = !neg;
+		__fallthrough;
+
+	case WHEN_COND_ERROR:
+		if (strm &&
+		    ((strm->flags & SF_REDISP) ||
+		     ((strm->flags & SF_ERR_MASK) > SF_ERR_LOCAL) ||
+		     (((strm->flags & SF_ERR_MASK) == SF_ERR_NONE) && strm->conn_retries) ||
+		     ((sess->fe->mode == PR_MODE_HTTP) && strm->txn && strm->txn->status >= 500)))
+			ret = 1;
+		break;
+
+	case WHEN_COND_FORWARDED: // true if forwarded to a connection
+		ret = !!sc_conn(smp->strm->scb);
+		break;
+
+	case WHEN_COND_TOAPPLET:  // true if handled as an applet
+		ret = !!sc_appctx(smp->strm->scb);
+		break;
+
+	case WHEN_COND_PROCESSED: // true if forwarded or appctx
+		ret = sc_conn(smp->strm->scb) || sc_appctx(smp->strm->scb);
+		break;
+
+	case WHEN_COND_ACL: // true if the ACL pointed to by args[2] evaluates to true
+		acl_sample = arg_p[2].data.ptr;
+		ret = acl_exec_cond(&acl_sample->cond, smp->px, smp->sess, smp->strm, smp->opt) == ACL_TEST_PASS;
+		break;
+	}
+
+	ret = !!ret ^ !!neg;
+	if (!ret) {
+		/* kill the sample */
+		return 0;
+	}
+
+	/* pass the sample as-is */
+	return 1;
+}
+
+/* checks and resolves the type of the argument passed to when().
+ * It supports an optional '!' to negate the condition, followed by
+ * a keyword among the list above. Note that we're purposely declaring
+ * one extra arg because the first one will be split into two.
+ */
+static int check_when_cond(struct arg *args, struct sample_conv *conv,
+                             const char *file, int line, char **err)
+{
+	struct acl_sample *acl_sample;
+	const char *kw;
+	int neg = 0;
+	int i;
+
+	kw = args[0].data.str.area;
+	if (*kw == '!') {
+		kw++;
+		neg = 1;
+	}
+
+	for (i = 0; i < WHEN_COND_CONDITIONS; i++) {
+		if (strcmp(kw, when_cond_kw[i]) == 0)
+			break;
+	}
+
+	if (i == WHEN_COND_CONDITIONS) {
+		memprintf(err, "expects a supported keyword among {");
+		for (i = 0; i < WHEN_COND_CONDITIONS; i++)
+			memprintf(err, "%s%s%s", *err, when_cond_kw[i],  (i == WHEN_COND_CONDITIONS - 1) ? "}" : ",");
+		memprintf(err, "%s but got '%s'", *err, kw);
+		return 0;
+	}
+
+	if (i == WHEN_COND_ACL) {
+		if (args[1].type != ARGT_STR || !*args[1].data.str.area) {
+			memprintf(err, "'acl' selector requires an extra argument with the ACL name");
+			return 0;
+		}
+
+		if (!curproxy) {
+			memprintf(err, "'acl' selector may only be used in the context of a proxy");
+			return 0;
+		}
+
+		acl_sample = calloc(1, sizeof(struct acl_sample) + sizeof(struct acl_term));
+		if (!acl_sample) {
+			memprintf(err, "not enough memory for 'acl' selector");
+			return 0;
+		}
+
+		LIST_INIT(&acl_sample->suite.terms);
+		LIST_INIT(&acl_sample->cond.suites);
+		LIST_APPEND(&acl_sample->cond.suites, &acl_sample->suite.list);
+		LIST_APPEND(&acl_sample->suite.terms, &acl_sample->terms[0].list);
+		acl_sample->cond.val = ~0U; // the keyword is valid everywhere for now.
+
+		/* build one term based on the ACL kw */
+		if (!(acl_sample->terms[0].acl = find_acl_by_name(args[1].data.str.area, &curproxy->acl)) &&
+		    !(acl_sample->terms[0].acl = find_acl_default(args[1].data.str.area, &curproxy->acl, err, NULL, NULL, 0))) {
+			memprintf(err, "ACL '%s' not found", args[1].data.str.area);
+			return 0;
+		}
+
+		acl_sample->cond.use |= acl_sample->terms[0].acl->use;
+		acl_sample->cond.val &= acl_sample->terms[0].acl->val;
+
+		args[2].type = ARGT_PTR;
+		args[2].unresolved = 0;
+		args[2].resolve_ptr = NULL;
+		args[2].data.ptr = acl_sample;
+	}
+
+	chunk_destroy(&args[0].data.str);
+	if (args[1].type == ARGT_STR)
+		chunk_destroy(&args[1].data.str);
+
+	if (args[2].type == ARGT_STR)
+		chunk_destroy(&args[2].data.str);
+
+	// store condition
+	args[0].type = ARGT_SINT;
+	args[0].data.sint = neg; // '!' present
+
+	// and keyword
+	args[1].type = ARGT_SINT;
+	args[1].data.sint = i;
+	return 1;
+}
+
 #define GRPC_MSG_COMPRESS_FLAG_SZ 1 /* 1 byte */
 #define GRPC_MSG_LENGTH_SZ        4 /* 4 bytes */
 #define GRPC_MSG_HEADER_SZ        (GRPC_MSG_COMPRESS_FLAG_SZ + GRPC_MSG_LENGTH_SZ)
@@ -3844,7 +4038,7 @@ static int sample_conv_ungrpc(const struct arg *arg_p, struct sample *smp, void 
 	while (grpc_left > GRPC_MSG_HEADER_SZ) {
 		size_t grpc_msg_len, left;
 
-		grpc_msg_len = left = ntohl(*(uint32_t *)(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
+		grpc_msg_len = left = ntohl(read_u32(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
 
 		pos += GRPC_MSG_HEADER_SZ;
 		grpc_left -= GRPC_MSG_HEADER_SZ;
@@ -4288,11 +4482,13 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
 static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *conv,
 					const char *file, int line, char **err)
 {
+	enum jwt_alg alg = JWT_ALG_DEFAULT;
+
 	vars_check_arg(&args[0], NULL);
 	vars_check_arg(&args[1], NULL);
 
 	if (args[0].type == ARGT_STR) {
-		enum jwt_alg alg = jwt_parse_alg(args[0].data.str.area, args[0].data.str.data);
+		alg = jwt_parse_alg(args[0].data.str.area, args[0].data.str.data);
 
 		if (alg == JWT_ALG_DEFAULT) {
 			memprintf(err, "unknown JWT algorithm: %s", args[0].data.str.area);
@@ -4301,7 +4497,16 @@ static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *co
 	}
 
 	if (args[1].type == ARGT_STR) {
-		jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
+		switch (alg) {
+			JWS_ALG_HS256:
+			JWS_ALG_HS384:
+			JWS_ALG_HS512:
+			/* don't try to load a file with HMAC algorithms */
+				break;
+			default:
+				jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
+				break;
+		}
 	}
 
 	return 1;
@@ -4807,29 +5012,57 @@ static int smp_check_uuid(struct arg *args, char **err)
 	if (!args[0].type) {
 		args[0].type = ARGT_SINT;
 		args[0].data.sint = 4;
-	}
-	else if (args[0].data.sint != 4) {
-		memprintf(err, "Unsupported UUID version: '%lld'", args[0].data.sint);
-		return 0;
+	} else {
+		switch (args[0].data.sint) {
+		case 4:
+		case 7:
+			break;
+		default:
+			memprintf(err, "Unsupported UUID version: '%lld'", args[0].data.sint);
+			return 0;
+		}
 	}
 
 	return 1;
 }
 
-// Generate a RFC4122 UUID (default is v4 = fully random)
+// Generate a RFC 9562 UUID (default is v4 = fully random)
 static int smp_fetch_uuid(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	if (args[0].data.sint == 4 || !args[0].type) {
-		ha_generate_uuid(&trash);
-		smp->data.type = SMP_T_STR;
-		smp->flags = SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
-		smp->data.u.str = trash;
-		return 1;
+	long long int type = -1;
+
+	if (!args[0].type) {
+		type = 4;
+	} else {
+		type = args[0].data.sint;
 	}
 
-	// more implementations of other uuid formats possible here
-	return 0;
+	switch (type) {
+	case 4:
+		ha_generate_uuid_v4(&trash);
+		break;
+	case 7:
+		ha_generate_uuid_v7(&trash);
+		break;
+	default:
+		return 0;
+	}
+
+	smp->data.type = SMP_T_STR;
+	smp->flags = SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	smp->data.u.str = trash;
+	return 1;
 }
+
+/* returns the uptime in seconds */
+static int
+smp_fetch_uptime(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ns_to_sec(now_ns - start_time_ns);
+	return 1;
+}
+
 
 /* Check if QUIC support was compiled and was not disabled by "no-quic" global option */
 static int smp_fetch_quic_enabled(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -5131,6 +5364,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "thread",       smp_fetch_thread,  0,          NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "rand",         smp_fetch_rand,  ARG1(0,SINT), NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "stopping",     smp_fetch_stopping, 0,         NULL, SMP_T_BOOL, SMP_USE_INTRN },
+	{ "uptime",       smp_fetch_uptime,   0,         NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "uuid",         smp_fetch_uuid,  ARG1(0, SINT),      smp_check_uuid, SMP_T_STR, SMP_USE_CONST },
 
 	{ "cpu_calls",    smp_fetch_cpu_calls,  0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
@@ -5236,6 +5470,7 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "jwt_payload_query", sample_conv_jwt_payload_query, ARG2(0,STR,STR), sample_conv_jwt_query_check,   SMP_T_BIN, SMP_T_ANY },
 	{ "jwt_verify",        sample_conv_jwt_verify,        ARG2(2,STR,STR), sample_conv_jwt_verify_check,  SMP_T_BIN, SMP_T_SINT },
 #endif
+	{ "when",              sample_conv_when,              ARG3(1,STR,STR,STR), check_when_cond,               SMP_T_ANY, SMP_T_ANY  },
 	{ NULL, NULL, 0, 0, 0 },
 }};
 

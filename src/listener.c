@@ -27,6 +27,7 @@
 #include <haproxy/freq_ctr.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
+#include <haproxy/guid.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
@@ -104,11 +105,14 @@ struct connection *accept_queue_pop_sc(struct accept_queue_ring *ring)
 }
 
 
-/* tries to push a new accepted connection <conn> into ring <ring>. Returns
- * non-zero if it succeeds, or zero if the ring is full. Supports multiple
- * producers.
+/* Tries to push a new accepted connection <conn> into ring <ring>.
+ * <accept_push_cb> is called if not NULL just prior to the push operation.
+ *
+ * Returns non-zero if it succeeds, or zero if the ring is full. Supports
+ * multiple producers.
  */
-int accept_queue_push_mp(struct accept_queue_ring *ring, struct connection *conn)
+int accept_queue_push_mp(struct accept_queue_ring *ring, struct connection *conn,
+                         void (*accept_push_cb)(struct connection *))
 {
 	unsigned int pos, next;
 	uint32_t idx = _HA_ATOMIC_LOAD(&ring->idx);  /* (head << 16) + tail */
@@ -122,6 +126,9 @@ int accept_queue_push_mp(struct accept_queue_ring *ring, struct connection *conn
 			return 0; // ring full
 		next |= (idx & 0xffff0000U);
 	} while (unlikely(!_HA_ATOMIC_CAS(&ring->idx, &idx, next) && __ha_cpu_relax()));
+
+	if (accept_push_cb)
+		accept_push_cb(conn);
 
 	ring->entry[pos] = conn;
 	__ha_barrier_store();
@@ -443,9 +450,9 @@ int default_resume_listener(struct listener *l)
 		err = l->rx.proto->fam->bind(&l->rx, &errmsg);
 		if (err != ERR_NONE) {
 			if (err & ERR_WARN)
-				ha_warning("Resuming listener: %s\n", errmsg);
+				ha_warning("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, errmsg);
 			else if (err & ERR_ALERT)
-				ha_alert("Resuming listener: %s\n", errmsg);
+				ha_alert("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, errmsg);
 			ha_free(&errmsg);
 			if (err & (ERR_FATAL | ERR_ABORT)) {
 				ret = 0;
@@ -460,9 +467,9 @@ int default_resume_listener(struct listener *l)
 		BUG_ON(!l->rx.proto->listen);
 		err = l->rx.proto->listen(l, msg, sizeof(msg));
 		if (err & ERR_ALERT)
-			ha_alert("Resuming listener: %s\n", msg);
+			ha_alert("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, msg);
 		else if (err & ERR_WARN)
-			ha_warning("Resuming listener: %s\n", msg);
+			ha_warning("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, msg);
 
 		if (err & (ERR_FATAL | ERR_ABORT)) {
 			ret = 0;
@@ -700,8 +707,12 @@ void dequeue_all_listeners()
 	}
 }
 
-/* Dequeues all listeners waiting for a resource in proxy <px>'s queue */
-void dequeue_proxy_listeners(struct proxy *px)
+/* Dequeues all listeners waiting for a resource in proxy <px>'s queue
+ * The caller is responsible for indicating in lpx, whether the proxy's lock
+ * is already held (non-zero) or not (zero) so that this information can be
+ * passed to relax_listener
+*/
+void dequeue_proxy_listeners(struct proxy *px, int lpx)
 {
 	struct listener *listener;
 
@@ -709,7 +720,7 @@ void dequeue_proxy_listeners(struct proxy *px)
 		/* This cannot fail because the listeners are by definition in
 		 * the LI_LIMITED state.
 		 */
-		relax_listener(listener, 0, 0);
+		relax_listener(listener, lpx, 0);
 	}
 }
 
@@ -816,6 +827,8 @@ int create_listeners(struct bind_conf *bc, const struct sockaddr_storage *ss,
 		if (fd != -1)
 			l->rx.flags |= RX_F_INHERITED;
 
+		guid_init(&l->guid);
+
 		l->extra_counters = NULL;
 
 		HA_RWLOCK_INIT(&l->lock);
@@ -913,6 +926,7 @@ struct listener *clone_listener(struct listener *src)
 		goto oom1;
 	memcpy(l, src, sizeof(*l));
 
+	l->luid = 0; // don't dup the listener's ID!
 	if (l->name) {
 		l->name = strdup(l->name);
 		if (!l->name)
@@ -1009,6 +1023,7 @@ static inline int listener_uses_maxconn(const struct listener *l)
  */
 void listener_accept(struct listener *l)
 {
+	void (*bind_tid_commit)(struct connection *) __maybe_unused;
 	struct connection *cli_conn;
 	struct proxy *p;
 	unsigned int max_accept;
@@ -1019,6 +1034,7 @@ void listener_accept(struct listener *l)
 	int ret;
 
 	p = l->bind_conf->frontend;
+	bind_tid_commit = l->rx.proto->bind_tid_commit;
 
 	/* if l->bind_conf->maxaccept is -1, then max_accept is UINT_MAX. It is
 	 * not really illimited, but it is probably enough.
@@ -1066,11 +1082,11 @@ void listener_accept(struct listener *l)
 	}
 #endif
 	if (p && p->fe_sps_lim) {
-		int max = freq_ctr_remain(&p->fe_sess_per_sec, p->fe_sps_lim, 0);
+		int max = freq_ctr_remain(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0);
 
 		if (unlikely(!max)) {
 			/* frontend accept rate limit was reached */
-			expire = tick_add(now_ms, next_event_delay(&p->fe_sess_per_sec, p->fe_sps_lim, 0));
+			expire = tick_add(now_ms, next_event_delay(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0));
 			goto limit_proxy;
 		}
 
@@ -1457,8 +1473,8 @@ void listener_accept(struct listener *l)
 			 * reservation in the target ring.
 			 */
 
-			if (l->rx.proto && l->rx.proto->set_affinity) {
-				if (l->rx.proto->set_affinity(cli_conn, t)) {
+			if (l->rx.proto->bind_tid_prep) {
+				if (l->rx.proto->bind_tid_prep(cli_conn, t)) {
 					/* Failed migration, stay on the same thread. */
 					goto local_accept;
 				}
@@ -1471,15 +1487,19 @@ void listener_accept(struct listener *l)
 			 * when processing this loop.
 			 */
 			ring = &accept_queue_rings[t];
-			if (accept_queue_push_mp(ring, cli_conn)) {
+			if (accept_queue_push_mp(ring, cli_conn, bind_tid_commit)) {
 				_HA_ATOMIC_INC(&activity[t].accq_pushed);
 				tasklet_wakeup(ring->tasklet);
+
 				continue;
 			}
 			/* If the ring is full we do a synchronous accept on
 			 * the local thread here.
 			 */
 			_HA_ATOMIC_INC(&activity[t].accq_full);
+
+			if (l->rx.proto->bind_tid_reset)
+				l->rx.proto->bind_tid_reset(cli_conn);
 		}
 #endif // USE_THREAD
 
@@ -1541,8 +1561,8 @@ void listener_accept(struct listener *l)
 		dequeue_all_listeners();
 
 		if (p && !MT_LIST_ISEMPTY(&p->listener_queue) &&
-		    (!p->fe_sps_lim || freq_ctr_remain(&p->fe_sess_per_sec, p->fe_sps_lim, 0) > 0))
-			dequeue_proxy_listeners(p);
+		    (!p->fe_sps_lim || freq_ctr_remain(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0) > 0))
+			dequeue_proxy_listeners(p, 0);
 	}
 	return;
 
@@ -1553,7 +1573,7 @@ void listener_accept(struct listener *l)
 	/* This may be a shared socket that was paused by another process.
 	 * Let's put it to pause in this case.
 	 */
-	if (l->rx.proto && l->rx.proto->rx_listening(&l->rx) == 0) {
+	if (l->rx.proto->rx_listening(&l->rx) == 0) {
 		suspend_listener(l, 0, 0);
 		goto end;
 	}
@@ -1600,8 +1620,24 @@ void listener_release(struct listener *l)
 	dequeue_all_listeners();
 
 	if (fe && !MT_LIST_ISEMPTY(&fe->listener_queue) &&
-	    (!fe->fe_sps_lim || freq_ctr_remain(&fe->fe_sess_per_sec, fe->fe_sps_lim, 0) > 0))
-		dequeue_proxy_listeners(fe);
+	    (!fe->fe_sps_lim || freq_ctr_remain(&fe->fe_counters.sess_per_sec, fe->fe_sps_lim, 0) > 0))
+		dequeue_proxy_listeners(fe, 0);
+	else if (fe) {
+		unsigned int wait;
+		int expire = TICK_ETERNITY;
+
+		if (fe->task && fe->fe_sps_lim &&
+		    (wait = next_event_delay(&fe->fe_counters.sess_per_sec,fe->fe_sps_lim, 0))) {
+			/* we're blocking because a limit was reached on the number of
+			 * requests/s on the frontend. We want to re-check ASAP, which
+			 * means in 1 ms before estimated expiration date, because the
+			 * timer will have settled down.
+			 */
+			expire = tick_first(fe->task->expire, tick_add(now_ms, wait));
+			if (tick_isset(expire))
+				task_schedule(fe->task, expire);
+		}
+	}
 }
 
 /* Initializes the listener queues. Returns 0 on success, otherwise ERR_* flags */
@@ -1697,8 +1733,8 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 			else {
 				if (fe != global.cli_fe)
 					ha_diag_warning("[%s:%d]: Disabling per-thread sharding for listener in"
-					                " %s '%s' because SO_REUSEPORT is disabled\n",
-					                bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id);
+					                " %s '%s' because SO_REUSEPORT is disabled for %s protocol.\n",
+					                bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id, li->rx.proto->name);
 				shards = 1;
 			}
 		}
@@ -1711,8 +1747,8 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 
 		/* We also need to check if an explicit shards count was set and cannot be honored */
 		if (shards > 1 && !protocol_supports_flag(li->rx.proto, PROTO_F_REUSEPORT_SUPPORTED)) {
-			ha_warning("[%s:%d]: Disabling sharding for listener in %s '%s' because SO_REUSEPORT is disabled\n",
-			           bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id);
+			ha_warning("[%s:%d]: Disabling sharding for listener in %s '%s' because SO_REUSEPORT is disabled for %s protocol.\n",
+			           bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id, li->rx.proto->name);
 			shards = 1;
 		}
 
@@ -1791,6 +1827,12 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 						*err_code |= ERR_FATAL | ERR_ALERT;
 						return cfgerr;
 					}
+					/* assign the ID to the first one only */
+					new_li->luid = new_li->conf.id.key = tmp_li->luid;
+					tmp_li->luid = 0;
+					eb32_delete(&tmp_li->conf.id);
+					if (tmp_li->luid)
+						eb32_insert(&fe->conf.used_listener_id, &new_li->conf.id);
 					new_li = tmp_li;
 				}
 			}
@@ -1809,11 +1851,54 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 				*err_code |= ERR_FATAL | ERR_ALERT;
 				return cfgerr;
 			}
+			/* assign the ID to the first one only */
+			new_li->luid = new_li->conf.id.key = li->luid;
+			li->luid = 0;
+			eb32_delete(&li->conf.id);
+			if (li->luid)
+				eb32_insert(&fe->conf.used_listener_id, &new_li->conf.id);
 		}
 	}
 
 	/* success */
 	return cfgerr;
+}
+
+/* Generate and insert unique GUID for each listeners of <bind_conf> instance
+ * if GUID prefix is defined.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int bind_generate_guid(struct bind_conf *bind_conf)
+{
+	struct listener *l;
+	char *guid_err = NULL;
+
+	if (!bind_conf->guid_prefix)
+		return 0;
+
+	list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+		if (bind_conf->guid_idx == (size_t)-1) {
+			ha_alert("[%s:%d] : error on GUID generation : Too many listeners.\n",
+			         bind_conf->file, bind_conf->line);
+			return 1;
+		}
+
+		chunk_printf(&trash, "%s-%lld", bind_conf->guid_prefix,
+		             (ullong)bind_conf->guid_idx);
+
+		if (guid_insert(&l->obj_type, b_head(&trash), &guid_err)) {
+			ha_alert("[%s:%d] : error on GUID generation : %s. "
+			         "You may fix it by adjusting guid-prefix.\n",
+			         bind_conf->file, bind_conf->line, guid_err);
+			ha_free(&guid_err);
+			return 1;
+		}
+
+		++bind_conf->guid_idx;
+	}
+
+	return 0;
 }
 
 /*
@@ -1954,10 +2039,12 @@ struct bind_conf *bind_conf_alloc(struct proxy *fe, const char *file,
 #ifdef USE_QUIC
 	/* Use connection socket for QUIC by default. */
 	bind_conf->quic_mode = QUIC_SOCK_MODE_CONN;
-	bind_conf->max_cwnd =
-		global.tune.bufsize * global.tune.quic_streams_buf;
+	bind_conf->max_cwnd = global.tune.quic_frontend_max_window_size;
 #endif
 	LIST_INIT(&bind_conf->listeners);
+
+	bind_conf->guid_prefix = NULL;
+	bind_conf->guid_idx = 0;
 
 	bind_conf->rhttp_srvname = NULL;
 
@@ -2063,6 +2150,26 @@ static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct
 	}
 
 	conf->backlog = val;
+	return 0;
+}
+
+/* parse the "guid-prefix" bind keyword */
+static int bind_parse_guid_prefix(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	char *prefix = NULL;
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : expects an argument", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	prefix = strdup(args[cur_arg + 1]);
+	if (!prefix) {
+		memprintf(err, "'%s' : out of memory", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	conf->guid_prefix = prefix;
 	return 0;
 }
 
@@ -2261,8 +2368,13 @@ static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct bi
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind)
+	list_for_each_entry(l, &conf->listeners, by_bind) {
 		l->name = strdup(args[cur_arg + 1]);
+		if (!l->name) {
+			memprintf(err, "'%s %s' : out of memory", args[cur_arg], args[cur_arg + 1]);
+			return ERR_ALERT | ERR_FATAL;
+		}
+	}
 
 	return 0;
 }
@@ -2470,6 +2582,7 @@ static struct bind_kw_list bind_kws = { "ALL", { }, {
 	{ "accept-netscaler-cip", bind_parse_accept_netscaler_cip, 1, 0 }, /* enable NetScaler Client IP insertion protocol */
 	{ "accept-proxy", bind_parse_accept_proxy, 0, 0 }, /* enable PROXY protocol */
 	{ "backlog",      bind_parse_backlog,      1, 0 }, /* set backlog of listening socket */
+	{ "guid-prefix",  bind_parse_guid_prefix,  1, 1 }, /* set guid of listening socket */
 	{ "id",           bind_parse_id,           1, 1 }, /* set id of listening socket */
 	{ "maxconn",      bind_parse_maxconn,      1, 0 }, /* set maxconn of listening socket */
 	{ "name",         bind_parse_name,         1, 1 }, /* set name of listening socket */

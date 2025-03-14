@@ -28,6 +28,7 @@
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
 #include <haproxy/dns.h>
+#include <haproxy/dns_ring.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/http_rules.h>
@@ -36,7 +37,6 @@
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/resolvers.h>
-#include <haproxy/ring.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
@@ -96,7 +96,7 @@ enum {
 	RSLV_STAT_END,
 };
 
-static struct name_desc resolv_stats[] = {
+static struct stat_col resolv_stats[] = {
 	[RSLV_STAT_ID]          = { .name = "id",          .desc = "ID" },
 	[RSLV_STAT_PID]         = { .name = "pid",         .desc = "Parent ID" },
 	[RSLV_STAT_SENT]        = { .name = "sent",        .desc = "Sent" },
@@ -725,7 +725,7 @@ static void resolv_srvrq_cleanup_srv(struct server *srv)
 	ha_free(&srv->hostname_dn);
 	srv->hostname_dn_len = 0;
 	memset(&srv_addr, 0, sizeof(srv_addr));
-	/* unset server's addr */
+	/* unset server's addr AND port */
 	server_set_inetaddr(srv, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	srv->flags |= SRV_F_NO_RESOLUTION;
 
@@ -836,7 +836,7 @@ static void resolv_check_response(struct resolv_resolution *res)
 
 				/* convert the key to lookup in lower case */
 				for (i = 0 ; item->data.target[i] ; i++)
-					target[i] = tolower(item->data.target[i]);
+					target[i] = tolower((unsigned char)item->data.target[i]);
 				target[i] = 0;
 
 				node = ebis_lookup(&srvrq->named_servers, target);
@@ -1810,7 +1810,7 @@ int resolv_dn_label_to_str(const char *dn, int dn_len, char *str, int str_len)
 			*ptr++ = '.';
 		/* copy the string at i+1 to lower case */
 		for (; sz > 0; sz--)
-			*(ptr++) = tolower(dn[++i]);
+			*(ptr++) = tolower((unsigned char)dn[++i]);
 	}
 	*ptr++ = '\0';
 	return (ptr - str);
@@ -1850,7 +1850,7 @@ int resolv_str_to_dn_label(const char *str, int str_len, char *dn, int dn_len)
 			offset = i+1;
 			continue;
 		}
-		dn[i+1] = tolower(str[i]);
+		dn[i+1] = tolower((unsigned char)str[i]);
 	}
 	dn[offset] = i - offset;
 	dn[i+1] = '\0';
@@ -2531,7 +2531,7 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 		if (resolv_run_resolution(res) != 1) {
 			res->last_resolution = now_ms;
 			LIST_DEL_INIT(&res->list);
-			LIST_APPEND(&resolvers->resolutions.wait, &res->list);
+			LIST_INSERT(&resolvers->resolutions.wait, &res->list);
 		}
 	}
 
@@ -2571,11 +2571,11 @@ static void resolvers_destroy(struct resolvers *resolvers)
 				fd_delete(ns->dgram->conn.t.sock.fd);
 				close(ns->dgram->conn.t.sock.fd);
 			}
-			ring_free(ns->dgram->ring_req);
+			dns_ring_free(ns->dgram->ring_req);
 			free(ns->dgram);
 		}
 		if (ns->stream) {
-			ring_free(ns->stream->ring_req);
+			dns_ring_free(ns->stream->ring_req);
 			task_destroy(ns->stream->task_req);
 			task_destroy(ns->stream->task_rsp);
 			free(ns->stream);
@@ -2633,6 +2633,7 @@ static void resolvers_deinit(void)
  */
 static int resolvers_finalize_config(void)
 {
+	const struct protocol *proto;
 	struct resolvers *resolvers;
 	struct proxy	     *px;
 	int err_code = 0;
@@ -2650,7 +2651,9 @@ static int resolvers_finalize_config(void)
 
 			if (ns->dgram) {
 				/* Check nameserver info */
-				if ((fd = socket(ns->dgram->conn.addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+				proto = protocol_lookup(ns->dgram->conn.addr.to.ss_family, PROTO_TYPE_DGRAM, 1);
+				BUG_ON(!proto);
+				if ((fd = socket(proto->fam->sock_domain, proto->sock_type, proto->sock_prot)) == -1) {
 					if (!resolvers->conf.implicit) {  /* emit a warning only if it was configured manually */
 						ha_alert("resolvers '%s': can't create socket for nameserver '%s'.\n",
 							 resolvers->id, ns->id);
@@ -3324,7 +3327,7 @@ int check_action_do_resolve(struct act_rule *rule, struct proxy *px, char **err)
 
 void resolvers_setup_proxy(struct proxy *px)
 {
-	px->last_change = ns_to_sec(now_ns);
+	px->fe_counters.last_change = px->be_counters.last_change = ns_to_sec(now_ns);
 	px->cap = PR_CAP_FE | PR_CAP_BE;
 	px->maxconn = 0;
 	px->conn_retries = 1;
@@ -3486,22 +3489,34 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	p = calloc(1, sizeof *p);
 	if (!p) {
 		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
+		goto err_free_r;
 	}
 
 	init_new_proxy(p);
 	resolvers_setup_proxy(p);
 	p->parent = r;
 	p->id = strdup(id);
-	p->conf.args.file = p->conf.file = strdup(file);
+	if (!p->id) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_p;
+	}
+	p->conf.args.file = p->conf.file = copy_file_name(file);
 	p->conf.args.line = p->conf.line = linenum;
 	r->px = p;
 
 	/* default values */
 	LIST_APPEND(&sec_resolvers, &r->list);
 	r->conf.file = strdup(file);
+	if (!r->conf.file) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_p_id;
+	}
 	r->conf.line = linenum;
 	r->id = strdup(id);
+	if (!r->id) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_conf_file;
+	}
 	r->query_ids = EB_ROOT;
 	/* default maximum response size */
 	r->accepted_payload_size = 512;
@@ -3525,11 +3540,17 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	*resolvers = r;
 
 out:
-	if (err_code & (ERR_FATAL|ERR_ABORT)) {
-		ha_free(&r);
-		ha_free(&p);
-	}
+	return err_code;
 
+/* free all allocated stuff and return err_code */
+err_free_conf_file:
+	ha_free((void **)&r->conf.file);
+err_free_p_id:
+	ha_free(&p->id);
+err_free_p:
+	ha_free(&p);
+err_free_r:
+	ha_free(&r);
 	return err_code;
 }
 
@@ -3613,7 +3634,8 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 		}
 
 		sk = str2sa_range(args[2], NULL, &port1, &port2, NULL, &proto, NULL,
-		                  &errmsg, NULL, NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_DGRAM | PA_O_STREAM | PA_O_DEFAULT_DGRAM);
+		                  &errmsg, NULL, NULL, NULL,
+		                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_DGRAM | PA_O_STREAM | PA_O_DEFAULT_DGRAM);
 		if (!sk) {
 			ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -3729,6 +3751,12 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		if (warn_if_lower(args[2], 100)) {
+			ha_alert("parsing [%s:%d] : '%s %s %u' looks suspiciously small for a value in milliseconds."
+				 " Please use an explicit unit ('%ums') if that was the intent.\n",
+				 file, linenum, args[0], args[1], time, time);
+			err_code |= ERR_WARN;
+		}
 	}
 	else if (strcmp(args[0], "accepted_payload_size") == 0) {
 		int i = 0;
@@ -3809,6 +3837,12 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 				curr_resolvers->px->timeout.connect = tout;
 			}
 
+			if (warn_if_lower(args[2], 100)) {
+				ha_alert("parsing [%s:%d] : '%s %s %u' looks suspiciously small for a value in milliseconds."
+					 " Please use an explicit unit ('%ums') if that was the intent.\n",
+					 file, linenum, args[0], args[1], tout, tout);
+				err_code |= ERR_WARN;
+			}
 		}
 		else {
 			ha_alert("parsing [%s:%d] : '%s' expects 'retry' or 'resolve' and <time> as arguments got '%s'.\n",
@@ -3835,14 +3869,15 @@ out:
  */
 int resolvers_create_default()
 {
-	int err_code = 0;
+	int err_code = ERR_NONE;
 
-	if (global.mode & MODE_MWORKER_WAIT) /* does not create the section if in wait mode */
-		return 0;
+	/* does not create the section if in master process */
+	if (master)
+		return ERR_NONE;
 
 	/* if the section already exists, do nothing */
 	if (find_resolvers_by_id("default"))
-		return 0;
+		return ERR_NONE;
 
 	curr_resolvers = NULL;
 	err_code |= resolvers_new(&curr_resolvers, "default", "<internal>", 0);
@@ -3868,7 +3903,7 @@ err:
 
 	/* we never return an error there, we only try to create this section
 	 * if that's possible */
-	return 0;
+	return ERR_NONE;
 }
 
 int cfg_post_parse_resolvers()
@@ -3919,22 +3954,35 @@ static int rslv_promex_metric_info(unsigned int id, struct promex_metric *metric
 
 static void *rslv_promex_start_ts(void *unused, unsigned int id)
 {
-	struct resolvers *resolver = LIST_NEXT(&sec_resolvers, struct resolvers *, list);
+	struct resolvers *resolver;
 
-	return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+	if (LIST_ISEMPTY(&sec_resolvers))
+		return NULL;
+
+	/* Find the first resolvers with at least one nameserver */
+	list_for_each_entry(resolver, &sec_resolvers, list) {
+		if (LIST_ISEMPTY(&resolver->nameservers))
+			continue;
+		return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+	}
+	return NULL;
 }
 
-static void *rslv_promex_next_ts(void *unsued, void *metric_ctx, unsigned int id)
+static void *rslv_promex_next_ts(void *unused, void *metric_ctx, unsigned int id)
 {
 	struct dns_nameserver *ns = metric_ctx;
 	struct resolvers *resolver = ns->parent;
 
 	ns = LIST_NEXT(&ns->list, struct dns_nameserver *, list);
 	if (&ns->list == &resolver->nameservers) {
+		/* Find the next resolver with at least on nameserver */
 		resolver = LIST_NEXT(&resolver->list, struct resolvers *, list);
-		ns = ((&resolver->list == &sec_resolvers)
-		      ? NULL
-		      : LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list));
+		list_for_each_entry_from(resolver, &sec_resolvers, list) {
+			if (LIST_ISEMPTY(&resolver->nameservers))
+				continue;
+			return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+		}
+		ns = NULL;
 	}
 	return ns;
 }
@@ -3947,9 +3995,9 @@ static int rslv_promex_fill_ts(void *unused, void *metric_ctx, unsigned int id, 
 	int ret;
 
 	labels[0].name  = ist("resolver");
-	labels[0].value = ist2(resolver->id, strlen(resolver->id));
+	labels[0].value = ist(resolver->id);
 	labels[1].name  = ist("nameserver");
-	labels[1].value = ist2(ns->id, strlen(ns->id));
+	labels[1].value = ist(ns->id);
 
 	ret = resolv_fill_stats(ns->counters, stats, &id);
 	if (ret == 1)

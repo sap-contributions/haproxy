@@ -30,6 +30,7 @@
 #include <haproxy/dynbuf-t.h>
 #include <haproxy/filters-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/log-t.h>
 #include <haproxy/show_flags-t.h>
 #include <haproxy/stick_table-t.h>
 #include <haproxy/vars-t.h>
@@ -40,7 +41,7 @@
  */
 #define SF_DIRECT	0x00000001	/* connection made on the server matching the client cookie */
 #define SF_ASSIGNED	0x00000002	/* no need to assign a server to this stream */
-/* unused: 0x00000004 */
+#define SF_MAYALLOC     0x00000004      /* we were notified that a work buffer might be available now */
 #define SF_BE_ASSIGNED	0x00000008	/* a backend was assigned. Conns are accounted. */
 
 #define SF_FORCE_PRST	0x00000010	/* force persistence here, even if server is down */
@@ -88,6 +89,7 @@
 #define SF_SRC_ADDR     0x00800000	/* get the source ip/port with getsockname */
 #define SF_BC_MARK      0x01000000	/* need to set specific mark on backend/srv conn upon connect */
 #define SF_BC_TOS       0x02000000	/* need to set specific tos on backend/srv conn upon connect */
+#define SF_RULE_FYIELD  0x04000000      /* s->current_rule set because of forced yield */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -102,7 +104,8 @@ static forceinline char *strm_show_flags(char *buf, size_t len, const char *deli
 	_(0);
 	/* flags & enums */
 	_(SF_IGNORE_PRST, _(SF_SRV_REUSED, _(SF_SRV_REUSED_ANTICIPATED,
-	_(SF_WEBSOCKET, _(SF_SRC_ADDR, _(SF_BC_MARK, _(SF_BC_TOS)))))));
+	_(SF_WEBSOCKET, _(SF_SRC_ADDR, _(SF_BC_MARK, _(SF_BC_TOS,
+	_(SF_RULE_FYIELD))))))));
 
 	_e(SF_FINST_MASK, SF_FINST_R,    _e(SF_FINST_MASK, SF_FINST_C,
 	_e(SF_FINST_MASK, SF_FINST_H,    _e(SF_FINST_MASK, SF_FINST_D,
@@ -116,9 +119,9 @@ static forceinline char *strm_show_flags(char *buf, size_t len, const char *deli
 	_e(SF_ERR_MASK, SF_ERR_DOWN,     _e(SF_ERR_MASK, SF_ERR_KILLED,
 	_e(SF_ERR_MASK, SF_ERR_UP,       _e(SF_ERR_MASK, SF_ERR_CHK_PORT))))))))))));
 
-	_(SF_DIRECT, _(SF_ASSIGNED, _(SF_BE_ASSIGNED, _(SF_FORCE_PRST,
+	_(SF_DIRECT, _(SF_ASSIGNED, _(SF_MAYALLOC, _(SF_BE_ASSIGNED, _(SF_FORCE_PRST,
 	_(SF_MONITOR, _(SF_CURR_SESS, _(SF_CONN_EXP, _(SF_REDISP,
-	_(SF_IGNORE, _(SF_REDIRECTABLE, _(SF_HTX)))))))))));
+	_(SF_IGNORE, _(SF_REDIRECTABLE, _(SF_HTX))))))))))));
 
 	/* epilogue */
 	_(~0U);
@@ -153,6 +156,29 @@ enum {
 	STRM_ET_DATA_TO    = 0x0100,  /* timeout during data phase */
 	STRM_ET_DATA_ERR   = 0x0200,  /* error during data phase */
 	STRM_ET_DATA_ABRT  = 0x0400,  /* data phase aborted by external cause */
+};
+
+
+/* Types of entities that may interrupt a processing, teomporarily or not
+ * depending on the context;
+ */
+enum {
+	STRM_ENTITY_NONE      = 0x0000,
+	STRM_ENTITY_RULE      = 0x0001,
+	STRM_ENTITY_FILTER    = 0x0002,
+	STRM_ENTITY_WREQ_BODY = 0x0003,
+};
+
+/* All possible stream events handled by process_stream(). First ones are mapped
+ * from TASK_WOKEN_*.
+ */
+enum {
+	STRM_EVT_NONE          = 0x00000000, /* No events */
+	STRM_EVT_TIMER         = 0x00000001, /* A timer has expired */
+	STRM_EVT_MSG           = 0x00000002, /* A message event was triggered  */
+	STRM_EVT_SHUT_SRV_DOWN = 0x00000004, /* Must be shut because the selected server became available */
+	STRM_EVT_SHUT_SRV_UP   = 0x00000008, /* Must be shut because a preferred server became available */
+	STRM_EVT_KILLED        = 0x00000010, /* Must be shut for external reason */
 };
 
 /* This function is used to report flags in debugging tools. Please reflect
@@ -229,11 +255,16 @@ struct stream {
 	struct http_txn *txn;           /* current HTTP transaction being processed. Should become a list. */
 
 	struct task *task;              /* the task associated with this stream */
-	unsigned int pending_events;	/* the pending events not yet processed by the stream.
-					 * This is a bit field of TASK_WOKEN_* */
+	unsigned int pending_events;	/* the pending events not yet processed by the stream but handled by process_stream() */
+	unsigned int new_events;        /* the new events added since the previous wakeup (never seen by process_stream()). It is atomic field */
 	int conn_retries;               /* number of connect retries performed */
 	unsigned int conn_exp;          /* wake up time for connect, queue, turn-around, ... */
 	unsigned int conn_err_type;     /* first error detected, one of STRM_ET_* */
+
+	uint32_t rules_bcount;          /* number of rules evaluated since last yield */
+
+	struct stream *parent;          /* Pointer to the parent stream, if any. NULL most of time */
+
 	struct list list;               /* position in the thread's streams list */
 	struct mt_list by_srv;          /* position in server stream list */
 	struct list back_refs;          /* list of users tracking this stream */
@@ -242,9 +273,13 @@ struct stream {
 	uint64_t lat_time;		/* total latency time experienced */
 	uint64_t cpu_time;              /* total CPU time consumed */
 	struct freq_ctr call_rate;      /* stream task call rate without making progress */
+	uint32_t passes_stconn;         /* number of passes on the stconn evaluation code */
+	uint32_t passes_reqana;         /* number of passes on the req analysers block */
+	uint32_t passes_resana;         /* number of passes on the res analysers block */
+	uint32_t passes_propag;         /* number of passes on the shut/err propag code */
 
+	unsigned short max_retries;     /* Maximum number of connection retried (=0 is backend is not set) */
 	short store_count;
-	/* 2 unused bytes here */
 
 	struct {
 		struct stksess *ts;
@@ -265,7 +300,8 @@ struct stream {
 
 	struct strm_logs logs;                  /* logs for this stream */
 
-	void (*do_log)(struct stream *s);       /* the function to call in order to log (or NULL) */
+	void (*do_log)(struct stream *s,        /* the function to call in order to log (or NULL) */
+	               struct log_orig origin);
 	void (*srv_error)(struct stream *s,     /* the function to call upon unrecoverable server errors (or NULL) */
 			  struct stconn *sc);
 
@@ -280,11 +316,20 @@ struct stream {
 	void *current_rule;                     /* this is used to store the current rule to be resumed. */
 	int rules_exp;                          /* expiration date for current rules execution */
 	int tunnel_timeout;
-	const char *last_rule_file;             /* last evaluated final rule's file (def: NULL) */
-	int last_rule_line;                     /* last evaluated final rule's line (def: 0) */
+
+	struct {
+		void *ptr;                      /* Pointer on the entity  (def: NULL) */
+		int type;                       /* entity type (STRM_ENTITY_*) */
+	} last_entity;                          /* last evaluated entity that interrupted processing */
+
+	struct {
+		void *ptr;                      /* Pointer on the entity  (def: NULL) */
+		int type;                       /* entity type (STRM_ENTITY_*) */
+	} waiting_entity;                       /* The entity waiting to continue its processing and interrupted by an error/timeout */
 
 	unsigned int stream_epoch;              /* copy of stream_epoch when the stream was created */
-	struct hlua *hlua;                      /* lua runtime context */
+	uint32_t term_evts_log;                 /* termination events log */
+	struct hlua *hlua[2];                   /* lua runtime context (0: global, 1: per-thread) */
 
 	/* Context */
 	struct {

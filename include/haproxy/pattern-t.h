@@ -25,6 +25,7 @@
 #include <import/ebtree-t.h>
 
 #include <haproxy/api-t.h>
+#include <haproxy/event_hdl-t.h>
 #include <haproxy/regex-t.h>
 #include <haproxy/sample_data-t.h>
 #include <haproxy/thread-t.h>
@@ -116,6 +117,7 @@ struct pat_ref {
 	unsigned long long entry_cnt; /* the total number of entries */
 	THREAD_ALIGN(64);
 	__decl_thread(HA_RWLOCK_T lock); /* Lock used to protect pat ref elements */
+	event_hdl_sub_list e_subs;       /* event_hdl: pat_ref's subscribers list (atomically updated) */
 };
 
 /* This is a part of struct pat_ref. Each entry contains one pattern and one
@@ -207,6 +209,7 @@ struct pattern_expr {
 	struct eb_root pattern_tree;  /* may be used for lookup in large datasets */
 	struct eb_root pattern_tree_2;  /* may be used for different types */
 	int mflags;                     /* flags relative to the parsing or matching method. */
+	uint32_t refcount;            /* refcount used to know if the expr can be deleted or not */
 	__decl_thread(HA_RWLOCK_T lock);               /* lock used to protect patterns */
 };
 
@@ -216,7 +219,6 @@ struct pattern_expr {
  */
 struct pattern_expr_list {
 	struct list list; /* Used for chaining pattern_expr in pattern_head. */
-	int do_free;
 	struct pattern_expr *expr; /* The used expr. */
 };
 

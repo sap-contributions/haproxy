@@ -64,7 +64,14 @@ enum {
 #define TH_FL_SLEEPING          0x00000008  /* thread won't check its task list before next wakeup */
 #define TH_FL_STARTED           0x00000010  /* set once the thread starts */
 #define TH_FL_IN_LOOP           0x00000020  /* set only inside the polling loop */
+#define TH_FL_DUMPING_OTHERS    0x00000040  /* thread currently dumping other threads */
+#define TH_FL_IN_SIG_HANDLER    0x00000080  /* thread currently in the generic signal handler */
+#define TH_FL_IN_DBG_HANDLER    0x00000100  /* thread currently in the debug signal handler */
+#define TH_FL_IN_WDT_HANDLER    0x00000200  /* thread currently in the wdt signal handler */
+#define TH_FL_IN_ANY_HANDLER    0x00000380  /* mask to test if the thread is in any signal handler */
 
+/* we have 4 buffer-wait queues, in highest to lowest emergency order */
+#define DYNBUF_NBQ              4
 
 /* Thread group information. This defines a base and a count of global thread
  * IDs which belong to it, and which can be looked up into thread_info/ctx. It
@@ -110,7 +117,7 @@ struct thread_info {
 	uint tid, ltid;                   /* process-wide and group-wide thread ID (start at 0) */
 	ulong ltid_bit;                   /* bit masks for the tid/ltid */
 	uint tgid;                        /* ID of the thread group this thread belongs to (starts at 1; 0=unset) */
-	/* 32-bit hole here */
+	uint ring_queue;                  /* queue number for the rings */
 
 	ullong pth_id;                    /* the pthread_t cast to a ullong */
 	void *stack_top;                  /* the top of the stack when entering the thread */
@@ -133,18 +140,32 @@ struct thread_ctx {
 	int current_queue;                  /* points to current tasklet list being run, -1 if none */
 	unsigned int nb_tasks;              /* number of tasks allocated on this thread */
 	uint8_t tl_class_mask;              /* bit mask of non-empty tasklets classes */
+	uint8_t bufq_map;                   /* one bit per non-empty buffer_wq */
+	uint8_t trc_disable_ctr;            /* cumulative counter to temporarily disable tracing */
 
-	// 7 bytes hole here
+	// 1 byte hole here
+	unsigned int nb_rhttp_conns;        /* count of current conns used for active reverse HTTP */
+	struct sched_activity *sched_profile_entry; /* profile entry in use by the current task/tasklet, only if sched_wake_date>0 */
+
+	ALWAYS_ALIGN(2*sizeof(void*));
+	struct list buffer_wq[DYNBUF_NBQ];  /* buffer waiters, 4 criticality-based queues */
 	struct list pool_lru_head;          /* oldest objects in thread-local pool caches */
-	struct list buffer_wq;              /* buffer waiters */
 	struct list streams;                /* list of streams attached to this thread */
 	struct list quic_conns;             /* list of active quic-conns attached to this thread */
 	struct list quic_conns_clo;         /* list of closing quic-conns attached to this thread */
 	struct list queued_checks;          /* checks waiting for a connection slot */
-	unsigned int nb_rhttp_conns;        /* count of current conns used for active reverse HTTP */
-
-	ALWAYS_ALIGN(2*sizeof(void*));
 	struct list tasklets[TL_CLASSES];   /* tasklets (and/or tasks) to run, by class */
+
+	void **emergency_bufs;              /* array of buffers allocated at boot. Next free one is [emergency_bufs_left-1] */
+	uint emergency_bufs_left;           /* number of emergency buffers left in magic_bufs[] */
+
+	uint32_t sched_wake_date;           /* current task/tasklet's wake date in 32-bit ns or 0 if not supported */
+	uint64_t sched_call_date;           /* current task/tasklet's call date in ns */
+
+	uint64_t prev_mono_time;            /* previous system wide monotonic time (leaving poll) */
+	uint64_t curr_mono_time;            /* latest system wide monotonic time (leaving poll) */
+
+	// around 8 bytes here for thread-local variables
 
 	// third cache line here on 64 bits: accessed mostly using atomic ops
 	ALWAYS_ALIGN(64);
@@ -156,12 +177,7 @@ struct thread_ctx {
 	uint flags;                         /* thread flags, TH_FL_*, atomic! */
 	uint active_checks;                 /* number of active health checks on this thread, incl migrated */
 
-	uint32_t sched_wake_date;           /* current task/tasklet's wake date or 0 */
-	uint32_t sched_call_date;           /* current task/tasklet's call date (valid if sched_wake_date > 0) */
-	struct sched_activity *sched_profile_entry; /* profile entry in use by the current task/tasklet, only if sched_wake_date>0 */
-
 	uint64_t prev_cpu_time;             /* previous per thread CPU time */
-	uint64_t prev_mono_time;            /* previous system wide monotonic time  */
 
 	struct eb_root rqueue_shared;       /* run queue fed by other threads */
 	__decl_thread(HA_SPINLOCK_T rqsh_lock); /* lock protecting the shared runqueue */
@@ -171,7 +187,11 @@ struct thread_ctx {
 
 	unsigned long long out_bytes;           /* total #of bytes emitted */
 	unsigned long long spliced_out_bytes;   /* total #of bytes emitted though a kernel pipe */
-	struct buffer *thread_dump_buffer;      /* NULL out of dump, valid during a dump, 0x01 once done */
+	struct buffer *thread_dump_buffer;      /* NULL out of dump, 0x02=to alloc, valid during a dump, |0x01 once done */
+	unsigned long long total_streams;       /* Total number of streams created on this thread */
+	unsigned int stream_cnt;                /* Number of streams attached to this thread */
+
+	// around 68 bytes here for shared variables
 
 	ALWAYS_ALIGN(128);
 };

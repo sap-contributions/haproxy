@@ -49,7 +49,7 @@ static void release_http_action(struct act_rule *rule)
 	istfree(&rule->arg.http.str);
 	if (rule->arg.http.re)
 		regex_free(rule->arg.http.re);
-	free_logformat_list(&rule->arg.http.fmt);
+	lf_expr_deinit(&rule->arg.http.fmt);
 }
 
 /* Release memory allocated by HTTP actions relying on an http reply. Concretly,
@@ -172,7 +172,7 @@ static enum act_parse_ret parse_set_req_line(const char **args, int *orig_arg, s
 	}
 	rule->action_ptr = http_action_set_req_line;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	if (!*args[cur_arg] ||
 	    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
@@ -609,7 +609,7 @@ static enum act_parse_ret parse_replace_uri(const char **args, int *orig_arg, st
 
 	rule->action_ptr = http_action_replace_uri;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	if (!*args[cur_arg] || !*args[cur_arg+1] ||
 	    (*args[cur_arg+2] && strcmp(args[cur_arg+2], "if") != 0 && strcmp(args[cur_arg+2], "unless") != 0)) {
@@ -673,7 +673,7 @@ static enum act_parse_ret parse_http_set_status(const char **args, int *orig_arg
 	rule->action = ACT_CUSTOM;
 	rule->action_ptr = action_http_set_status;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	/* Check if an argument is available */
 	if (!*args[*orig_arg]) {
@@ -1310,7 +1310,7 @@ static enum act_parse_ret parse_http_auth(const char **args, int *orig_arg, stru
 	rule->flags |= ACT_FLAG_FINAL;
 	rule->action_ptr = http_action_auth;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (strcmp(args[cur_arg], "realm") == 0) {
@@ -1490,7 +1490,7 @@ static enum act_parse_ret parse_http_set_header(const char **args, int *orig_arg
 		rule->action_ptr = http_action_set_header;
 	}
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (!*args[cur_arg] || !*args[cur_arg+1]) {
@@ -1521,10 +1521,6 @@ static enum act_parse_ret parse_http_set_header(const char **args, int *orig_arg
 		istfree(&rule->arg.http.str);
 		return ACT_RET_PRS_ERR;
 	}
-
-	free(px->conf.lfs_file);
-	px->conf.lfs_file = strdup(px->conf.args.file);
-	px->conf.lfs_line = px->conf.args.line;
 
 	/* some characters are totally forbidden in header names and
 	 * may happen by accident when writing configs, causing strange
@@ -1616,7 +1612,7 @@ static enum act_parse_ret parse_http_replace_header(const char **args, int *orig
 		rule->action = 1; // replace-value
 	rule->action_ptr = http_action_replace_header;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (!*args[cur_arg] || !*args[cur_arg+1] || !*args[cur_arg+2]) {
@@ -1653,10 +1649,6 @@ static enum act_parse_ret parse_http_replace_header(const char **args, int *orig
 		regex_free(rule->arg.http.re);
 		return ACT_RET_PRS_ERR;
 	}
-
-	free(px->conf.lfs_file);
-	px->conf.lfs_file = strdup(px->conf.args.file);
-	px->conf.lfs_line = px->conf.args.line;
 
 	*orig_arg = cur_arg + 1;
 	return ACT_RET_PRS_OK;
@@ -1719,7 +1711,7 @@ static enum act_parse_ret parse_http_del_header(const char **args, int *orig_arg
 	rule->action = PAT_MATCH_STR;
 	rule->action_ptr = http_action_del_header;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (!*args[cur_arg]) {
@@ -1856,7 +1848,7 @@ static enum act_return http_action_set_map(struct act_rule *rule, struct proxy *
 		elt = pat_ref_find_elt(ref, key->area);
 		if (elt) {
 			/* update entry if it exists */
-			pat_ref_set(ref, key->area, value->area, NULL, elt);
+			pat_ref_set_elt_duplicate(ref, elt, value->area, NULL);
 		}
 		else {
 			/* insert a new entry */
@@ -1895,9 +1887,9 @@ static enum act_return http_action_set_map(struct act_rule *rule, struct proxy *
 static void release_http_map(struct act_rule *rule)
 {
 	free(rule->arg.map.ref);
-	free_logformat_list(&rule->arg.map.key);
+	lf_expr_deinit(&rule->arg.map.key);
 	if (rule->action == 1)
-		free_logformat_list(&rule->arg.map.value);
+		lf_expr_deinit(&rule->arg.map.value);
 }
 
 /* Parse a "add-acl", "del-acl", "set-map" or "del-map" actions. It takes one or
@@ -1959,8 +1951,8 @@ static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, s
 	}
 
 	/* key pattern */
-	LIST_INIT(&rule->arg.map.key);
-	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.key, LOG_OPT_HTTP, cap, err)) {
+	lf_expr_init(&rule->arg.map.key);
+	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.key, LOG_OPT_NONE, cap, err)) {
 		free(rule->arg.map.ref);
 		return ACT_RET_PRS_ERR;
 	}
@@ -1968,16 +1960,12 @@ static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, s
 	if (rule->action == 1) {
 		/* value pattern for set-map only */
 		cur_arg++;
-		LIST_INIT(&rule->arg.map.value);
-		if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.value, LOG_OPT_HTTP, cap, err)) {
+		lf_expr_init(&rule->arg.map.value);
+		if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.value, LOG_OPT_NONE, cap, err)) {
 			free(rule->arg.map.ref);
 			return ACT_RET_PRS_ERR;
 		}
 	}
-
-	free(px->conf.lfs_file);
-	px->conf.lfs_file = strdup(px->conf.args.file);
-	px->conf.lfs_line = px->conf.args.line;
 
 	*orig_arg = cur_arg + 1;
 	return ACT_RET_PRS_OK;
@@ -2383,6 +2371,40 @@ static enum act_parse_ret parse_http_wait_for_body(const char **args, int *orig_
 	return ACT_RET_PRS_OK;
 }
 
+static enum log_orig_id do_log_http_req;
+static enum log_orig_id do_log_http_res;
+static enum log_orig_id do_log_http_after_res;
+
+static void init_do_log(void)
+{
+	do_log_http_req = log_orig_register("http-req");
+	BUG_ON(do_log_http_req == LOG_ORIG_UNSPEC);
+	do_log_http_res = log_orig_register("http-res");
+	BUG_ON(do_log_http_res == LOG_ORIG_UNSPEC);
+	do_log_http_after_res = log_orig_register("http-after-res");
+	BUG_ON(do_log_http_after_res == LOG_ORIG_UNSPEC);
+}
+
+INITCALL0(STG_PREPARE, init_do_log);
+
+static enum act_parse_ret parse_http_req_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_http_req, args, orig_arg, px, rule, err);
+}
+
+static enum act_parse_ret parse_http_res_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_http_res, args, orig_arg, px, rule, err);
+}
+
+static enum act_parse_ret parse_http_after_res_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                      struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_http_after_res, args, orig_arg, px, rule, err);
+}
+
 /************************************************************************/
 /*   All supported http-request action keywords must be declared here.  */
 /************************************************************************/
@@ -2399,6 +2421,7 @@ static struct action_kw_list http_req_actions = {
 		{ "del-map",          parse_http_set_map,              KWF_MATCH_PREFIX },
 		{ "deny",             parse_http_deny,                 0 },
 		{ "disable-l7-retry", parse_http_req_disable_l7_retry, 0 },
+		{ "do-log",           parse_http_req_do_log,           0 },
 		{ "early-hint",       parse_http_set_header,           0 },
 		{ "normalize-uri",    parse_http_normalize_uri,        KWF_EXPERIMENTAL },
 		{ "redirect",         parse_http_redirect,             0 },
@@ -2437,6 +2460,7 @@ static struct action_kw_list http_res_actions = {
 		{ "del-header",      parse_http_del_header,     0 },
 		{ "del-map",         parse_http_set_map,        KWF_MATCH_PREFIX },
 		{ "deny",            parse_http_deny,           0 },
+		{ "do-log",          parse_http_res_do_log,     0 },
 		{ "redirect",        parse_http_redirect,       0 },
 		{ "replace-header",  parse_http_replace_header, 0 },
 		{ "replace-value",   parse_http_replace_header, 0 },
@@ -2462,6 +2486,7 @@ static struct action_kw_list http_after_res_actions = {
 		{ "del-acl",          parse_http_set_map,       KWF_MATCH_PREFIX },
 		{ "del-header",      parse_http_del_header,     0 },
 		{ "del-map",          parse_http_set_map,       KWF_MATCH_PREFIX },
+		{ "do-log",          parse_http_after_res_do_log, 0 },
 		{ "replace-header",  parse_http_replace_header, 0 },
 		{ "replace-value",   parse_http_replace_header, 0 },
 		{ "set-header",      parse_http_set_header,     0 },

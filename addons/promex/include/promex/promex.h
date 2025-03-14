@@ -47,6 +47,7 @@
 #define PROMEX_FL_NO_MAINT_SRV      0x00002000
 #define PROMEX_FL_EXTRA_COUNTERS    0x00004000
 #define PROMEX_FL_INC_METRIC_BY_DEFAULT 0x00008000
+#define PROMEX_FL_DESC_LABELS       0x00010000
 
 #define PROMEX_FL_SCOPE_ALL (PROMEX_FL_SCOPE_GLOBAL | PROMEX_FL_SCOPE_FRONT | \
 			     PROMEX_FL_SCOPE_LI | PROMEX_FL_SCOPE_BACK | \
@@ -84,13 +85,13 @@ struct promex_label {
  *                           is responsible to deinit the dump context.
  *
  *     * metric_info(): This one is mandatory. It returns the info about the
- *                      metric: name, type and flags and descrition.
+ *                      metric: name, type and flags and description.
  *
  *     * start_ts(): This one is mandatory, it initializes the context for a time
  *                   series for a given metric. This context is the second
  *                   restart point.
  *
- *    * next_ts(): This one is mandatory. It interates on time series for a
+ *    * next_ts(): This one is mandatory. It iterates on time series for a
  *                 given metrics. It is also responsible to handle end of a
  *                 time series and deinit the context.
  *

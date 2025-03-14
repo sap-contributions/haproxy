@@ -78,17 +78,21 @@ static int bwlim_apply_limit(struct filter *filter, struct channel *chn, unsigne
 	struct bwlim_config *conf = FLT_CONF(filter);
 	struct bwlim_state *st = filter->ctx;
 	struct freq_ctr *bytes_rate;
-	unsigned int period, limit, remain, tokens, users;
+	uint64_t remain;
+	unsigned int period, limit, tokens, users, factor;
 	unsigned int wait = 0;
 	int overshoot, ret = 0;
 
 	/* Don't forward anything if there is nothing to forward or the waiting
 	 * time is not expired
 	 */
-	if (!len || (tick_isset(st->exp) && !tick_is_expired(st->exp, now_ms)))
+	if (tick_isset(st->exp) && !tick_is_expired(st->exp, now_ms))
 		goto end;
 
 	st->exp = TICK_ETERNITY;
+	if (!len)
+		goto end;
+
 	ret = len;
 	if (conf->flags & BWLIM_FL_SHARED) {
 		void *ptr;
@@ -102,11 +106,12 @@ static int bwlim_apply_limit(struct filter *filter, struct channel *chn, unsigne
 		if (!ptr)
 			goto end;
 
-		HA_RWLOCK_WRLOCK(STK_SESS_LOCK, &st->ts->lock);
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &st->ts->lock);
 		bytes_rate = &stktable_data_cast(ptr, std_t_frqp);
 		period = conf->table.t->data_arg[type].u;
 		limit = conf->limit;
 		users = st->ts->ref_cnt;
+		factor = conf->table.t->brates_factor;
 	}
 	else {
 		/* On per-stream mode, the freq-counter is private to the
@@ -118,6 +123,7 @@ static int bwlim_apply_limit(struct filter *filter, struct channel *chn, unsigne
 		period = (st->period ? st->period : conf->period);
 		limit = (st->limit ? st->limit : conf->limit);
 		users = 1;
+		factor = 1;
 	}
 
 	/* Be sure the current rate does not exceed the limit over the current
@@ -131,7 +137,7 @@ static int bwlim_apply_limit(struct filter *filter, struct channel *chn, unsigne
 	overshoot = freq_ctr_overshoot_period(bytes_rate, period, limit);
 	if (overshoot > 0) {
 		if (conf->flags & BWLIM_FL_SHARED)
-			HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &st->ts->lock);
+			HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &st->ts->lock);
 		wait = div64_32((uint64_t)(conf->min_size + overshoot) * period * users,
 				limit);
 		st->exp = tick_add(now_ms, (wait ? wait : 1));
@@ -140,7 +146,7 @@ static int bwlim_apply_limit(struct filter *filter, struct channel *chn, unsigne
 	}
 
 	/* Get the allowed quota per user. */
-	remain = freq_ctr_remain_period(bytes_rate, period, limit, 0);
+	remain = (uint64_t)freq_ctr_remain_period(bytes_rate, period, limit, 0) * factor;
 	tokens = div64_32((uint64_t)(remain + users - 1), users);
 
 	if (tokens < len) {
@@ -156,27 +162,28 @@ static int bwlim_apply_limit(struct filter *filter, struct channel *chn, unsigne
 				: conf->min_size;
 
 			if (ret <= remain)
-				wait = div64_32((uint64_t)(ret - tokens) * period * users + limit - 1, limit);
+				wait = div64_32((uint64_t)(ret - tokens) * period * users + limit * factor - 1, limit * factor);
 			else
-				ret = (limit < ret) ? remain : 0;
+				ret = (limit * factor < ret) ? remain : 0;
 		}
 	}
 
 	/* At the end, update the freq-counter and compute the waiting time if
 	 * the stream is limited
 	 */
-	update_freq_ctr_period(bytes_rate, period, ret);
+	update_freq_ctr_period(bytes_rate, period, div64_32((uint64_t)ret + factor -1, factor));
 	if (ret < len) {
 		wait += next_event_delay_period(bytes_rate, period, limit, MIN(len - ret, conf->min_size * users));
 		st->exp = tick_add(now_ms, (wait ? wait : 1));
 	}
 
 	if (conf->flags & BWLIM_FL_SHARED)
-		HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &st->ts->lock);
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &st->ts->lock);
 
   end:
 	chn->analyse_exp = tick_first((tick_is_expired(chn->analyse_exp, now_ms) ? TICK_ETERNITY : chn->analyse_exp),
 				      st->exp);
+	BUG_ON(tick_is_expired(chn->analyse_exp, now_ms));
 	return ret;
 }
 
@@ -219,26 +226,26 @@ static int bwlim_check(struct proxy *px, struct flt_conf *fconf)
 		target = px->table;
 
 	if (!target) {
-		ha_alert("Proxy %s : unable to find table '%s' referenced by bwlim filter '%s'",
+		ha_alert("Proxy %s : unable to find table '%s' referenced by bwlim filter '%s'\n",
 			 px->id, conf->table.n ? conf->table.n : px->id, conf->name);
 		return 1;
 	}
 
 	if ((conf->flags & BWLIM_FL_IN) && !target->data_ofs[STKTABLE_DT_BYTES_IN_RATE]) {
 		ha_alert("Proxy %s : stick-table '%s' uses a data type incompatible with bwlim filter '%s'."
-			 " It must be 'bytes_in_rate'",
+			 " It must be 'bytes_in_rate'\n",
 			 px->id, conf->table.n ? conf->table.n : px->id, conf->name);
 		return 1;
 	}
 	else if ((conf->flags & BWLIM_FL_OUT) && !target->data_ofs[STKTABLE_DT_BYTES_OUT_RATE]) {
 		ha_alert("Proxy %s : stick-table '%s' uses a data type incompatible with bwlim filter '%s'."
-			 " It must be 'bytes_out_rate'",
+			 " It must be 'bytes_out_rate'\n",
 			 px->id, conf->table.n ? conf->table.n : px->id, conf->name);
 		return 1;
 	}
 
 	if (!stktable_compatible_sample(conf->expr,  target->type)) {
-		ha_alert("Proxy %s : stick-table '%s' uses a key type incompatible with bwlim filter '%s'",
+		ha_alert("Proxy %s : stick-table '%s' uses a key type incompatible with bwlim filter '%s'\n",
 			 px->id, conf->table.n ? conf->table.n : px->id, conf->name);
 		return 1;
 	}

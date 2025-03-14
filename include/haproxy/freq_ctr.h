@@ -28,9 +28,19 @@
 #include <haproxy/ticks.h>
 
 /* exported functions from freq_ctr.c */
+ullong _freq_ctr_total_from_values(uint period, int pend, uint tick, ullong past, ullong curr);
 ullong freq_ctr_total(const struct freq_ctr *ctr, uint period, int pend);
+ullong freq_ctr_total_estimate(const struct freq_ctr *ctr, uint period, int pend);
 int freq_ctr_overshoot_period(const struct freq_ctr *ctr, uint period, uint freq);
 uint update_freq_ctr_period_slow(struct freq_ctr *ctr, uint period, uint inc);
+
+/* Only usable during single threaded startup phase. */
+static inline void preload_freq_ctr(struct freq_ctr *ctr, uint value)
+{
+	ctr->curr_ctr = 0;
+	ctr->prev_ctr = value;
+	ctr->curr_tick = now_ms & ~1;
+}
 
 /* Update a frequency counter by <inc> incremental units. It is automatically
  * rotated if the period is over. It is important that it correctly initializes
@@ -80,6 +90,16 @@ static inline unsigned int update_freq_ctr(struct freq_ctr *ctr, unsigned int in
 static inline uint read_freq_ctr_period(const struct freq_ctr *ctr, uint period)
 {
 	ullong total = freq_ctr_total(ctr, period, -1);
+
+	return div64_32(total, period);
+}
+
+/* same as read_freq_ctr_period() above except that it doesn't lock and may
+ * return incorrect values. This is only meant for use in signal handlers.
+ */
+static inline uint read_freq_ctr_period_estimate(const struct freq_ctr *ctr, uint period)
+{
+	ullong total = freq_ctr_total_estimate(ctr, period, -1);
 
 	return div64_32(total, period);
 }

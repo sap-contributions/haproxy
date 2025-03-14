@@ -38,14 +38,20 @@
 #define UNIQUEID_LEN            128
 
 /* flags used in logformat_node->options */
+#define LOG_OPT_NONE            0x00000000
 #define LOG_OPT_HEXA            0x00000001
 #define LOG_OPT_MANDATORY       0x00000002
 #define LOG_OPT_QUOTE           0x00000004
 #define LOG_OPT_REQ_CAP         0x00000008
 #define LOG_OPT_RES_CAP         0x00000010
-#define LOG_OPT_HTTP            0x00000020
+#define LOG_OPT_HTTP            0x00000020 // forces http-encoding on the payload, incompatible with LOG_OPT_ENCODE
 #define LOG_OPT_ESC             0x00000040
 #define LOG_OPT_MERGE_SPACES    0x00000080
+#define LOG_OPT_BIN             0x00000100
+/* unused: 0x00000200 ... 0x00000800 */
+#define LOG_OPT_ENCODE_JSON     0x00001000
+#define LOG_OPT_ENCODE_CBOR     0x00002000
+#define LOG_OPT_ENCODE          0x00003000
 
 
 /* Fields that need to be extracted from the incoming connection or request for
@@ -53,6 +59,7 @@
  * and appear as flags in session->logs.logwait, which are removed once the
  * required information has been collected.
  */
+#define LW_LOGSTEPS        -1        /* special value: ignore LW_* fields and consider proxy log-steps */
 #define LW_INIT             1        /* anything */
 #define LW_CLIP             2        /* CLient IP */
 #define LW_SVIP             4        /* SerVer IP */
@@ -122,75 +129,10 @@ enum log_tgt {
 /* lists of fields that can be logged, for logformat_node->type */
 enum {
 
-	LOG_FMT_TEXT = 0, /* raw text */
-	LOG_FMT_EXPR,     /* sample expression */
+	LOG_FMT_TEXT = 0,  /* raw text */
+	LOG_FMT_EXPR,      /* sample expression */
 	LOG_FMT_SEPARATOR, /* separator replaced by one space */
-
-	/* information fields */
-	LOG_FMT_GLOBAL,
-	LOG_FMT_CLIENTIP,
-	LOG_FMT_CLIENTPORT,
-	LOG_FMT_BACKENDIP,
-	LOG_FMT_BACKENDPORT,
-	LOG_FMT_FRONTENDIP,
-	LOG_FMT_FRONTENDPORT,
-	LOG_FMT_SERVERPORT,
-	LOG_FMT_SERVERIP,
-	LOG_FMT_COUNTER,
-	LOG_FMT_LOGCNT,
-	LOG_FMT_PID,
-	LOG_FMT_DATE,
-	LOG_FMT_DATEGMT,
-	LOG_FMT_DATELOCAL,
-	LOG_FMT_TS,
-	LOG_FMT_MS,
-	LOG_FMT_FRONTEND,
-	LOG_FMT_FRONTEND_XPRT,
-	LOG_FMT_BACKEND,
-	LOG_FMT_SERVER,
-	LOG_FMT_BYTES,
-	LOG_FMT_BYTES_UP,
-	LOG_FMT_Ta,
-	LOG_FMT_Th,
-	LOG_FMT_Ti,
-	LOG_FMT_TQ,
-	LOG_FMT_TW,
-	LOG_FMT_TC,
-	LOG_FMT_Tr,
-	LOG_FMT_tr,
-	LOG_FMT_trg,
-	LOG_FMT_trl,
-	LOG_FMT_TR,
-	LOG_FMT_TD,
-	LOG_FMT_TT,
-	LOG_FMT_TU,
-	LOG_FMT_STATUS,
-	LOG_FMT_CCLIENT,
-	LOG_FMT_CSERVER,
-	LOG_FMT_TERMSTATE,
-	LOG_FMT_TERMSTATE_CK,
-	LOG_FMT_ACTCONN,
-	LOG_FMT_FECONN,
-	LOG_FMT_BECONN,
-	LOG_FMT_SRVCONN,
-	LOG_FMT_RETRIES,
-	LOG_FMT_SRVQUEUE,
-	LOG_FMT_BCKQUEUE,
-	LOG_FMT_HDRREQUEST,
-	LOG_FMT_HDRRESPONS,
-	LOG_FMT_HDRREQUESTLIST,
-	LOG_FMT_HDRRESPONSLIST,
-	LOG_FMT_REQ,
-	LOG_FMT_HTTP_METHOD,
-	LOG_FMT_HTTP_URI,
-	LOG_FMT_HTTP_PATH,
-	LOG_FMT_HTTP_PATH_ONLY,
-	LOG_FMT_HTTP_QUERY,
-	LOG_FMT_HTTP_VERSION,
-	LOG_FMT_HOSTNAME,
-	LOG_FMT_UNIQUEID,
-	LOG_FMT_SSL_CIPHER,
-	LOG_FMT_SSL_VERSION,
+	LOG_FMT_ALIAS,     /* reference to logformat_alias */
 };
 
 /* enum for parse_logformat_string */
@@ -198,8 +140,8 @@ enum {
 	LF_INIT = 0,   // before first character
 	LF_TEXT,       // normal text
 	LF_SEPARATOR,  // a single separator
-	LF_VAR,        // variable name, after '%' or '%{..}'
-	LF_STARTVAR,   // % in text
+	LF_ALIAS,      // alias name, after '%' or '%{..}'
+	LF_STARTALIAS, // % in text
 	LF_STONAME,    // after '%(' and before ')'
 	LF_STOTYPE,    // after ':' while in STONAME
 	LF_EDONAME,    // ')' after '%('
@@ -210,6 +152,17 @@ enum {
 	LF_END,        // \0 found
 };
 
+/* log_format aliases (ie: %alias), see logformat_aliases table in log.c for
+ * available aliases definitions
+ */
+struct logformat_node; // forward-declaration
+struct logformat_alias {
+	char *name;
+	int type;
+	int mode;
+	int lw; /* logwait bitsfield */
+	int (*config_callback)(struct logformat_node *node, struct proxy *curproxy);
+};
 
 struct logformat_node {
 	struct list list;
@@ -219,6 +172,29 @@ struct logformat_node {
 	char *name;    // printable name for output types that require named fields (ie: json)
 	char *arg;     // text for LOG_FMT_TEXT, arg for others
 	void *expr;    // for use with LOG_FMT_EXPR
+	const struct logformat_alias *alias; // set if ->type == LOG_FMT_ALIAS
+};
+
+enum lf_expr_flags {
+	LF_FL_NONE     = 0x00,
+	LF_FL_COMPILED = 0x01
+};
+
+/* a full logformat expr made of one or multiple logformat nodes */
+struct lf_expr {
+	struct list list;                 /* to store lf_expr inside a list */
+	union {
+		struct {
+			struct list list; /* logformat_node list */
+			int options;      /* global '%o' options (common to all nodes) */
+		} nodes;
+		char *str;                /* original string prior to parsing (NULL once compiled) */
+	};
+	struct {
+		char *file;               /* file where the lft appears */
+		int line;                 /* line where the lft appears */
+	} conf; // parsing hints
+	uint8_t flags;             /* LF_FL_* flags */
 };
 
 /* Range of indexes for log sampling. */
@@ -256,20 +232,107 @@ struct log_target {
 	uint16_t flags;
 };
 
+enum logger_flags {
+	LOGGER_FL_NONE     = 0x00,
+	LOGGER_FL_RESOLVED = 0x01,
+};
+
 struct logger {
 	struct list list;
 	struct log_target target;
 	struct smp_info lb;
+	uint16_t flags;
+	/* 2 bytes hole */
 	enum log_fmt format;
 	int facility;
 	int level;
 	int minlvl;
 	int maxlen;
 	struct logger *ref;
+	union {
+		struct log_profile *prof; /* postparsing */
+		char *prof_str;           /* preparsing */
+	};
 	struct {
                 char *file;                     /* file where the logger appears */
                 int line;                       /* line where the logger appears */
         } conf;
+};
+
+/* integer used to provide some context about the log origin
+ * when sending log through logging functions
+ */
+enum log_orig_id {
+	LOG_ORIG_UNSPEC = 0,         /* unspecified */
+	LOG_ORIG_SESS_ERROR,         /* general error during session handling */
+	LOG_ORIG_SESS_KILL,          /* during embryonic session kill */
+	LOG_ORIG_TXN_ACCEPT,         /* during stream accept handling */
+	LOG_ORIG_TXN_REQUEST,        /* during stream request handling */
+	LOG_ORIG_TXN_CONNECT,        /* during stream connect handling */
+	LOG_ORIG_TXN_RESPONSE,       /* during stream response handling */
+	LOG_ORIG_TXN_CLOSE,          /* during stream termination */
+	LOG_ORIG_EXTRA,              /* end of hard-coded/legacy log origins,
+	                              * beginning of extra ones. 1 extra orig
+	                              * = 1 logging step
+	                              */
+	LOG_ORIG_MAX = 0xFFFF,       /* max log origin number (65k) */
+};
+
+/* log orig flags
+ */
+#define LOG_ORIG_FL_NONE  0x0000
+#define LOG_ORIG_FL_ERROR 0x0001
+#define LOG_ORIG_FL_ALL   0xFFFF
+
+struct log_orig {
+	enum log_orig_id id;
+	uint16_t flags; /* any LOG_ORIG_FL_* */
+};
+
+/* max number of extra log origins */
+#define LOG_ORIG_EXTRA_SLOTS LOG_ORIG_MAX - LOG_ORIG_EXTRA
+
+/* used to register extra log origins */
+struct log_origin_node {
+	struct list list;      /* per-name lookup during config */
+	struct eb32_node tree; /* per-id lookup during runtime */
+	const char *name;
+};
+
+/* log profile step flags */
+enum log_ps_flags {
+	LOG_PS_FL_NONE = 0,
+	LOG_PS_FL_DROP,              /* don't emit log for this step */
+};
+
+struct log_profile_step {
+	struct lf_expr logformat;
+	struct lf_expr logformat_sd;
+	enum log_ps_flags flags;     /* LOG_PS_FL_* */
+};
+
+struct log_profile_step_extra {
+	struct log_profile_step step;
+	struct eb32_node node;
+	struct log_origin_node *orig; // reference to log_origin config node
+};
+
+struct log_profile {
+	struct list list;
+	struct {
+		char *file;
+		int line;
+	} conf;
+	char *id;
+	struct buffer log_tag;          // override log-tag
+	struct log_profile_step *accept;
+	struct log_profile_step *request;
+	struct log_profile_step *connect;
+	struct log_profile_step *response;
+	struct log_profile_step *close;
+	struct log_profile_step *error; // override error-log-format
+	struct log_profile_step *any;   // override log-format
+	struct eb_root extra;           // extra log profile steps (if any)
 };
 
 #endif /* _HAPROXY_LOG_T_H */

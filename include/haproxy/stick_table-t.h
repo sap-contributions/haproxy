@@ -119,7 +119,7 @@ union stktable_data {
 	unsigned long long std_t_ull;
 	struct freq_ctr std_t_frqp;
 	struct dict_entry *std_t_dict;
-};
+} __attribute__((packed, aligned(sizeof(int))));
 
 /* known data types */
 struct stktable_data_type {
@@ -147,13 +147,20 @@ struct stksess {
 	unsigned int expire;      /* session expiration date */
 	unsigned int ref_cnt;     /* reference count, can only purge when zero */
 	__decl_thread(HA_RWLOCK_T lock); /* lock related to the table entry */
-	int shard;                /* shard */
+	int shard;                /* shard number used by peers */
+	int seen;                 /* 0 only when no peer has seen this entry yet */
 	struct eb32_node exp;     /* ebtree node used to hold the session in expiration tree */
 	struct eb32_node upd;     /* ebtree node used to hold the update sequence tree */
 	struct ebmb_node key;     /* ebtree node used to hold the session in table */
 	/* WARNING! do not put anything after <keys>, it's used by the key */
 };
 
+/* stktable struct flags */
+#define STK_FL_NONE      0x0000
+#define STK_FL_RECV_ONLY 0x0001    /* table is assumed to be remotely updated only
+                                    * (never updated locally)
+                                    */
+#define STK_FL_NOPURGE   0x0002    /* if non-zero, don't purge sticky sessions when full */
 
 /* stick table */
 struct stktable {
@@ -178,11 +185,13 @@ struct stktable {
 	size_t key_size;          /* size of a key, maximum size in case of string */
 	unsigned int server_key_type; /* What type of key is used to identify servers */
 	unsigned int size;        /* maximum number of sticky sessions in table */
-	int nopurge;              /* if non-zero, don't purge sticky sessions when full */
 	int expire;               /* time to live for sticky sessions (milliseconds) */
 	int data_size;            /* the size of the data that is prepended *before* stksess */
 	int data_ofs[STKTABLE_DATA_TYPES]; /* negative offsets of present data types, or 0 if absent */
 	unsigned int data_nbelem[STKTABLE_DATA_TYPES]; /* to store nb_elem in case of array types */
+	unsigned int brates_factor; /* Factor used for IN/OUT bytes rates */
+	uint16_t flags; /* STK_FL_* flags */
+	/* 2-bytes hole */
 	union {
 		int i;
 		unsigned int u;
@@ -197,8 +206,12 @@ struct stktable {
 
 	THREAD_ALIGN(64);
 
-	struct eb_root keys;      /* head of sticky session tree */
-	struct eb_root exps;      /* head of sticky session expiration tree */
+	struct {
+		struct eb_root keys;      /* head of sticky session tree */
+		struct eb_root exps;      /* head of sticky session expiration tree */
+		__decl_thread(HA_RWLOCK_T sh_lock); /* for the trees above */
+	} shards[CONFIG_HAP_TBL_BUCKETS];
+
 	unsigned int refcnt;     /* number of local peer over all peers sections
 				    attached to this table */
 	unsigned int current;     /* number of sticky sessions currently in table */
@@ -218,7 +231,7 @@ struct stktable {
 	/* rarely used config stuff below (should not interfere with updt_lock) */
 	struct proxy *proxies_list; /* The list of proxies which reference this stick-table. */
 	struct {
-		const char *file;     /* The file where the stick-table is declared. */
+		const char *file;     /* The file where the stick-table is declared (global name). */
 		int line;             /* The line in this <file> the stick-table is declared. */
 	} conf;
 };

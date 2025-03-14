@@ -757,9 +757,9 @@ const struct {
  * to report missing dependencies. It may be NULL if such dependencies are not
  * allowed.
  */
-static struct acl *find_acl_default(const char *acl_name, struct list *known_acl,
-                                    char **err, struct arg_list *al,
-                                    const char *file, int line)
+struct acl *find_acl_default(const char *acl_name, struct list *known_acl,
+                             char **err, struct arg_list *al,
+                             const char *file, int line)
 {
 	__label__ out_return, out_free_acl_expr, out_free_name;
 	struct acl *cur_acl;
@@ -1350,7 +1350,11 @@ int smp_fetch_acl_parse(struct arg *args, char **err_msg)
 			name++;
 		}
 
-		if (!(acl_sample->terms[i].acl = find_acl_by_name(name, &curproxy->acl))) {
+
+		if (
+			!(acl_sample->terms[i].acl = find_acl_by_name(name, &curproxy->acl)) &&
+			!(acl_sample->terms[i].acl = find_acl_default(name, &curproxy->acl, err_msg, NULL, NULL, 0))
+			) {
 			memprintf(err_msg, "ACL '%s' not found", name);
 			goto err;
 		}

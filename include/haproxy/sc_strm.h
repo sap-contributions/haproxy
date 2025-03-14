@@ -43,6 +43,9 @@ void sc_conn_sync_send(struct stconn *sc);
 int sc_applet_sync_recv(struct stconn *sc);
 void sc_applet_sync_send(struct stconn *sc);
 
+int sc_applet_sync_recv(struct stconn *sc);
+void sc_applet_sync_send(struct stconn *sc);
+
 
 /* returns the channel which receives data from this stream connector (input channel) */
 static inline struct channel *sc_ic(const struct stconn *sc)
@@ -152,8 +155,11 @@ static inline int sc_alloc_ibuf(struct stconn *sc, struct buffer_wait *wait)
 	int ret;
 
 	ret = channel_alloc_buffer(sc_ic(sc), wait);
-	if (!ret)
+	if (ret)
+		sc_used_buff(sc);
+	else
 		sc_need_buff(sc);
+
 	return ret;
 }
 
@@ -320,6 +326,37 @@ static inline void sc_chk_snd(struct stconn *sc)
 {
 	if (likely(sc->app_ops->chk_snd))
 		sc->app_ops->chk_snd(sc);
+}
+
+
+/* Perform a synchronous receive using the right version, depending the endpoing
+ * is a connection or an applet.
+ */
+static inline int sc_sync_recv(struct stconn *sc)
+{
+	if (sc_ep_test(sc, SE_FL_T_MUX))
+		return sc_conn_sync_recv(sc);
+	else if (sc_ep_test(sc, SE_FL_T_APPLET))
+		return sc_applet_sync_recv(sc);
+	return 0;
+}
+
+/* Perform a synchronous send using the right version, depending the endpoing is
+ * a connection or an applet.
+ */
+static inline void sc_sync_send(struct stconn *sc)
+{
+	if (sc_ep_test(sc, SE_FL_T_MUX))
+		sc_conn_sync_send(sc);
+	else if (sc_ep_test(sc, SE_FL_T_APPLET)) {
+		sc_applet_sync_send(sc);
+		if (sc_oc(sc)->flags & CF_WRITE_EVENT) {
+			/* Data was send, wake the applet up. It is safe to do so becasuse sc_applet_sync_send()
+			 * removes CF_WRITE_EVENT flag from the channel before trying to send data to the applet.
+			 */
+			task_wakeup(__sc_appctx(sc)->t, TASK_WOKEN_OTHER);
+		}
+	}
 }
 
 /* Combines both sc_update_rx() and sc_update_tx() at once */

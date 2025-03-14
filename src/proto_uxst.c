@@ -81,11 +81,91 @@ struct protocol proto_uxst = {
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = sock_accepting_conn,
 	.default_iocb   = sock_accept_iocb,
-	.receivers      = LIST_HEAD_INIT(proto_uxst.receivers),
+};
+
+/* Note: must not be declared <const> as its list will be overwritten */
+struct protocol proto_abns_stream = {
+	.name           = "abns_stream",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_STREAM,
+	.listen         = uxst_bind_listener,
+	.enable         = uxst_enable_listener,
+	.disable        = uxst_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+	.accept_conn    = sock_accept_conn,
+	.ctrl_init      = sock_conn_ctrl_init,
+	.ctrl_close     = sock_conn_ctrl_close,
+	.connect        = uxst_connect_server,
+	.drain          = sock_drain,
+	.check_events   = sock_check_events,
+	.ignore_events  = sock_ignore_events,
+
+	/* binding layer */
+	.rx_suspend     = uxst_suspend_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_abns,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_STREAM,
+	.sock_type      = SOCK_STREAM,
+	.sock_prot      = 0,
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.rx_listening   = sock_accepting_conn,
+	.default_iocb   = sock_accept_iocb,
+
+	.nb_receivers   = 0,
+};
+
+/* Note: must not be declared <const> as its list will be overwritten */
+struct protocol proto_abnsz_stream = {
+	.name           = "abnsz_stream",
+
+	/* connection layer */
+	.xprt_type      = PROTO_TYPE_STREAM,
+	.listen         = uxst_bind_listener,
+	.enable         = uxst_enable_listener,
+	.disable        = uxst_disable_listener,
+	.add            = default_add_listener,
+	.unbind         = default_unbind_listener,
+	.suspend        = default_suspend_listener,
+	.resume         = default_resume_listener,
+	.accept_conn    = sock_accept_conn,
+	.ctrl_init      = sock_conn_ctrl_init,
+	.ctrl_close     = sock_conn_ctrl_close,
+	.connect        = uxst_connect_server,
+	.drain          = sock_drain,
+	.check_events   = sock_check_events,
+	.ignore_events  = sock_ignore_events,
+
+	/* binding layer */
+	.rx_suspend     = uxst_suspend_receiver,
+
+	/* address family */
+	.fam            = &proto_fam_abnsz,
+
+	/* socket layer */
+	.proto_type     = PROTO_TYPE_STREAM,
+	.sock_type      = SOCK_STREAM,
+	.sock_prot      = 0,
+	.rx_enable      = sock_enable,
+	.rx_disable     = sock_disable,
+	.rx_unbind      = sock_unbind,
+	.rx_listening   = sock_accepting_conn,
+	.default_iocb   = sock_accept_iocb,
+
 	.nb_receivers   = 0,
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_uxst);
+INITCALL1(STG_REGISTER, protocol_register, &proto_abns_stream);
+INITCALL1(STG_REGISTER, protocol_register, &proto_abnsz_stream);
 
 /********************************
  * 1) low-level socket functions
@@ -107,9 +187,15 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 {
 	int fd, err;
 	int ready;
-	char *msg = NULL;
+	struct buffer *msg = alloc_trash_chunk();
 
 	err = ERR_NONE;
+
+	if (!msg) {
+		if (errlen)
+			snprintf(errmsg, errlen, "out of memory");
+		return ERR_ALERT | ERR_FATAL;
+	}
 
 	/* ensure we never return garbage */
 	if (errlen)
@@ -119,7 +205,7 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 		return ERR_NONE; /* already bound */
 
 	if (!(listener->rx.flags & RX_F_BOUND)) {
-		msg = "receiving socket not bound";
+		chunk_appendf(msg, "receiving socket not bound");
 		err |= ERR_FATAL | ERR_ALERT;
 		goto uxst_return;
 	}
@@ -133,25 +219,27 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 	if (!ready && /* only listen if not already done by external process */
 	    listen(fd, listener_backlog(listener)) < 0) {
 		err |= ERR_FATAL | ERR_ALERT;
-		msg = "cannot listen to UNIX socket";
+		chunk_appendf(msg, "cannot listen on UNIX socket (%s)", strerror(errno));
 		goto uxst_close_return;
 	}
 
  done:
 	/* the socket is now listening */
 	listener_set_state(listener, LI_LISTEN);
-	return err;
+	goto uxst_return;
 
  uxst_close_return:
-	close(fd);
+	fd_delete(fd);
  uxst_return:
 	if (msg && errlen) {
 		char *path_str;
 
 		path_str = sa2str((struct sockaddr_storage *)&listener->rx.addr, 0, 0);
-		snprintf(errmsg, errlen, "%s for [%s]", msg, ((path_str) ? path_str : ""));
+		snprintf(errmsg, errlen, "%s for [%s]", msg->area, ((path_str) ? path_str : ""));
 		ha_free(&path_str);
 	}
+	free_trash_chunk(msg);
+	msg = NULL;
 	return err;
 }
 
@@ -219,7 +307,9 @@ static int uxst_suspend_receiver(struct receiver *rx)
  */
 static int uxst_connect_server(struct connection *conn, int flags)
 {
-	int fd;
+	struct sockaddr_storage addr;
+	socklen_t addr_len;
+	int fd, stream_err;
 	struct server *srv;
 	struct proxy *be;
 
@@ -239,72 +329,26 @@ static int uxst_connect_server(struct connection *conn, int flags)
 		return SF_ERR_INTERNAL;
 	}
 
-	if ((fd = conn->handle.fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
-		qfprintf(stderr, "Cannot get a server socket.\n");
+	/* perform common checks on obtained socket FD, return appropriate Stream Error Flag in case of failure */
+	fd = conn->handle.fd = sock_create_server_socket(conn, be, &stream_err);
+	if (fd == -1)
+		return stream_err;
 
-		if (errno == ENFILE) {
-			conn->err_code = CO_ER_SYS_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system FD limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EMFILE) {
-			conn->err_code = CO_ER_PROC_FDLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached process FD limit (maxsock=%d). Please check 'ulimit-n' and restart.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == ENOBUFS || errno == ENOMEM) {
-			conn->err_code = CO_ER_SYS_MEMLIM;
-			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system memory limit (maxsock=%d). Please check system tunables.\n",
-				 be->id, global.maxsock);
-		}
-		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
-			conn->err_code = CO_ER_NOPROTO;
-		}
-		else
-			conn->err_code = CO_ER_SOCK_ERR;
-
-		/* this is a resource error */
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_RESOURCE;
-	}
-
-	if (fd >= global.maxsock) {
-		/* do not log anything there, it's a normal condition when this option
-		 * is used to serialize connections to a server !
-		 */
-		ha_alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
-		close(fd);
-		conn->err_code = CO_ER_CONF_FDLIM;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_PRXCOND; /* it is a configuration limit */
-	}
-
-	if (fd_set_nonblock(fd) == -1) {
-		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
-	if (master == 1 && fd_set_cloexec(fd) == -1) {
-		ha_alert("Cannot set CLOEXEC on client socket.\n");
-		close(fd);
-		conn->err_code = CO_ER_SOCK_ERR;
-		conn->flags |= CO_FL_ERROR;
-		return SF_ERR_INTERNAL;
-	}
-
+	/* FD is ok, continue with protocol specific settings */
 	if (global.tune.server_sndbuf)
                 setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.server_sndbuf, sizeof(global.tune.server_sndbuf));
 
 	if (global.tune.server_rcvbuf)
                 setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &global.tune.server_rcvbuf, sizeof(global.tune.server_rcvbuf));
 
-	if (connect(fd, (struct sockaddr *)conn->dst, get_addr_len(conn->dst)) == -1) {
+	/* address may contain a custom family that is used to adjust the
+	 * length (abns vs abnsz).
+	 */
+	addr = *conn->dst;
+	addr_len = get_addr_len(&addr);
+	addr.ss_family = AF_UNIX;
+
+	if (connect(fd, (struct sockaddr *)&addr, addr_len) == -1) {
 		if (errno == EINPROGRESS || errno == EALREADY) {
 			conn->flags |= CO_FL_WAIT_L4_CONN;
 		}
@@ -322,9 +366,9 @@ static int uxst_connect_server(struct connection *conn, int flags)
 				conn->err_code = CO_ER_ADDR_INUSE;
 			}
 
-			qfprintf(stderr,"Connect() failed for backend %s: %s.\n", be->id, msg);
+			qfprintf(stderr,"Connect() failed for backend %s: %s (%s).\n", be->id, msg, strerror(errno));
 			close(fd);
-			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s.\n", be->id, msg);
+			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s (%s).\n", be->id, msg, strerror(errno));
 			conn->flags |= CO_FL_ERROR;
 			return SF_ERR_RESOURCE;
 		}

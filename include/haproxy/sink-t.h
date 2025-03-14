@@ -31,15 +31,18 @@
  *   - ring buffer, readable from CLI
  */
 enum sink_type {
-	SINK_TYPE_NEW,      // not yet initialized
-	SINK_TYPE_FD,       // events sent to a file descriptor
-	SINK_TYPE_BUFFER,   // events sent to a ring buffer
+	SINK_TYPE_FORWARD_DECLARED, // was searched using sink_find_early(), is expected to exist by some component
+	SINK_TYPE_NEW,              // not yet initialized
+	SINK_TYPE_FD,               // events sent to a file descriptor
+	SINK_TYPE_BUFFER,           // events sent to a ring buffer
 };
 
 struct sink_forward_target {
 	struct server *srv;    // used server
 	struct appctx *appctx; // appctx of current session
+	uint last_conn;        // copy of now_ms for last session establishment attempt
 	size_t ofs;            // ring buffer reader offset
+	size_t e_processed;    // processed events
 	struct sink *sink;     // the associated sink
 	struct sink_forward_target *next;
 	__decl_thread(HA_SPINLOCK_T lock); // lock to protect current struct
@@ -49,7 +52,11 @@ struct sink_forward_target {
 struct sink {
 	struct list sink_list;     // position in the sink list
 	char *name;                // sink name
-	char *desc;                // sink description
+	char *desc;                /* sink description:
+	                            *   when forward-declared, holds info about where the
+	                            *   sink was first forward declared, else holds actual
+	                            *   sink description
+				    */
 	char *store;               // backing-store file when buffer
 	enum log_fmt fmt;          // format expected by the sink
 	enum sink_type type;       // type of storage
@@ -60,9 +67,8 @@ struct sink {
 	struct sig_handler *forward_sighandler; /* signal handler */
 	struct {
 		struct ring *ring;    // used by ring buffer and STRM sender
-		unsigned int dropped; // dropped events since last one.
+		unsigned int dropped; // 2*dropped events since last one + 1 for purge in progress.
 		int fd;               // fd num for FD type sink
-		__decl_thread(HA_RWLOCK_T lock); // shared/excl for dropped
 	} ctx;
 };
 

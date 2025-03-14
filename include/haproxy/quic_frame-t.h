@@ -33,6 +33,7 @@
 #include <haproxy/buf-t.h>
 #include <haproxy/list.h>
 #include <haproxy/quic_stream-t.h>
+#include <haproxy/quic_token.h>
 
 extern struct pool_head *pool_head_quic_frame;
 extern struct pool_head *pool_head_qf_crypto;
@@ -80,6 +81,12 @@ enum quic_frame_type {
 	/* Do not insert enums after the following one. */
 	QUIC_FT_MAX
 };
+
+/* Extra frame types larger than QUIC_FT_MAX should be declared here.
+ * For every new value, an associated builder and parser instances should be
+ * defined in quic_frame.c. Do not forget to complete the associated function
+ * quic_frame_type_is_known() and both qf_builder()/qf_parser().
+ */
 
 #define QUIC_FT_PKT_TYPE_I_BITMASK (1 << QUIC_PACKET_TYPE_INITIAL)
 #define QUIC_FT_PKT_TYPE_0_BITMASK (1 << QUIC_PACKET_TYPE_0RTT)
@@ -154,7 +161,7 @@ struct qf_crypto {
 
 struct qf_new_token {
 	uint64_t len;
-	const unsigned char *data;
+	unsigned char data[QUIC_TOKEN_LEN];
 };
 
 struct qf_stream {
@@ -170,7 +177,7 @@ struct qf_stream {
 	 */
 	struct buffer *buf;
 
-	struct eb64_node offset;
+	uint64_t offset;
 	uint64_t len;
 
 	/* for TX pointer into <buf> field.
@@ -245,7 +252,7 @@ struct qf_connection_close_app {
 struct quic_frame {
 	struct list list;           /* List elem from parent elem (typically a Tx packet instance, a PKTNS or a MUX element). */
 	struct quic_tx_packet *pkt; /* Last Tx packet used to send the frame. */
-	unsigned char type;         /* QUIC frame type. */
+	uint64_t type;              /* QUIC frame type. */
 	union {
 		struct qf_padding padding;
 		struct qf_ack ack;

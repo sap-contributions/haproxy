@@ -1027,13 +1027,13 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
 		      global.node,
 		      (s->cur_eweight * s->proxy->lbprm.wmult + s->proxy->lbprm.wdiv - 1) / s->proxy->lbprm.wdiv,
 		      (s->proxy->lbprm.tot_weight * s->proxy->lbprm.wmult + s->proxy->lbprm.wdiv - 1) / s->proxy->lbprm.wdiv,
-		      s->cur_sess, s->proxy->beconn - s->proxy->queue.length,
-		      s->queue.length);
+		      s->cur_sess, s->proxy->beconn - s->proxy->queueslength,
+		      s->queueslength);
 
 	if ((s->cur_state == SRV_ST_STARTING) &&
-	    ns_to_sec(now_ns) < s->last_change + s->slowstart &&
-	    ns_to_sec(now_ns) >= s->last_change) {
-		ratio = MAX(1, 100 * (ns_to_sec(now_ns) - s->last_change) / s->slowstart);
+	    ns_to_sec(now_ns) < s->counters.last_change + s->slowstart &&
+	    ns_to_sec(now_ns) >= s->counters.last_change) {
+		ratio = MAX(1, 100 * (ns_to_sec(now_ns) - s->counters.last_change) / s->slowstart);
 		chunk_appendf(buf, "; throttle=%d%%", ratio);
 	}
 
@@ -1279,7 +1279,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * was erased during the bounce.
 		 */
 		if (!tick_isset(t->expire)) {
-			t->expire = now_ms;
+			t->expire = tick_add(now_ms, 0);
 			expired = 0;
 		}
 	}
@@ -1382,7 +1382,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * as a failed response coupled with "observe layer7" caused the
 		 * server state to be suddenly changed.
 		 */
-		sc_conn_drain_and_shut(sc);
+		se_shutdown(sc->sedesc, SE_SHR_DRAIN|SE_SHW_SILENT);
 	}
 
 	if (sc) {
@@ -1415,8 +1415,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		}
 	}
 
-        if (LIST_INLIST(&check->buf_wait.list))
-                LIST_DEL_INIT(&check->buf_wait.list);
+	b_dequeue(&check->buf_wait);
 
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
@@ -1505,13 +1504,13 @@ int check_buf_available(void *target)
 
 	BUG_ON(!check->sc);
 
-	if ((check->state & CHK_ST_IN_ALLOC) && b_alloc(&check->bi)) {
+	if ((check->state & CHK_ST_IN_ALLOC) && b_alloc(&check->bi, DB_CHANNEL)) {
 		TRACE_STATE("unblocking check, input buffer allocated", CHK_EV_TCPCHK_EXP|CHK_EV_RX_BLK, check);
 		check->state &= ~CHK_ST_IN_ALLOC;
 		tasklet_wakeup(check->sc->wait_event.tasklet);
 		return 1;
 	}
-	if ((check->state & CHK_ST_OUT_ALLOC) && b_alloc(&check->bo)) {
+	if ((check->state & CHK_ST_OUT_ALLOC) && b_alloc(&check->bo, DB_CHANNEL)) {
 		TRACE_STATE("unblocking check, output buffer allocated", CHK_EV_TCPCHK_SND|CHK_EV_TX_BLK, check);
 		check->state &= ~CHK_ST_OUT_ALLOC;
 		tasklet_wakeup(check->sc->wait_event.tasklet);
@@ -1529,10 +1528,8 @@ struct buffer *check_get_buf(struct check *check, struct buffer *bptr)
 	struct buffer *buf = NULL;
 
 	if (likely(!LIST_INLIST(&check->buf_wait.list)) &&
-	    unlikely((buf = b_alloc(bptr)) == NULL)) {
-		check->buf_wait.target = check;
-		check->buf_wait.wakeup_cb = check_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &check->buf_wait.list);
+	    unlikely((buf = b_alloc(bptr, DB_CHANNEL)) == NULL)) {
+		b_queue(DB_CHANNEL, &check->buf_wait, check, check_buf_available);
 	}
 	return buf;
 }
@@ -1670,6 +1667,10 @@ static int start_checks()
 	/* 0- init the dummy frontend used to create all checks sessions */
 	init_new_proxy(&checks_fe);
 	checks_fe.id = strdup("CHECKS-FE");
+	if (!checks_fe.id) {
+		ha_alert("Out of memory creating the checks frontend.\n");
+		return ERR_ALERT | ERR_FATAL;
+	}
 	checks_fe.cap = PR_CAP_FE | PR_CAP_BE;
         checks_fe.mode = PR_MODE_TCP;
 	checks_fe.maxconn = 0;
@@ -1829,12 +1830,14 @@ int init_srv_check(struct server *srv)
 	 */
 	if (srv->mux_proto && !srv->check.mux_proto &&
 	    ((srv->mux_proto->mode == PROTO_MODE_HTTP && check_type == TCPCHK_RULES_HTTP_CHK) ||
+	     (srv->mux_proto->mode == PROTO_MODE_SPOP && check_type == TCPCHK_RULES_SPOP_CHK) ||
 	     (srv->mux_proto->mode == PROTO_MODE_TCP && check_type != TCPCHK_RULES_HTTP_CHK))) {
 		srv->check.mux_proto = srv->mux_proto;
 	}
 	/* test that check proto is valid if explicitly defined */
 	else if (srv->check.mux_proto &&
 	         ((srv->check.mux_proto->mode == PROTO_MODE_HTTP && check_type != TCPCHK_RULES_HTTP_CHK) ||
+		  (srv->check.mux_proto->mode == PROTO_MODE_SPOP && check_type != TCPCHK_RULES_SPOP_CHK) ||
 	          (srv->check.mux_proto->mode == PROTO_MODE_TCP && check_type == TCPCHK_RULES_HTTP_CHK))) {
 		ha_alert("config: %s '%s': server '%s' uses an incompatible MUX protocol for the selected check type\n",
 		         proxy_type_str(srv->proxy), srv->proxy->id, srv->id);
@@ -2033,7 +2036,7 @@ static int srv_parse_addr(char **args, int *cur_arg, struct proxy *curpx, struct
 		goto error;
 	}
 
-	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, NULL, errmsg, NULL, NULL,
+	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, NULL, errmsg, NULL, NULL, NULL,
 	                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_STREAM | PA_O_CONNECT);
 	if (!sk) {
 		memprintf(errmsg, "'%s' : %s", args[*cur_arg], *errmsg);
@@ -2190,6 +2193,12 @@ static int srv_parse_agent_inter(char **args, int *cur_arg, struct proxy *curpx,
 		goto error;
 	}
 	srv->agent.inter = delay;
+
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
 
   out:
 	return err_code;
@@ -2460,6 +2469,12 @@ static int srv_parse_check_inter(char **args, int *cur_arg, struct proxy *curpx,
 	}
 	srv->check.inter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2505,6 +2520,12 @@ static int srv_parse_check_fastinter(char **args, int *cur_arg, struct proxy *cu
 	}
 	srv->check.fastinter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2549,6 +2570,12 @@ static int srv_parse_check_downinter(char **args, int *cur_arg, struct proxy *cu
 		goto error;
 	}
 	srv->check.downinter = delay;
+
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
 
   out:
 	return err_code;

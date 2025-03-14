@@ -49,6 +49,10 @@ int mworker_ext_launch_all()
 
 	/* find the right mworker_proc */
 	list_for_each_entry_safe(child, tmp, &proc_list, list) {
+		/* need to stop progs, which were launched before reload */
+		if ((child->options & PROC_O_TYPE_PROG) && (child->options & PROC_O_LEAVING))
+			kill(child->pid, oldpids_sig);
+
 		if (child->reloads == 0 && (child->options & PROC_O_TYPE_PROG)) {
 
 			if (reexec && (!(child->options & PROC_O_START_RELOAD))) {
@@ -114,8 +118,6 @@ int mworker_ext_launch_all()
 
 				/* This one must not be exported, it's internal! */
 				unsetenv("HAPROXY_MWORKER_REEXEC");
-				unsetenv("HAPROXY_STARTUPLOGS_FD");
-				unsetenv("HAPROXY_MWORKER_WAIT_ONLY");
 				unsetenv("HAPROXY_PROCESSES");
 				execvp(child->command[0], child->command);
 
@@ -137,6 +139,9 @@ int cfg_parse_program(const char *file, int linenum, char **args, int kwm)
 	static struct mworker_proc *ext_child = NULL;
 	struct mworker_proc *child;
 	int err_code = 0;
+
+	if (!(global.mode & MODE_DISCOVERY))
+		return err_code;
 
 	if (strcmp(args[0], "program") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
@@ -185,6 +190,16 @@ int cfg_parse_program(const char *file, int linenum, char **args, int kwm)
 		ext_child->id = strdup(args[1]);
 		if (!ext_child->id) {
 			ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto error;
+		}
+
+		if (!deprecated_directives_allowed) {
+			ha_warning("parsing [%s:%d]: The 'program' section is deprecated and will be eventually removed, "
+			           "it can be still allowed by setting 'expose-deprecated-directives' keyword in the 'global' "
+			           "section defined before any 'program' section. Please, consider to use a process manager instead "
+			           "of 'program' section, such as sysvinit, systemd, supervisord or s6.\n",
+			           file, linenum);
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto error;
 		}
@@ -327,33 +342,4 @@ out:
 
 }
 
-int cfg_program_postparser()
-{
-	int err_code = 0;
-	struct mworker_proc *child;
-
-	/* we only need to check this during configuration parsing,
-	 * wait mode doesn't have the complete description of a program */
-	if (global.mode & MODE_MWORKER_WAIT)
-		return err_code;
-
-	list_for_each_entry(child, &proc_list, list) {
-		if (child->reloads == 0 && (child->options & PROC_O_TYPE_PROG)) {
-			if (child->command == NULL) {
-				ha_alert("The program section '%s' lacks a command to launch.\n", child->id);
-				err_code |= ERR_ALERT | ERR_FATAL;
-			}
-		}
-	}
-
-	if (use_program && !(global.mode & MODE_MWORKER)) {
-		ha_alert("Can't use a 'program' section without master worker mode.\n");
-		err_code |= ERR_ALERT | ERR_FATAL;
-	}
-
-	return err_code;
-}
-
-
 REGISTER_CONFIG_SECTION("program", cfg_parse_program, NULL);
-REGISTER_CONFIG_POSTPARSER("program", cfg_program_postparser);

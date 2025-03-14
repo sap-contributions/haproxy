@@ -23,6 +23,7 @@
 #define _HAPROXY_CFGPARSE_H
 
 #include <haproxy/api.h>
+#include <haproxy/proxy-t.h>
 
 struct hap_cpuset;
 struct proxy;
@@ -36,6 +37,8 @@ struct acl_cond;
 #define CFG_USERLIST	3
 #define CFG_PEERS	4
 #define CFG_CRTLIST	5
+#define CFG_CRTSTORE    6
+#define CFG_TRACES      7
 
 /* various keyword modifiers */
 enum kw_mod {
@@ -47,6 +50,7 @@ enum kw_mod {
 enum cfg_keyword_flags {
 	KWF_EXPERIMENTAL = 0x1,
 	KWF_MATCH_PREFIX = 0x2,
+	KWF_DISCOVERY = 0x4,
 };
 
 struct cfg_keyword {
@@ -89,6 +93,14 @@ struct cfg_postparser {
 	int (*func)();
 };
 
+/* store in memory config files meta data and content */
+struct cfgfile {
+	struct list list;
+	char *filename;                         /* config file name */
+	char *content;                          /* allocated str with config file content */
+	ssize_t size;                           /* size of stored file or error indication (-1) */
+};
+
 extern struct list postparsers;
 extern int cfg_maxpconn;
 extern int cfg_maxconn;
@@ -98,12 +110,18 @@ extern char *cursection;
 extern int non_global_section_parsed;
 
 extern struct proxy *curproxy;
+extern char initial_cwd[PATH_MAX];
 
 int cfg_parse_global(const char *file, int linenum, char **args, int inv);
 int cfg_parse_listen(const char *file, int linenum, char **args, int inv);
+int cfg_parse_listen_match_option(const char *file, int linenum, int kwm,
+                                  const struct cfg_opt config_opts[], int *err_code,
+                                  char **args, int mode, int cap,
+                                  int *options, int *no_options);
+int cfg_parse_traces(const char *file, int linenum, char **args, int inv);
 int cfg_parse_track_sc_num(unsigned int *track_sc_num,
                            const char *arg, const char *end, char **err);
-int readcfgfile(const char *file);
+int parse_cfg(const struct cfgfile *cfg);
 void cfg_register_keywords(struct cfg_kw_list *kwl);
 void cfg_unregister_keywords(struct cfg_kw_list *kwl);
 int check_config_validity(void);
@@ -116,9 +134,11 @@ int cfg_register_postparser(char *name, int (*func)());
 void cfg_unregister_sections(void);
 void cfg_backup_sections(struct list *backup_sections);
 void cfg_restore_sections(struct list *backup_sections);
-int warnif_misplaced_tcp_conn(struct proxy *proxy, const char *file, int line, const char *arg);
-int warnif_misplaced_tcp_sess(struct proxy *proxy, const char *file, int line, const char *arg);
-int warnif_misplaced_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg);
+int warnif_misplaced_tcp_req_conn(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2);
+int warnif_misplaced_tcp_req_sess(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
+int warnif_misplaced_tcp_req_cont(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
+int warnif_misplaced_tcp_res_cont(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
+int warnif_misplaced_quic_init(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
 int warnif_cond_conflicts(const struct acl_cond *cond, unsigned int where, const char *file, int line);
 int warnif_tcp_http_cond(const struct proxy *px, const struct acl_cond *cond);
 int too_many_args_idx(int maxarg, int index, char **args, char **msg, int *err_code);
@@ -126,15 +146,20 @@ int too_many_args(int maxarg, char **args, char **msg, int *err_code);
 int alertif_too_many_args_idx(int maxarg, int index, const char *file, int linenum, char **args, int *err_code);
 int alertif_too_many_args(int maxarg, const char *file, int linenum, char **args, int *err_code);
 int parse_process_number(const char *arg, unsigned long *proc, int max, int *autoinc, char **err);
-void free_email_alert(struct proxy *p);
 const char *cfg_find_best_match(const char *word, const struct list *list, int section, const char **extra);
 int warnifnotcap(struct proxy *proxy, int cap, const char *file, int line, const char *arg, const char *hint);
 int failifnotcap(struct proxy *proxy, int cap, const char *file, int line, const char *arg, const char *hint);
 void cfg_dump_registered_keywords();
+int list_append_cfgfile(struct list *li, const char *filename, char **err);
+ssize_t load_cfg_in_mem(char* filename, char** cfg_content);
 
 /* simplified way to define a section parser */
 #define REGISTER_CONFIG_SECTION(name, parse, post)                            \
 	INITCALL3(STG_REGISTER, cfg_register_section, (name), (parse), (post))
+
+/* simplified way to define a post section parser */
+#define REGISTER_CONFIG_POST_SECTION(name, post)                              \
+	INITCALL3(STG_REGISTER, cfg_register_section, (name), NULL, (post))
 
 #define REGISTER_CONFIG_POSTPARSER(name, parser)                              \
 	INITCALL2(STG_REGISTER, cfg_register_postparser, (name), (parser))

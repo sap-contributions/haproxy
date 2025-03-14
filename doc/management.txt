@@ -1,7 +1,7 @@
                              ------------------------
                              HAProxy Management Guide
                              ------------------------
-                                   version 3.0
+                                   version 3.2
 
 
 This document describes how to start, stop, manage, and troubleshoot HAProxy,
@@ -32,10 +32,12 @@ Summary
 9.3.      Unix Socket commands
 9.4.      Master CLI
 9.4.1.    Master CLI commands
+9.5.      Stats-file
 10.   Tricks for easier configuration management
 11.   Well-known traps to avoid
 12.   Debugging and performance issues
 13.   Security considerations
+13.1.     Linux capabilities support
 
 
 1. Prerequisites
@@ -49,7 +51,7 @@ familiar with troubleshooting utilities such as strace and tcpdump.
 2. Quick reminder about HAProxy's architecture
 ----------------------------------------------
 
-HAProxy is a multi-threaded, event-driven, non-blocking daemon. This means is
+HAProxy is a multi-threaded, event-driven, non-blocking daemon. This means it
 uses event multiplexing to schedule all of its activities instead of relying on
 the system to schedule between multiple activities. Most of the time it runs as
 a single process, so the output of "ps aux" on a system will report only one
@@ -128,7 +130,7 @@ followed by one of more letters, and possibly followed by one or multiple extra
 arguments. Without any option, HAProxy displays the help page with a reminder
 about supported options. Available options may vary slightly based on the
 operating system. A fair number of these options overlap with an equivalent one
-if the "global" section. In this case, the command line always has precedence
+in the "global" section. In this case, the command line always has precedence
 over the configuration file, so that the command line can be used to quickly
 enforce some settings without touching the configuration files. The current
 list of options is :
@@ -189,8 +191,6 @@ list of options is :
     recommended to use this mode with multiprocess and systemd.
 
   -Ws : master-worker mode with support of `notify` type of systemd service.
-    This option is only available when HAProxy was built with `USE_SYSTEMD`
-    build option enabled.
 
   -c : only performs a check of the configuration files and exits before trying
     to bind. The exit status is zero if everything is OK, or non-zero if an
@@ -229,6 +229,11 @@ list of options is :
     This option was made available because many bogus implementations of
     getaddrinfo() exist on various systems and cause anomalies that are
     difficult to troubleshoot.
+
+  -dI : enable the insecure fork. This is the equivalent of the
+    "insecure-fork-wanted" in the global section. It can be useful when running
+    all the reg-tests with ASAN which need to fork addr2line to resolve the
+    addresses.
 
   -dK<class[,class]*> : dumps the list of registered keywords in each class.
     The list of classes is available with "-dKhelp". All classes may be dumped
@@ -353,6 +358,11 @@ list of options is :
         the byte's value to -dM but using this option allows to disable/enable
         use of a previously set value.
 
+  -dR : disable SO_REUSEPORT socket option on listening ports. It is equivalent
+    to the "global" section's "noreuseport" keyword. This may be applied in
+    multi-threading scenarios, when load distribution issues observed among the
+    haproxy threads (could be monitored with top).
+
   -dS : disable use of the splice() system call. It is equivalent to the
     "global" section's "nosplice" keyword. This may be used when splice() is
     suspected to behave improperly or to cause performance issues, or when
@@ -373,6 +383,12 @@ list of options is :
    tend to emit more warnings. It may be combined with "-c" to cause warnings
    in checked configurations to fail. This is equivalent to global option
    "zero-warning".
+
+  -dZ : disable forwarding of data in "zero-copy" mode. It is equivalent to the
+   "global" section's "tune.disable-zero-copy-forwarding" keyword. This may be
+   helpful in case of issues with data loss or data integrity, or when using
+   strace to see the forwarded data, as it also disables any kernel tcp
+   splicing.
 
   -db : disable background mode and multi-process mode. The process remains in
     foreground. It is mainly used during development or during small tests, as
@@ -407,16 +423,26 @@ list of options is :
     detect protocol violations from clients or servers. An optional argument
     can be used to specify a list of various trace configurations using ',' as
     separator. Each element activates one or all trace sources. Additionally,
-    level and verbosity can be optionally specified on each element using ':' as
-    inner separator with trace name.
+    level and verbosity can be optionally specified on each element using ':'
+    as inner separator with trace name. When entering an invalid verbosity or
+    level name, the list of available keywords is presented. For example it can
+    be convenient to pass 'help' for each field to consult the list first.
 
-  -m <limit> : limit the total allocatable memory to <limit> megabytes across
-    all processes. This may cause some connection refusals or some slowdowns
-    depending on the amount of memory needed for normal operations. This is
-    mostly used to force the processes to work in a constrained resource usage
-    scenario. It is important to note that the memory is not shared between
-    processes, so in a multi-process scenario, this value is first divided by
-    global.nbproc before forking.
+  -dv : disable the use of the "evports" poller. It is equivalent to the
+    "global" section's keyword "noevports". It is mostly useful when suspecting
+    a bug related to this poller. On systems supporting event ports (SunOS
+    derived from Solaris 10 and later), the fallback will generally be the
+    "poll" poller.
+
+  -m <limit> : limit allocatable memory, which is used to keep process's data,
+    to <limit> megabytes. This may cause some connection refusals or some
+    slowdowns depending on the amount of memory needed for normal operations.
+    This is mostly used to force haproxy process to work in a constrained
+    resource consumption scenario. It is important to note that the memory is
+    not shared between haproxy processes and a child process created via fork()
+    system call inherits its parent's resource limits. So, in a master-worker
+    mode this memory limit is separately applied to the master and its forked
+    worker process.
 
   -n <limit> : limits the per-process connection limit to <limit>. This is
     equivalent to the global section's keyword "maxconn". It has precedence
@@ -450,7 +476,7 @@ list of options is :
   -st <pid>* : send the "terminate" signal (SIGTERM) to older processes after
     boot completion to terminate them immediately without finishing what they
     were doing. <pid> is a list of pids to signal (one per argument). The list
-    is ends on any option starting with a "-". It is not a problem if the list
+    ends on any option starting with a "-". It is not a problem if the list
     of pids is empty, so that it can be built on the fly based on the result of
     a command like "pidof" or "pgrep".
 
@@ -462,11 +488,16 @@ list of options is :
   -x <unix_socket> : connect to the specified socket and try to retrieve any
     listening sockets from the old process, and use them instead of trying to
     bind new ones. This is useful to avoid missing any new connection when
-    reloading the configuration on Linux. The capability must be enable on the
-    stats socket using "expose-fd listeners" in your configuration.
-    In master-worker mode, the master will use this option upon a reload with
-    the "sockpair@" syntax, which allows the master to connect directly to a
-    worker without using stats socket declared in the configuration.
+    reloading the configuration on Linux.
+
+    Without master-worker mode, the capability must be enable on the stats
+    socket using "expose-fd listeners" in your configuration.
+
+    In master-worker mode, it does not need "expose-fd listeners", the master
+    will use automatically this option upon a reload with the "sockpair@"
+    syntax, which allows the master to connect directly to a worker without using
+    any stats socket declared in the configuration. If you want to disable this,
+    you can pass -x /dev/null.
 
 A safe way to start HAProxy from an init file consists in forcing the daemon
 mode, storing existing pids to a pid file and using this pid file to notify
@@ -1091,9 +1122,9 @@ CSV output format for monitoring tools. The same format is provided on the
 Unix socket.
 
 Statistics are regroup in categories labelled as domains, corresponding to the
-multiple components of HAProxy. There are two domains available: proxy and dns.
-If not specified, the proxy domain is selected. Note that only the proxy
-statistics are printed on the HTTP page.
+multiple components of HAProxy. There are two domains available: proxy and
+resolvers. If not specified, the proxy domain is selected. Note that only the
+proxy statistics are printed on the HTTP page.
 
 9.1. CSV format
 ---------------
@@ -1553,7 +1584,7 @@ Limitations do exist: the length of the whole buffer passed to the CLI must
 not be greater than tune.bfsize and the pattern "<<" must not be glued to the
 last word of the line.
 
-When entering a paylod while in interactive mode, the prompt will change from
+When entering a payload while in interactive mode, the prompt will change from
 "> " to "+ ".
 
 It is important to understand that when multiple haproxy processes are started
@@ -1687,16 +1718,17 @@ add server <backend>/<server> [args]*
   - check-via-socks4
   - ciphers
   - ciphersuites
+  - cookie
   - crl-file
   - crt
   - disabled
   - downinter
-  - enabled
   - error-limit
   - fall
   - fastinter
   - force-sslv3/tlsv10/tlsv11/tlsv12/tlsv13
   - id
+  - init-state
   - inter
   - maxconn
   - maxqueue
@@ -1800,7 +1832,8 @@ clear map [@<ver>] <map>
   version of the map is cleared (the one being matched against). However it is
   possible to specify another version using '@' followed by this version.
 
-clear table <table> [ data.<type> <operator> <value> ] | [ key <key> ]
+clear table <table> [ data.<type> <operator> <value> ] | [ key <key> ] |
+                    [ ptr <ptr> ]
   Remove entries from the stick-table <table>.
 
   This is typically used to unblock some users complaining they have been
@@ -1830,6 +1863,15 @@ clear table <table> [ data.<type> <operator> <value> ] | [ key <key> ]
   same type as the table, which currently is limited to IPv4, IPv6, integer and
   string.
 
+  When the ptr form is used the entry <ptr> is removed. <ptr> is written in
+  the form 0xffff and must correspond to the address returned by a previous
+  "show table" command. Matching an entry using its pointer may be relevant if
+  the entry cannot be matched using the key due to empty key or incompatible
+  characters on the cli.
+
+  If data.<type> is an array type, "[]" may be used to access a specific
+  index in the array, like so: data.gpt[1]
+
   Example :
         $ echo "show table http_proxy" | socat stdio /tmp/sock1
     >>> # table: http_proxy, type: ip, size:204800, used:2
@@ -1837,16 +1879,26 @@ clear table <table> [ data.<type> <operator> <value> ] | [ key <key> ]
           bytes_out_rate(60000)=187
     >>> 0x80e6a80: key=127.0.0.2 use=0 exp=3594740 gpc0=1 conn_rate(30000)=10 \
           bytes_out_rate(60000)=191
+    >>> 0x80e6b40: key=127.0.0.3 use=0 exp=3594743 gpc0=2 conn_rate(30000)=10 \
+          bytes_out_rate(60000)=200
 
         $ echo "clear table http_proxy key 127.0.0.1" | socat stdio /tmp/sock1
 
         $ echo "show table http_proxy" | socat stdio /tmp/sock1
     >>> # table: http_proxy, type: ip, size:204800, used:1
     >>> 0x80e6a80: key=127.0.0.2 use=0 exp=3594740 gpc0=1 conn_rate(30000)=10 \
+    >>> 0x80e6b40: key=127.0.0.3 use=0 exp=3594743 gpc0=2 conn_rate(30000)=10 \
+          bytes_out_rate(60000)=200
           bytes_out_rate(60000)=191
         $ echo "clear table http_proxy data.gpc0 eq 1" | socat stdio /tmp/sock1
         $ echo "show table http_proxy" | socat stdio /tmp/sock1
     >>> # table: http_proxy, type: ip, size:204800, used:1
+    >>> 0x80e6b40: key=127.0.0.3 use=0 exp=3594743 gpc0=2 conn_rate(30000)=10 \
+          bytes_out_rate(60000)=200
+
+        $ echo "clear table http_proxy ptr 0x80e6b40" | socat stdio /tmp/sock1
+        $ echo "show table http_proxy" | socat stdio /tmp/sock1
+    >>> # table: http_proxy, type: ip, size:204800, used:0
 
 commit acl @<ver> <acl>
   Commit all changes made to version <ver> of ACL <acl>, and deletes all past
@@ -1902,7 +1954,7 @@ commit ssl cert <filename>
   Commit a temporary SSL certificate update transaction.
 
   In the case of an existing certificate (in a "Used" state in "show ssl
-  cert"), generate every SSL contextes and SNIs it need, insert them, and
+  cert"), generate every SSL contexts and SNIs it needs, insert them, and
   remove the previous ones. Replace in memory the previous SSL certificates
   everywhere the <filename> was used in the configuration. Upon failure it
   doesn't remove or insert anything. Once the temporary transaction is
@@ -1938,6 +1990,38 @@ commit ssl crl-file <crlfile>
 
   See also "new ssl crl-file", "set ssl crl-file", "abort ssl crl-file" and
   "add ssl crt-list".
+
+debug counters [reset|show|all|bug|chk|cnt|glt|?]*
+  List internal counters placed in the code, which may vary depending on some
+  build options. Some of them depend on DEBUG_STRICT, others on DEBUG_GLITCHES.
+  The command takes a combination of multiple arguments, some defining actions
+  and others defining filters:
+    - bug     enables listing the counters for BUG_ON() statements
+    - cnt     enables listing the counters for COUNT_IF() statements
+    - chk     enables listing the counters for CHECK_IF() statements
+    - glt     enables listing the counters for COUNT_GLITCH() statements
+    - all     enables showing counters that never triggered (value 0)
+    - reset   action: resets all specified counters
+    - show    action: shows all specified counters
+
+  By default, the action is "show" to show counters, and the listed counters
+  are all types with a non-zero value. The "show" command is implicit when no
+  other action is specified, and is only present to ease the production of
+  commands from scripts.
+
+  The output starts with an integer counter, followed by the type of the
+  counter in upper case, then its location in the code (file:line), the
+  function name, and optionally ": " followed by a description. Please note
+  that the output format might change between major versions, and new types
+  and entries might be backported to stable versions for the purpose of
+  improved debugging capabilities. Any monitoring performed on them should
+  only be done in a very lenient and permissive way, and preferably not.
+
+  Normally, end users will not use this command, but they may be invited to do
+  so by a developer trying to figure the cause of an issue, looking for CNT or
+  GLT entries. By the way, non-zero "CHK" entries are not expected to happen
+  and should be reported to developers as they might indicate some incorrect
+  assumptions in the code.
 
 debug dev <command> [args]*
   Call a developer-specific command. Only supported on a CLI connection running
@@ -1991,7 +2075,7 @@ del server <backend>/<server>
   Remove a server attached to the backend <backend>. All servers are eligible,
   except servers which are referenced by other configuration elements. The
   server must be put in maintenance mode prior to its deletion.  The operation
-  is cancelled if the serveur still has active or idle connection or its
+  is cancelled if the server still has active or idle connection or its
   connection queue is not empty.
 
 disable agent <backend>/<server>
@@ -2058,6 +2142,36 @@ disable server <backend>/<server>
 
   This command is restricted and can only be issued on sockets configured for
   level "admin".
+
+dump ssl cert <certfile>
+  Dump a certificate loaded into HAProxy memory. This will dump the certificate
+  in PEM format, the private key, then the leaf certificate and finally the
+  chain will be dumped. You can also dump a transaction by prefixing the
+  filename by an asterisk.
+  This is useful in order to save certificates on the filesystem when it was
+  updated on the CLI and not on the filesystem.
+
+  This command is restricted and can only be issued on sockets configured for
+  level "admin".
+
+  Examples:
+
+  $ echo "dump ssl cert cert1.pem" | socat /tmp/sock1 -
+
+  $ echo "dump ssl cert cert1.pem" | socat /tmp/sock1 - | openssl storeutl -noout -text /dev/stdin
+
+dump stats-file
+  Generate a stats-file which can be used to preload haproxy counters values on
+  startup. See "Stats-file" section for more detail.
+
+echo <text>
+  Print some text with the CLI. Can be useful to wrote commentaries between
+  commands when dumping the result of multiple commands.
+
+  Example:
+
+    echo "expert-mode on; echo FDs from fdtab; show fd; echo wild FDs; debug dev fd" | socat /var/run/haproxy.sock -
+
 
 enable agent <backend>/<server>
   Resume auxiliary agent check that was temporarily stopped.
@@ -2500,12 +2614,22 @@ set ssl tls-key <id> <tlskey>
   or 80 bits TLS ticket key (ex. openssl rand 80 | openssl base64 -A).
 
 set table <table> key <key> [data.<data_type> <value>]*
+set table <table> ptr <ptr> [data.<data_type> <value>]*
   Create or update a stick-table entry in the table. If the key is not present,
   an entry is inserted. See stick-table in section 4.2 to find all possible
   values for <data_type>. The most likely use consists in dynamically entering
   entries for source IP addresses, with a flag in gpc0 to dynamically block an
   IP address or affect its quality of service. It is possible to pass multiple
   data_types in a single call.
+
+  Optional ptr lookup may be used instead of key lookup for an existing entry:
+  <ptr> is written in the form 0xffff and must correspond to the address
+  returned by a previous "show table" command. Matching an entry using its
+  pointer may be relevant if the entry cannot be matched using the key due to
+  empty key or incompatible characters on the cli.
+
+  If data.<data_type> is an array type, "[]" may be used to access a specific
+  index in the array, like so: data.gpt[1]
 
 set timeout cli <delay>
   Change the CLI interface timeout for current connection. This can be useful
@@ -2702,14 +2826,14 @@ show env [<name>]
   can only be issued on sockets configured for levels "operator" or "admin".
 
 show errors [<iid>|<proxy>] [request|response]
-  Dump last known request and response errors collected by frontends and
-  backends. If <iid> is specified, the limit the dump to errors concerning
-  either frontend or backend whose ID is <iid>. Proxy ID "-1" will cause
-  all instances to be dumped. If a proxy name is specified instead, its ID
-  will be used as the filter. If "request" or "response" is added after the
-  proxy name or ID, only request or response errors will be dumped. This
-  command is restricted and can only be issued on sockets configured for
-  levels "operator" or "admin".
+  Dump last known HTTP/1.x request and response errors collected by frontends
+  and backends. If <iid> is specified, the limit the dump to errors concerning
+  either frontend or backend whose ID is <iid>. Proxy ID "-1" will cause all
+  instances to be dumped. If a proxy name is specified instead, its ID will be
+  used as the filter. If "request" or "response" is added after the proxy name
+  or ID, only request or response errors will be dumped. This command is
+  restricted and can only be issued on sockets configured for levels "operator"
+  or "admin".
 
   The errors which may be collected are the last request and response errors
   caused by protocol violations, often due to invalid characters in header
@@ -3077,7 +3201,8 @@ show quic [<format>] [<filter>]
   values, "oneline" for the default format and "full" to display all
   information. Alternatively, a list of comma-delimited fields can be specified
   to restrict output. Currently supported values are "tp", "sock", "pktns",
-  "cc" and "mux".
+  "cc" and "mux". Finally, "help" in the format will instead show a more
+  detailed help message.
 
   The final argument is used to restrict or extend the connection list. By
   default, connections on closing or draining state are not displayed. Use the
@@ -3201,7 +3326,7 @@ show servers state [<backend>]
      srv_agent_addr:              Server health agent address.
      srv_agent_port:              Server health agent port.
 
-show sess
+show sess [<options>*]
   Dump all known active streams (formerly called "sessions"). Avoid doing this
   on slow connections as this can be huge. This command is restricted and can
   only be issued on sockets configured for levels "operator" or "admin". Note
@@ -3209,32 +3334,52 @@ show sess
   output reports less entries than really exist because it will dump all
   existing streams up to the last one that was created before the command was
   entered; those which die in the mean time will not appear.
+  For supported opitons, see below.
 
-show sess <id> | older <age> | susp | all
-  Display a lot of internal information about the matching streams. In the
-  first form, only the stream matching the specified stream identifier will
-  be shown. This identifier is the first field at the beginning of the lines in
-  the dumps of "show sess" (it corresponds to the stream pointer). In the
-  second form, only streams older than <age> (in seconds by default) will be
-  shown. Passing "susp" instead will only report entries that are considered as
-  suspicious by the developers based on criteria that may in time or vary along
-  versions. If "all" is used instead, then all streams will be dumped. Dumping
-  many streams can produce a huge output, take a lot of time and be CPU
-  intensive, so it's always better to only dump the minimum needed. Those
-  information are useless to most users but may be used by haproxy developers
-  to troubleshoot a complex bug. The output format is intentionally not
-  documented so that it can freely evolve depending on demands. This output
-  is meant to be interpreted while checking function strm_dump_to_buffer() in
-  src/stream.c to figure the exact meaning of certain fields.
+show sess [<id> | all | help] [<options>*]
+  Display a lot of internal information about the matching streams. The command
+  knows two output formats: a short one, which is the default when not asking
+  for a specific stream identifier, and an extended one when listing designated
+  streams. The short format, used by default with "show sess", only dumps one
+  stream per line with a few info, and the stream identifier at the beginning
+  of the line in hexadecimal (it corresponds to the pointer to the stream).
 
-show stat [domain <dns|proxy>] [{<iid>|<proxy>} <type> <sid>] [typed|json] \
-          [desc] [up|no-maint]
-  Dump statistics. The domain is used to select which statistics to print; dns
-  and proxy are available for now. By default, the CSV format is used; you can
-  activate the extended typed output format described in the section above if
-  "typed" is passed after the other arguments; or in JSON if "json" is passed
-  after the other arguments. By passing <id>, <type> and <sid>, it is possible
-  to dump only selected items :
+  In the extended form, used by "show sess <id>" or "show sess all", streams
+  are dumped with a huge amount of debugging details over multiple lines
+  (around 20 each), and still start with their identifier. The delimiter
+  between streams here is the identifier at the beginning of the line; extra
+  lines belonging to the same stream start with one or multiple spaces (the
+  stream is dumped indented). Dumping many streams can produce a huge output,
+  take a lot of time and be CPU intensive, so it's always better to only dump
+  the minimum needed. Those information are useless to most users but may be
+  used by HAProxy developers to troubleshoot a complex bug. The exact output
+  format is intentionally not documented so that it can freely evolve depending
+  on requirements, including in stable branches. This output is meant to be
+  interpreted while checking function strm_dump_to_buffer() in src/stream.c to
+  figure the exact meaning of certain fields.
+
+  The "help" argument will show the detailed usage of the command instead of
+  dumping streams.
+
+  It is possible to set some options to customize the dump or apply some
+  filters. Here are the supported options:
+    - backend <b>  only display streams attached to this backend
+    - frontend <f> only display streams attached to this frontend
+    - older <age>  only display streams older than <age> seconds
+    - server <b/s> only show streams attached to this backend+server
+    - show-uri     dump the transaction URI, as captured during the request
+                   analysis. It is only displayed if it was captured.
+    - susp         only show streams considered as suspicious by the developers
+                   based on criteria that may in time or vary along versions.
+
+show stat [domain <resolvers|proxy>] [{<iid>|<proxy>} <type> <sid>] \
+          [typed|json] [desc] [up|no-maint]
+  Dump statistics. The domain is used to select which statistics to print;
+  resolvers and proxy are available for now. By default, the CSV format is used;
+  you can activate the extended typed output format described in the section
+  above if "typed" is passed after the other arguments; or in JSON if "json" is
+  passed after the other arguments. By passing <id>, <type> and <sid>, it is
+  possible to dump only selected items :
     - <iid> is a proxy ID, -1 to dump everything. Alternatively, a proxy name
       <proxy> may be specified. In this case, this proxy's ID will be used as
       the ID selector.
@@ -3395,7 +3540,7 @@ show stat [domain <dns|proxy>] [{<iid>|<proxy>} <type> <sid>] [typed|json] \
   $ echo "show stat json" | socat /var/run/haproxy.sock stdio | \
     python -m json.tool
 
-show ssl ca-file [<cafile>[:<index>]]
+show ssl ca-file [[*][\]<cafile>[:<index>]]
   Display the list of CA files loaded into the process and their respective
   certificate counts. The certificates are not used by any frontend or backend
   until their status is "Used".
@@ -3412,7 +3557,8 @@ show ssl ca-file [<cafile>[:<index>]]
   If the index is invalid (too big for instance), nothing will be displayed.
   This command can be useful to check if a CA file was properly updated.
   You can also display the details of an ongoing transaction by prefixing the
-  filename by an asterisk.
+  filename by a '*'. If the first character of the filename is a '*', it can be
+  escaped with '\*'.
 
   Example :
 
@@ -3444,14 +3590,15 @@ show ssl ca-file [<cafile>[:<index>]]
     Serial: 587A1CE5ED855040A0C82BF255FF300ADB7C8136
     [...]
 
-show ssl cert [<filename>]
+show ssl cert [[*][\]<filename>]
   Display the list of certificates loaded into the process. They are not used
   by any frontend or backend until their status is "Used".
   If a filename is prefixed by an asterisk, it is a transaction which is not
   committed yet. If a filename is specified, it will show details about the
   certificate. This command can be useful to check if a certificate was well
   updated. You can also display details on a transaction by prefixing the
-  filename by an asterisk.
+  filename by a '*'. If the first character of the filename is a '*', it can be
+  escaped with '\*'.
   This command can also be used to display the details of a certificate's OCSP
   response by suffixing the filename with a ".ocsp" extension. It works for
   committed certificates as well as for ongoing transactions. On a committed
@@ -3483,7 +3630,12 @@ show ssl cert [<filename>]
     Status: Unused
     [...]
 
-show ssl crl-file [<crlfile>[:<index>]]
+    $ echo "@1 show ssl cert \*.local.pem" | socat /var/run/haproxy.master -
+    Filename: *.local.pem
+    Status: Used
+    [...]
+
+show ssl crl-file [[*][\]<crlfile>[:<index>]]
   Display the list of CRL files loaded into the process. They are not used
   by any frontend or backend until their status is "Used".
   If a filename is prefixed by an asterisk, it is a transaction which is not
@@ -3496,7 +3648,8 @@ show ssl crl-file [<crlfile>[:<index>]]
   If the index is invalid (too big for instance), nothing will be displayed.
   This command can be useful to check if a CRL file was properly updated.
   You can also display the details of an ongoing transaction by prefixing the
-  filename by an asterisk.
+  filename by a '*'. If the first character of the filename is a '*', it can be
+  escaped with '\*'.
 
   Example :
 
@@ -3633,6 +3786,48 @@ show ssl providers
         - fips
         - base
 
+show ssl sni [-f <frontend>] [-A]
+  Dump every SNI configured for the designated frontend, or all frontends if no
+  frontend was specified. It allows to see what SNI are offered for a frontend,
+  and to identify if a SNI is defined multiple times by multiple certificates for
+  the same frontend.
+
+  The -A option allows to filter the list and only displays the certificates
+  that are past the notAfter date, allowing to show only expired certificates.
+
+  Columns are separated by a single \t, allowing to parse it simply.
+
+  The 'Frontend/Bind' column shows the frontend name followed by the bind line
+  position in the configuration (frontend/file:linenum).
+
+  The 'SNI' column shows the SNI, it can be either a CN, a SAN or a filter from a crt-list.
+  The default certificates of a bind line, (which are either declared
+  explicitely by 'default-crt' or is implicitely the first certificate of a bind
+  line when no 'strict-sni' is used) shows the '*' character in the SNI column.
+
+  The 'Negative Filter' column is the list of negative filters associated to a
+  wildcard, this will show all negatives filters that are on the same crt-list
+  line. A dash character is displayed if there are none.
+
+  The 'Type' column shows the encryption algorithm type, it can be "rsa", "ecdsa" or "dsa".
+
+  The 'Filename' column can be either a filename from the configuration, or an
+  alias declared in a crt-store.
+
+  The 'NotAfter' and 'NotBefore' columns are directly extracted from the X509
+  leaf certificate.
+
+  Example:
+    $ echo "@1 show ssl sni" | socat /var/run/haproxy-master.sock - | column -t -s $'\t'
+    # Frontend/Bind        SNI        Negative Filter  Type   Filename             NotAfter                  NotBefore
+    li1/haproxy.cfg:10021  *.ex.lan   !m1.ex.lan       rsa    example.lan.pem      Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  machine10  -                ecdsa  machine10.pem.ecdsa  Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  machine10  -                rsa    machine10.pem.rsa    Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  machine10  -                ecdsa  machine10.pem.ecdsa  Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  localhost  -                rsa    localhost.pem.rsa    Jun 13 13:37:11 2024 GMT  May 14 13:37:11 2024 GMT
+    li1/haproxy.cfg:10021  localhost  -                ecdsa  localhost.pem.ecdsa  Jun 13 13:37:10 2024 GMT  May 14 13:37:10 2024 GMT
+    li1/haproxy.cfg:10021  *          -                rsa    localhost.pem.rsa    Jun 13 13:37:11 2024 GMT  May 14 13:37:11 2024 GMT
+
 show startup-logs
   Dump all messages emitted during the startup of the current haproxy process,
   each startup-logs buffer is unique to its haproxy worker.
@@ -3651,7 +3846,8 @@ show table
     >>> # table: front_pub, type: ip, size:204800, used:171454
     >>> # table: back_rdp, type: ip, size:204800, used:0
 
-show table <name> [ data.<type> <operator> <value> [data.<type> ...]] | [ key <key> ]
+show table <name> [ data.<type> <operator> <value> [data.<type> ...]] |
+                  [ key <key> ] | [ ptr <ptr> ]
   Dump contents of stick-table <name>. In this mode, a first line of generic
   information about the table is reported as with "show table", then all
   entries are dumped. Since this can be quite heavy, it is possible to specify
@@ -3677,6 +3873,15 @@ show table <name> [ data.<type> <operator> <value> [data.<type> ...]] | [ key <k
   same type as the table, which currently is limited to IPv4, IPv6, integer,
   and string.
 
+  When the ptr form is used the entry <ptr> is shown. <ptr> is written in
+  the form 0xffff and must correspond to the address returned by a previous
+  "show table" command. Matching an entry using its pointer may be relevant if
+  the entry cannot be matched using the key due empty key or incompatible
+  characters on the cli.
+
+  If data.<type> is an array type, "[]" may be used to access a specific
+  index in the array, like so: data.gpt[1]
+
   Example :
         $ echo "show table http_proxy" | socat stdio /tmp/sock1
     >>> # table: http_proxy, type: ip, size:204800, used:2
@@ -3697,6 +3902,12 @@ show table <name> [ data.<type> <operator> <value> [data.<type> ...]] | [ key <k
           bytes_out_rate(60000)=191
 
         $ echo "show table http_proxy key 127.0.0.2" | \
+            socat stdio /tmp/sock1
+    >>> # table: http_proxy, type: ip, size:204800, used:2
+    >>> 0x80e6a80: key=127.0.0.2 use=0 exp=3594740 gpc0=1 conn_rate(30000)=10 \
+          bytes_out_rate(60000)=191
+
+        $ echo "show table http_proxy ptr 0x80e6a80" | \
             socat stdio /tmp/sock1
     >>> # table: http_proxy, type: ip, size:204800, used:2
     >>> 0x80e6a80: key=127.0.0.2 use=0 exp=3594740 gpc0=1 conn_rate(30000)=10 \
@@ -3839,158 +4050,186 @@ trace 0
   to terminate a debugging session or as an emergency action to be used in case
   complex traces were enabled on multiple sources and impact the service.
 
-trace <source> event [ [+|-|!]<name> ]
-  Without argument, this will list all the events supported by the designated
-  source. They are prefixed with a "-" if they are not enabled, or a "+" if
-  they are enabled. It is important to note that a single trace may be labelled
-  with multiple events, and as long as any of the enabled events matches one of
-  the events labelled on the trace, the event will be passed to the trace
-  subsystem. For example, receiving an HTTP/2 frame of type HEADERS may trigger
-  a frame event and a stream event since the frame creates a new stream. If
-  either the frame event or the stream event are enabled for this source, the
-  frame will be passed to the trace framework.
+trace <source> [<args...>]
+  Configure traces for the source <source>. Without argument, this will list all
+  supported sub-commands to the given source. Multiple sub-commands can be
+  chained. Following sub-commands are supported:
 
-  With an argument, it is possible to toggle the state of each event and
-  individually enable or disable them. Two special keywords are supported,
-  "none", which matches no event, and is used to disable all events at once,
-  and "any" which matches all events, and is used to enable all events at
-  once. Other events are specific to the event source. It is possible to
-  enable one event by specifying its name, optionally prefixed with '+' for
-  better readability. It is possible to disable one event by specifying its
-  name prefixed by a '-' or a '!'.
+  event [ [+|-|!]<name> ]
+    Without argument, this will list all the events supported by the designated
+    source. They are prefixed with a "-" if they are not enabled, or a "+" if
+    they are enabled. It is important to note that a single trace may be
+    labelled with multiple events, and as long as any of the enabled events
+    matches one of the events labelled on the trace, the event will be passed to
+    the trace subsystem. For example, receiving an HTTP/2 frame of type HEADERS
+    may trigger a frame event and a stream event since the frame creates a new
+    stream. If either the frame event or the stream event are enabled for this
+    source, the frame will be passed to the trace framework.
 
-  One way to completely disable a trace source is to pass "event none", and
-  this source will instantly be totally ignored.
+    With an argument, it is possible to toggle the state of each event and
+    individually enable or disable them. Two special keywords are supported,
+    "none", which matches no event, and is used to disable all events at once,
+    and "any" which matches all events, and is used to enable all events at
+    once. Other events are specific to the event source. It is possible to
+    enable one event by specifying its name, optionally prefixed with '+' for
+    better readability. It is possible to disable one event by specifying its
+    name prefixed by a '-' or a '!'.
 
-trace <source> level [<level>]
-  Without argument, this will list all trace levels for this source, and the
-  current one will be indicated by a star ('*') prepended in front of it. With
-  an argument, this will change the trace level to the specified level. Detail
-  levels are a form of filters that are applied before reporting the events.
-  These filters are used to selectively include or exclude events depending on
-  their level of importance. For example a developer might need to know
-  precisely where in the code an HTTP header was considered invalid while the
-  end user may not even care about this header's validity at all. There are
-  currently 5 distinct levels for a trace :
+    One way to completely disable a trace source is to pass "event none", and
+    this source will instantly be totally ignored.
 
-      user         this will report information that are suitable for use by a
+  follow <other_source>
+    This permits the source <source> to also emit traces when the other source
+    <other_source> is locked on a criteria and the same criteria matches for the
+    current source as well. For example, if a source is locked on a session,
+    following that source from another one will make that other one emit traces
+    for all events related to this session. This may be used to some extents to
+    track backend requests along with the associated frontend connections. The
+    "session" source makes this easier by providing a "new" and an "end" events
+    that are usable for lock-on processing. Note that the source <source> does
+    not need to have its traces enabled in this case, and its tracing state will
+    not be affected either. It is, however, possible that some events may be
+    missing if they do not contain information that allow to correlate them with
+    the tracked element. The meta-source "all" may also be used with this
+    command: in this case, all sources will follow <other_source>.
+
+    Example:
+       trace h1 lock session start sess_new pause sess_end follow session
+
+  level [<level>]
+    Without argument, this will list all trace levels for this source, and the
+    current one will be indicated by a star ('*') prepended in front of it. With
+    an argument, this will change the trace level to the specified level. Detail
+    levels are a form of filters that are applied before reporting the events.
+    These filters are used to selectively include or exclude events depending on
+    their level of importance. For example a developer might need to know
+    precisely where in the code an HTTP header was considered invalid while the
+    end user may not even care about this header's validity at all. There are
+    currently 5 distinct levels for a trace :
+
+        user       this will report information that are suitable for use by a
                    regular haproxy user who wants to observe his traffic.
                    Typically some HTTP requests and responses will be reported
                    without much detail. Most sources will set this as the
                    default level to ease operations.
 
-      proto        in addition to what is reported at the "user" level, it also
+        proto      in addition to what is reported at the "user" level, it also
                    displays protocol-level updates. This can for example be the
                    frame types or HTTP headers after decoding.
 
-      state        in addition to what is reported at the "proto" level, it
+        state      in addition to what is reported at the "proto" level, it
                    will also display state transitions (or failed transitions)
                    which happen in parsers, so this will show attempts to
                    perform an operation while the "proto" level only shows
                    the final operation.
 
-      data         in addition to what is reported at the "state" level, it
+        data       in addition to what is reported at the "state" level, it
                    will also include data transfers between the various layers.
 
-      developer    it reports everything available, which can include advanced
+        developer  it reports everything available, which can include advanced
                    information such as "breaking out of this loop" that are
                    only relevant to a developer trying to understand a bug that
                    only happens once in a while in field. Function names are
                    only reported at this level.
 
-  It is highly recommended to always use the "user" level only and switch to
-  other levels only if instructed to do so by a developer. Also it is a good
-  idea to first configure the events before switching to higher levels, as it
-  may save from dumping many lines if no filter is applied.
+    It is highly recommended to always use the "user" level only and switch to
+    other levels only if instructed to do so by a developer. Also it is a good
+    idea to first configure the events before switching to higher levels, as it
+    may save from dumping many lines if no filter is applied. The meta-source
+    "all" may also be used with this command: in this case, the level will be
+    applied to all existing sources at once.
 
-trace <source> lock [criterion]
-  Without argument, this will list all the criteria supported by this source
-  for lock-on processing, and display the current choice by a star ('*') in
-  front of it. Lock-on means that the source will focus on the first matching
-  event and only stick to the criterion which triggered this event, and ignore
-  all other ones until the trace stops. This allows for example to take a trace
-  on a single connection or on a single stream. The following criteria are
-  supported by some traces, though not necessarily all, since some of them
-  might not be available to the source :
+  lock [criterion]
+    Without argument, this will list all the criteria supported by this source
+    for lock-on processing, and display the current choice by a star ('*') in
+    front of it. Lock-on means that the source will focus on the first matching
+    event and only stick to the criterion which triggered this event, and ignore
+    all other ones until the trace stops. This allows for example to take a
+    trace on a single connection or on a single stream. The following criteria
+    are supported by some traces, though not necessarily all, since some of them
+    might not be available to the source :
 
-      backend      lock on the backend that started the trace
-      connection   lock on the connection that started the trace
-      frontend     lock on the frontend that started the trace
-      listener     lock on the listener that started the trace
-      nothing      do not lock on anything
-      server       lock on the server that started the trace
-      session      lock on the session that started the trace
-      thread       lock on the thread that started the trace
+        backend      lock on the backend that started the trace
+        connection   lock on the connection that started the trace
+        frontend     lock on the frontend that started the trace
+        listener     lock on the listener that started the trace
+        nothing      do not lock on anything
+        server       lock on the server that started the trace
+        session      lock on the session that started the trace
+        thread       lock on the thread that started the trace
 
-  In addition to this, each source may provide up to 4 specific criteria such
-  as internal states or connection IDs. For example in HTTP/2 it is possible
-  to lock on the H2 stream and ignore other streams once a strace starts.
+    In addition to this, each source may provide up to 4 specific criteria such
+    as internal states or connection IDs. For example in HTTP/2 it is possible
+    to lock on the H2 stream and ignore other streams once a strace starts.
 
-  When a criterion is passed in argument, this one is used instead of the
-  other ones and any existing tracking is immediately terminated so that it can
-  restart with the new criterion. The special keyword "nothing" is supported by
-  all sources to permanently disable tracking.
+    When a criterion is passed in argument, this one is used instead of the
+    other ones and any existing tracking is immediately terminated so that it
+    can restart with the new criterion. The special keyword "nothing" is
+    supported by all sources to permanently disable tracking.
 
-trace <source> { pause | start | stop } [ [+|-|!]event]
-  Without argument, this will list the events enabled to automatically pause,
-  start, or stop a trace for this source. These events are specific to each
-  trace source. With an argument, this will either enable the event for the
-  specified action (if optionally prefixed by a '+') or disable it (if
-  prefixed by a '-' or '!'). The special keyword "now" is not an event and
-  requests to take the action immediately. The keywords "none" and "any" are
-  supported just like in "trace event".
+  { pause | start | stop } [ [+|-|!]event]
+    Without argument, this will list the events enabled to automatically pause,
+    start, or stop a trace for this source. These events are specific to each
+    trace source. With an argument, this will either enable the event for the
+    specified action (if optionally prefixed by a '+') or disable it (if
+    prefixed by a '-' or '!'). The special keyword "now" is not an event and
+    requests to take the action immediately. The keywords "none" and "any" are
+    supported just like in "trace event".
 
-  The 3 supported actions are respectively "pause", "start" and "stop". The
-  "pause" action enumerates events which will cause a running trace to stop and
-  wait for a new start event to restart it. The "start" action enumerates the
-  events which switch the trace into the waiting mode until one of the start
-  events appears. And the "stop" action enumerates the events which definitely
-  stop the trace until it is manually enabled again. In practice it makes sense
-  to manually start a trace using "start now" without caring about events, and
-  to stop it using "stop now". In order to capture more subtle event sequences,
-  setting "start" to a normal event (like receiving an HTTP request) and "stop"
-  to a very rare event like emitting a certain error, will ensure that the last
-  captured events will match the desired criteria. And the pause event is
-  useful to detect the end of a sequence, disable the lock-on and wait for
-  another opportunity to take a capture. In this case it can make sense to
-  enable lock-on to spot only one specific criterion (e.g. a stream), and have
-  "start" set to anything that starts this criterion (e.g. all events which
-  create a stream), "stop" set to the expected anomaly, and "pause" to anything
-  that ends that criterion (e.g. any end of stream event). In this case the
-  trace log will contain complete sequences of perfectly clean series affecting
-  a single object, until the last sequence containing everything from the
-  beginning to the anomaly.
+    The 3 supported actions are respectively "pause", "start" and "stop". The
+    "pause" action enumerates events which will cause a running trace to stop
+    and wait for a new start event to restart it. The "start" action enumerates
+    the events which switch the trace into the waiting mode until one of the
+    start events appears. And the "stop" action enumerates the events which
+    definitely stop the trace until it is manually enabled again. In practice it
+    makes sense to manually start a trace using "start now" without caring about
+    events, and to stop it using "stop now". In order to capture more subtle
+    event sequences, setting "start" to a normal event (like receiving an HTTP
+    request) and "stop" to a very rare event like emitting a certain error, will
+    ensure that the last captured events will match the desired criteria. And
+    the pause event is useful to detect the end of a sequence, disable the
+    lock-on and wait for another opportunity to take a capture. In this case it
+    can make sense to enable lock-on to spot only one specific criterion (e.g. a
+    stream), and have "start" set to anything that starts this criterion
+    (e.g. all events which create a stream), "stop" set to the expected anomaly,
+    and "pause" to anything that ends that criterion (e.g. any end of stream
+    event). In this case the trace log will contain complete sequences of
+    perfectly clean series affecting a single object, until the last sequence
+    containing everything from the beginning to the anomaly.
 
-trace <source> sink [<sink>]
-   Without argument, this will list all event sinks available for this source,
-   and the currently configured one will have a star ('*') prepended in front
-   of it. Sink "none" is always available and means that all events are simply
-   dropped, though their processing is not ignored (e.g. lock-on does occur).
-   Other sinks are available depending on configuration and build options, but
-   typically "stdout" and "stderr" will be usable in debug mode, and in-memory
-   ring buffers should be available as well. When a name is specified, the sink
-   instantly changes for the specified source. Events are not changed during a
-   sink change. In the worst case some may be lost if an invalid sink is used
-   (or "none"), but operations do continue to a different destination.
+  sink [<sink>]
+     Without argument, this will list all event sinks available for this source,
+     and the currently configured one will have a star ('*') prepended in front
+     of it. Sink "none" is always available and means that all events are simply
+     dropped, though their processing is not ignored (e.g. lock-on does occur).
+     Other sinks are available depending on configuration and build options, but
+     typically "stdout" and "stderr" will be usable in debug mode, and in-memory
+     ring buffers should be available as well. When a name is specified, the
+     sink instantly changes for the specified source. Events are not changed
+     during a sink change. In the worst case some may be lost if an invalid sink
+     is used (or "none"), but operations do continue to a different
+     destination. The meta-source "all" may also be used with this command: in
+     this case, the sink will be applied to all existing sources at once.
 
-trace <source> verbosity [<level>]
-  Without argument, this will list all verbosity levels for this source, and the
-  current one will be indicated by a star ('*') prepended in front of it. With
-  an argument, this will change the verbosity level to the specified one.
+  verbosity [<level>]
+    Without argument, this will list all verbosity levels for this source, and
+    the current one will be indicated by a star ('*') prepended in front of
+    it. With an argument, this will change the verbosity level to the specified
+    one.
 
-  Verbosity levels indicate how far the trace decoder should go to provide
-  detailed information. It depends on the trace source, since some sources will
-  not even provide a specific decoder. Level "quiet" is always available and
-  disables any decoding. It can be useful when trying to figure what's
-  happening before trying to understand the details, since it will have a very
-  low impact on performance and trace size. When no verbosity levels are
-  declared by a source, level "default" is available and will cause a decoder
-  to be called when specified in the traces. It is an opportunistic decoding.
-  When the source declares some verbosity levels, these ones are listed with
-  a description of what they correspond to. In this case the trace decoder
-  provided by the source will be as accurate as possible based on the
-  information available at the trace point. The first level above "quiet" is
-  set by default.
+    Verbosity levels indicate how far the trace decoder should go to provide
+    detailed information. It depends on the trace source, since some sources
+    will not even provide a specific decoder. Level "quiet" is always available
+    and disables any decoding. It can be useful when trying to figure what's
+    happening before trying to understand the details, since it will have a very
+    low impact on performance and trace size. When no verbosity levels are
+    declared by a source, level "default" is available and will cause a decoder
+    to be called when specified in the traces. It is an opportunistic decoding.
+    When the source declares some verbosity levels, these ones are listed with a
+    description of what they correspond to. In this case the trace decoder
+    provided by the source will be as accurate as possible based on the
+    information available at the trace point. The first level above "quiet" is
+    set by default.
 
 update ssl ocsp-response <certfile>
   Create an OCSP request for the specified <certfile> and send it to the OCSP
@@ -4014,13 +4253,13 @@ wait { -h | <delay> } [<condition> [<args>...]]
   specified condition to be satisfied, to unrecoverably fail, or to remain
   unsatisfied for the whole <delay> duration. The supported conditions are:
 
-  - srv-unused <proxy>/<server> : this will wait for the specified server to be
-    removable, i.e. be in maintenance and no longer have any connection on it.
-    Some conditions will never be accepted (e.g. not in maintenance) and will
-    cause the report of a specific error message indicating what condition is
-    not met. The server might even have been removed in parallel and no longer
-    exit. If everything is OK before the delay, a success is returned and the
-    operation is terminated.
+  - srv-removable <proxy>/<server> : this will wait for the specified server to
+    be removable, i.e. be in maintenance and no longer have any connection on
+    it.  Some conditions will never be accepted (e.g. not in maintenance) and
+    will cause the report of a specific error message indicating what condition
+    is not met. The server might even have been removed in parallel and no
+    longer exit. If everything is OK before the delay, a success is returned
+    and the operation is terminated.
 
   The default unit for the delay is milliseconds, though other units are
   accepted if suffixed with the usual timer units (us, ms, s, m, h, d). When
@@ -4033,7 +4272,7 @@ wait { -h | <delay> } [<condition> [<args>...]]
     $ socat -t5 /path/to/socket - <<< "
         disable server px/srv1
         shutdown sessions server px/srv1
-        wait 2s srv-unused px/srv1
+        wait 2s srv-removable px/srv1
         del server px/srv1"
 
 
@@ -4160,7 +4399,7 @@ reload
   return a reload status, once the reload was performed. Be careful with the
   timeout if a tool is used to parse it, it is only returned once the
   configuration is parsed and the new worker is forked. The "socat" command uses
-  a timeout of 0.5s by default so it will quits before showing the message if
+  a timeout of 0.5s by default so it will quit before showing the message if
   the reload is too long. "ncat" does not have a timeout by default.
   When compiled with USE_SHM_OPEN=1, the reload command is also able to dump
   the startup-logs of the master.
@@ -4194,7 +4433,7 @@ reload
   Note that a reload will close all connections to the master CLI.
   See also the "hard-reload" command.
 
-show proc
+show proc [debug]
   The master CLI introduces a 'show proc' command to surpervise the
   processe.
 
@@ -4215,6 +4454,10 @@ show proc
   worker is still running and survived 3 reloads. You could access the CLI of
   this worker to understand what's going on.
 
+  The 'debug' parameter is useful to show debug details, it currently shows the
+  FDs for IPC communication. Note that the debug output is not guaranteed to be
+  stable between haproxy versions.
+
 show startup-logs
   HAProxy needs to be compiled with USE_SHM_OPEN=1 to be used correctly on the
   master CLI or all messages won't be visible.
@@ -4226,6 +4469,29 @@ show startup-logs
   reload.
 
   Those messages are also dumped with the "reload" command.
+
+
+9.5. Stats-file
+--------------
+
+A so-called stats-file can be used to preload internal haproxy counters on
+process startup with non-null values. Its main purpose is to preserve
+statistics for worker processes across reloads. Only an excerpt of all the
+exposed haproxy statistics is present in a stats-file as it only makes sense to
+preload metric-type values.
+
+For the moment, only proxy counters are supported in stats-file. This allows to
+preload values for frontends, backends, servers and listeners. However only
+objects instances with a non-empty GUID are stored in a stats-file. This
+guarantees that value will be preloaded for object with matching type and GUID,
+even if other parameters differ.
+
+The CLI command "dump stats-file" purpose is to generate a stats-file. Format
+of the stats-file is internally defined and freely subject to future changes
+and extension. It is designed to be compatible at least across adjacent
+haproxy stable branch releases, but may require optional extra configuration
+when loading a stats-file to a process running on an older version.
+
 
 10. Tricks for easier configuration management
 ----------------------------------------------
@@ -4246,7 +4512,7 @@ using regular expressions involving the dollar symbol).
 
 Environment variables also make it convenient to write configurations which are
 expected to work on various sites where only the address changes. It can also
-permit to remove passwords from some configs. Example below where the the file
+permit to remove passwords from some configs. Example below where the file
 "site1.env" file is sourced by the init script upon startup :
 
   $ cat site1.env
@@ -4344,16 +4610,17 @@ connections are handled in parallel, though the "debug2ansi" and "debug2html"
 scripts found in the examples/ directory definitely help here by coloring the
 output.
 
-If a request or response is rejected because HAProxy finds it is malformed, the
-best thing to do is to connect to the CLI and issue "show errors", which will
-report the last captured faulty request and response for each frontend and
-backend, with all the necessary information to indicate precisely the first
-character of the input stream that was rejected. This is sometimes needed to
-prove to customers or to developers that a bug is present in their code. In
-this case it is often possible to relax the checks (but still keep the
-captures) using "option accept-invalid-http-request" or its equivalent for
-responses coming from the server "option accept-invalid-http-response". Please
-see the configuration manual for more details.
+If a HTTP/1.x request or response is rejected because HAProxy finds it is
+malformed, the best thing to do is to connect to the CLI and issue "show
+errors", which will report the last captured faulty HTTP/1.x request and
+response for each frontend and backend, with all the necessary information to
+indicate precisely the first character of the input stream that was
+rejected. This is sometimes needed to prove to customers or to developers that a
+bug is present in their code. In this case it is often possible to relax the
+checks (but still keep the captures) using "option
+accept-unsafe-violations-in-http-request" or its equivalent for responses coming
+from the server "option accept-unsafe-violations-in-http-response". Please see
+the configuration manual for more details.
 
 Example :
 
@@ -4558,3 +4825,73 @@ A safe configuration will have :
 
       stats socket /var/run/haproxy.stat uid hatop gid hatop mode 600
 
+13.1. Linux capabilities support
+------------------------------
+
+Since version v2.9 haproxy supports Linux capabilities. If the binary is
+compiled with USE_LINUX_CAP=1, it is able to preserve capabilities given in
+'setcap' keyword during switching from root user to a non-root.
+
+Since version v3.1 haproxy also checks if capabilities given in 'setcap'
+keyword were set in its binary file Permitted set by administrator
+(capget syscall). If this a case it performs transition of these capabilities
+in its process Effective set (capset syscall), while running as a non-root
+user.
+
+This was done to avoid all potential use cases when haproxy starts and runs as
+root: transparent proxy mode, binding to privileged ports.
+
+'setcap' keyword supports following network capabilities:
+- cap_net_admin: transparent proxying, binding socket to a specific network
+  interface, using set-mark action;
+- cap_net_raw (subset of cap_net_admin): transparent proxying;
+- cap_net_bind_service: binding socket to a specific network interface;
+- cap_sys_admin: creating socket in a specific network namespace.
+
+Haproxy never does the transition of these capabilities from its Permitted set
+to the Effective, if they are not listed as 'setcap' argument. See more
+information about 'setcap' keyword and supported capabilities in the chapter
+3.1 Process management and security in the Configuration guide.
+
+Administrator may add needed capabilities in the haproxy binary file Permitted
+set with the following command:
+
+Example:
+	# setcap cap_net_admin,cap_net_bind_service=p /usr/local/sbin/haproxy
+
+Added capabilities will be seen in process Permitted set after its start.
+If the same capabilities are the arguments of 'setcap' keyword, they could be
+also seen in the process Effective set. This could be check with the following
+command:
+
+Example:
+	# grep Cap /proc/<haproxy PID>/status
+	CapInh:	0000000000000000
+	CapPrm:	0000000000001400
+	CapEff:	0000000000001400
+	CapBnd:	000001ffffffffff
+	CapAmb:	0000000000000000
+
+See more details about setcap and capabilities sets in Linux man pages
+(capabilities(7)).
+
+In some use cases like transparent proxying or creating socket in a specific
+network namespace, configuration file parser detects that cap_net_raw or
+cap_sys_admin or some other supported capabilities are needed. Then, during
+the initialization stage, haproxy process checks, if these capabilities could
+be put in its Effective set. If it's not possible due to capget or capset
+syscall failure (restrictions set on syscalls by some security modules like
+SELinux, Seccomp, etc), process emits diagnostic warnings (start with -dD).
+
+Due to support of many different platforms with different system settings,
+it's impossible for the parser to deduce from the configuration file, if
+binding to privileged ports will be done. So, in the case of insufficient
+privileges (run as non-root) process will terminate only with an alert
+message like below. It's up to a user to recheck its configuration and haproxy
+binary capabilities set.
+
+Example:
+	$ haproxy -dD -f haproxy.cfg
+	...
+	[ALERT]    (96797) : Binding [haproxy.cfg:36] for frontend fe: cannot bind socket (Permission denied) for [0.0.0.0:80]
+	[ALERT]    (96797) : [haproxy.main()] Some protocols failed to start their listeners! Exiting.

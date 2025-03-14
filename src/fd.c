@@ -84,8 +84,8 @@
 
 #if defined(USE_POLL)
 #include <poll.h>
-#include <errno.h>
 #endif
+#include <errno.h>
 
 #include <haproxy/api.h>
 #include <haproxy/activity.h>
@@ -112,6 +112,7 @@ volatile struct fdlist update_list[MAX_TGROUPS]; // Global update list
 
 THREAD_LOCAL int *fd_updt  = NULL;  // FD updates list
 THREAD_LOCAL int  fd_nbupdt = 0;   // number of updates in the list
+THREAD_LOCAL int  fd_highest = -1; // highest FD known by the current thread
 THREAD_LOCAL int poller_rd_pipe = -1; // Pipe to wake the thread
 int poller_wr_pipe[MAX_THREADS] __read_mostly; // Pipe to wake the threads
 
@@ -354,8 +355,10 @@ void _fd_delete_orphan(int fd)
 	/* perform the close() call last as it's what unlocks the instant reuse
 	 * of this FD by any other thread.
 	 */
-	if (!fd_disown)
+	if (!fd_disown) {
+		fdtab[fd].generation++;
 		close(fd);
+	}
 	_HA_ATOMIC_DEC(&ha_used_fds);
 }
 
@@ -509,6 +512,8 @@ void fd_migrate_on(int fd, uint new_tid)
 int fd_takeover(int fd, void *expected_owner)
 {
 	unsigned long old;
+	int changing_tgid = 0;
+	int old_ltid, old_tgid;
 
 	/* protect ourself against a delete then an insert for the same fd,
 	 * if it happens, then the owner will no longer be the expected
@@ -517,17 +522,31 @@ int fd_takeover(int fd, void *expected_owner)
 	if (fdtab[fd].owner != expected_owner)
 		return -1;
 
-	/* we must be alone to work on this idle FD. If not, it means that its
-	 * poller is currently waking up and is about to use it, likely to
-	 * close it on shut/error, but maybe also to process any unexpectedly
-	 * pending data. It's also possible that the FD was closed and
-	 * reassigned to another thread group, so let's be careful.
-	 */
-	if (unlikely(!fd_grab_tgid(fd, ti->tgid)))
-		return -1;
+	/* We're taking a connection from a different thread group */
+	if ((fdtab[fd].refc_tgid & 0x7fff) != tgid) {
+		changing_tgid = 1;
+
+		old_tgid = fd_tgid(fd);
+		BUG_ON(atleast2(fdtab[fd].thread_mask));
+		old_ltid = my_ffsl(fdtab[fd].thread_mask) - 1;
+
+		if (unlikely(!fd_lock_tgid_cur(fd)))
+			return -1;
+	} else {
+		/* we must be alone to work on this idle FD. If not, it means that its
+		 * poller is currently waking up and is about to use it, likely to
+		 * close it on shut/error, but maybe also to process any unexpectedly
+		 * pending data. It's also possible that the FD was closed and
+		 * reassigned to another thread group, so let's be careful.
+		 */
+		if (unlikely(!fd_grab_tgid(fd, ti->tgid)))
+			return -1;
+	}
 
 	old = 0;
 	if (!HA_ATOMIC_CAS(&fdtab[fd].running_mask, &old, ti->ltid_bit)) {
+		if (changing_tgid)
+			fd_unlock_tgid(fd);
 		fd_drop_tgid(fd);
 		return -1;
 	}
@@ -535,11 +554,25 @@ int fd_takeover(int fd, void *expected_owner)
 	/* success, from now on it's ours */
 	HA_ATOMIC_STORE(&fdtab[fd].thread_mask, ti->ltid_bit);
 
+	/*
+	 * Change the tgid to our own tgid.
+	 * This removes the lock, we don't need it anymore, but we keep
+	 * the refcount.
+	 */
+	if (changing_tgid) {
+		fd_update_tgid(fd, tgid);
+		if (cur_poller.fixup_tgid_takeover)
+			cur_poller.fixup_tgid_takeover(&cur_poller, fd, old_ltid, old_tgid);
+	}
+
 	/* Make sure the FD doesn't have the active bit. It is possible that
 	 * the fd is polled by the thread that used to own it, the new thread
 	 * is supposed to call subscribe() later, to activate polling.
 	 */
 	fd_stop_recv(fd);
+
+	/* essentially for debugging */
+	fdtab[fd].nb_takeover++;
 
 	/* we're done with it */
 	HA_ATOMIC_AND(&fdtab[fd].running_mask, ~ti->ltid_bit);
@@ -836,7 +869,7 @@ void fd_reregister_all(int tgrp, ulong mask)
 {
 	int fd;
 
-	for (fd = 0; fd < global.maxsock; fd++) {
+	for (fd = 0; fd < fd_highest; fd++) {
 		if (!fdtab[fd].owner)
 			continue;
 
@@ -981,8 +1014,8 @@ void my_closefrom(int start)
 				break;
 		} while (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOMEM);
 
-		if (ret)
-			ret = fd - start;
+		/* always check the whole range */
+		ret = fd - start;
 
 		for (idx = 0; idx < ret; idx++) {
 			if (poll_events[idx].revents & POLLNVAL)
@@ -1019,32 +1052,6 @@ void my_closefrom(int start)
 }
 #endif // defined(USE_POLL)
 
-/* Sets the RLIMIT_NOFILE setting to <new_limit> and returns the previous one
- * in <old_limit> if the pointer is not NULL, even if set_rlimit() fails. The
- * two pointers may point to the same variable as the copy happens after
- * setting the new value. The value is only changed if at least one of the new
- * limits is strictly higher than the current one, otherwise returns 0 without
- * changing anything. The getrlimit() or setrlimit() syscall return value is
- * returned and errno is preserved.
- */
-int raise_rlim_nofile(struct rlimit *old_limit, struct rlimit *new_limit)
-{
-	struct rlimit limit = { };
-	int ret = 0;
-
-	ret = getrlimit(RLIMIT_NOFILE, &limit);
-
-	if (ret == 0 &&
-	    (limit.rlim_max < new_limit->rlim_max ||
-	     limit.rlim_cur < new_limit->rlim_cur)) {
-		ret = setrlimit(RLIMIT_NOFILE, new_limit);
-	}
-
-	if (old_limit)
-		*old_limit = limit;
-
-	return ret;
-}
 
 /* Computes the bounded poll() timeout based on the next expiration timer <next>
  * by bounding it to MAX_DELAY_MS. <next> may equal TICK_ETERNITY. The pollers
@@ -1108,6 +1115,7 @@ void poller_pipe_io_handler(int fd)
 static int alloc_pollers_per_thread()
 {
 	fd_updt = calloc(global.maxsock, sizeof(*fd_updt));
+	vma_set_name_id(fd_updt, global.maxsock * sizeof(*fd_updt), "fd", "fd_updt", tid + 1);
 	return fd_updt != NULL;
 }
 
@@ -1158,10 +1166,11 @@ int init_pollers()
 	int p;
 	struct poller *bp;
 
-	if ((fdtab_addr = calloc(global.maxsock, sizeof(*fdtab) + 64)) == NULL) {
+	if ((fdtab_addr = calloc(1, global.maxsock * sizeof(*fdtab) + 64)) == NULL) {
 		ha_alert("Not enough memory to allocate %d entries for fdtab!\n", global.maxsock);
 		goto fail_tab;
 	}
+	vma_set_name(fdtab_addr, global.maxsock * sizeof(*fdtab) + 64, "fd", "fdtab_addr");
 
 	/* always provide an aligned fdtab */
 	fdtab = (struct fdtab*)((((size_t)fdtab_addr) + 63) & -(size_t)64);
@@ -1170,11 +1179,13 @@ int init_pollers()
 		ha_alert("Not enough memory to allocate %d entries for polled_mask!\n", global.maxsock);
 		goto fail_polledmask;
 	}
+	vma_set_name(polled_mask, global.maxsock * sizeof(*polled_mask), "fd", "polled_mask");
 
 	if ((fdinfo = calloc(global.maxsock, sizeof(*fdinfo))) == NULL) {
 		ha_alert("Not enough memory to allocate %d entries for fdinfo!\n", global.maxsock);
 		goto fail_info;
 	}
+	vma_set_name(fdinfo, global.maxsock * sizeof(*fdinfo), "fd", "fdinfo");
 
 	for (p = 0; p < MAX_TGROUPS; p++)
 		update_list[p].first = update_list[p].last = -1;
@@ -1293,7 +1304,7 @@ int list_pollers(FILE *out)
 int fork_poller()
 {
 	int fd;
-	for (fd = 0; fd < global.maxsock; fd++) {
+	for (fd = 0; fd < fd_highest; fd++) {
 		if (fdtab[fd].owner) {
 			HA_ATOMIC_OR(&fdtab[fd].state, FD_CLONED);
 		}

@@ -27,6 +27,8 @@
 #include <haproxy/istbuf.h>
 #include <haproxy/list.h>
 #include <haproxy/log.h>
+#include <haproxy/global.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/sink.h>
 #include <haproxy/trace.h>
 
@@ -89,19 +91,18 @@ int __trace_enabled(enum trace_level level, uint64_t mask, struct trace_source *
 		    const void *a1, const void *a2, const void *a3, const void *a4,
 		    const void **plockptr)
 {
-	const struct listener *li = NULL;
-	const struct proxy *fe = NULL;
-	const struct proxy *be = NULL;
-	const struct server *srv = NULL;
-	const struct session *sess = NULL;
-	const struct stream *strm = NULL;
-	const struct connection *conn = NULL;
-	const struct check *check = NULL;
-	const struct quic_conn *qc = NULL;
-	const struct appctx *appctx = NULL;
 	const void *lockon_ptr = NULL;
+	const struct trace_source *origin = NULL;
+	struct trace_ctx ctx = { };
 
-	if (likely(src->state == TRACE_STATE_STOPPED))
+	/* in case we also follow another one (e.g. session) */
+	origin = HA_ATOMIC_LOAD(&src->follow);
+
+	/* Trace can be temporarily disabled via trace_disable(). */
+	if (likely(src->state == TRACE_STATE_STOPPED) && !origin)
+		return 0;
+
+	if (th_ctx->trc_disable_ctr)
 		return 0;
 
 	/* check that at least one action is interested by this event */
@@ -110,60 +111,67 @@ int __trace_enabled(enum trace_level level, uint64_t mask, struct trace_source *
 
 	/* retrieve available information from the caller's arguments */
 	if (src->arg_def & TRC_ARGS_CONN)
-		conn = trace_pick_arg(src->arg_def & TRC_ARGS_CONN, a1, a2, a3, a4);
+		ctx.conn = trace_pick_arg(src->arg_def & TRC_ARGS_CONN, a1, a2, a3, a4);
 
 	if (src->arg_def & TRC_ARGS_SESS)
-		sess = trace_pick_arg(src->arg_def & TRC_ARGS_SESS, a1, a2, a3, a4);
+		ctx.sess = trace_pick_arg(src->arg_def & TRC_ARGS_SESS, a1, a2, a3, a4);
 
 	if (src->arg_def & TRC_ARGS_STRM)
-		strm = trace_pick_arg(src->arg_def & TRC_ARGS_STRM, a1, a2, a3, a4);
+		ctx.strm = trace_pick_arg(src->arg_def & TRC_ARGS_STRM, a1, a2, a3, a4);
 
 	if (src->arg_def & TRC_ARGS_CHK)
-		check = trace_pick_arg(src->arg_def & TRC_ARGS_CHK, a1, a2, a3, a4);
+		ctx.check = trace_pick_arg(src->arg_def & TRC_ARGS_CHK, a1, a2, a3, a4);
 
 	if (src->arg_def & TRC_ARGS_QCON)
-		qc = trace_pick_arg(src->arg_def & TRC_ARGS_QCON, a1, a2, a3, a4);
+		ctx.qc = trace_pick_arg(src->arg_def & TRC_ARGS_QCON, a1, a2, a3, a4);
 
 	if (src->arg_def & TRC_ARGS_APPCTX)
-		appctx = trace_pick_arg(src->arg_def & TRC_ARGS_APPCTX, a1, a2, a3, a4);
+		ctx.appctx = trace_pick_arg(src->arg_def & TRC_ARGS_APPCTX, a1, a2, a3, a4);
 
-	if (!sess && strm)
-		sess = strm->sess;
-	else if (!sess && conn && LIST_INLIST(&conn->session_list))
-		sess = conn->owner;
-	else if (!sess && check)
-		sess = check->sess;
-	else if (!sess && appctx)
-		sess = appctx->sess;
+	if (src->fill_ctx)
+		src->fill_ctx(&ctx, src, a1, a2, a3, a4);
 
-	if (sess) {
-		fe = sess->fe;
-		li = sess->listener;
+#ifdef USE_QUIC
+	if (ctx.qc && !ctx.conn)
+		ctx.conn = ctx.qc->conn;
+#endif
+	if (!ctx.sess && ctx.strm)
+		ctx.sess = ctx.strm->sess;
+	else if (!ctx.sess && ctx.conn && LIST_INLIST(&ctx.conn->sess_el))
+		ctx.sess = ctx.conn->owner;
+	else if (!ctx.sess && ctx.check)
+		ctx.sess = ctx.check->sess;
+	else if (!ctx.sess && ctx.appctx)
+		ctx.sess = ctx.appctx->sess;
+
+	if (ctx.sess) {
+		ctx.fe = ctx.sess->fe;
+		ctx.li = ctx.sess->listener;
 	}
 
-	if (!li && conn)
-		li = objt_listener(conn->target);
+	if (!ctx.li && ctx.conn)
+		ctx.li = objt_listener(ctx.conn->target);
 
-	if (li && !fe)
-		fe = li->bind_conf->frontend;
+	if (ctx.li && !ctx.fe)
+		ctx.fe = ctx.li->bind_conf->frontend;
 
-	if (strm) {
-		be = strm->be;
-		srv = strm->srv_conn;
+	if (ctx.strm) {
+		ctx.be = ctx.strm->be;
+		ctx.srv = ctx.strm->srv_conn;
 	}
-	if (check) {
-		srv = check->server;
-		be = (srv ? srv->proxy : NULL);
+	if (ctx.check) {
+		ctx.srv = ctx.check->server;
+		ctx.be = (ctx.srv ? ctx.srv->proxy : NULL);
 	}
 
-	if (!srv && conn)
-		srv = objt_server(conn->target);
+	if (!ctx.srv && ctx.conn)
+		ctx.srv = objt_server(ctx.conn->target);
 
-	if (srv && !be)
-		be = srv->proxy;
+	if (ctx.srv && !ctx.be)
+		ctx.be = ctx.srv->proxy;
 
-	if (!be && conn)
-		be = objt_proxy(conn->target);
+	if (!ctx.be && ctx.conn)
+		ctx.be = objt_proxy(ctx.conn->target);
 
 	/* TODO: add handling of filters here, return if no match (not even update states) */
 
@@ -179,29 +187,57 @@ int __trace_enabled(enum trace_level level, uint64_t mask, struct trace_source *
 	/* we may want to lock on a particular object */
 	if (src->lockon != TRACE_LOCKON_NOTHING) {
 		switch (src->lockon) {
-		case TRACE_LOCKON_BACKEND:    lockon_ptr = be;     break;
-		case TRACE_LOCKON_CONNECTION: lockon_ptr = conn;   break;
-		case TRACE_LOCKON_FRONTEND:   lockon_ptr = fe;     break;
-		case TRACE_LOCKON_LISTENER:   lockon_ptr = li;     break;
-		case TRACE_LOCKON_SERVER:     lockon_ptr = srv;    break;
-		case TRACE_LOCKON_SESSION:    lockon_ptr = sess;   break;
-		case TRACE_LOCKON_STREAM:     lockon_ptr = strm;   break;
-		case TRACE_LOCKON_CHECK:      lockon_ptr = check;  break;
-		case TRACE_LOCKON_THREAD:     lockon_ptr = ti;     break;
-		case TRACE_LOCKON_QCON:       lockon_ptr = qc;     break;
-		case TRACE_LOCKON_APPCTX:     lockon_ptr = appctx; break;
-		case TRACE_LOCKON_ARG1:       lockon_ptr = a1;     break;
-		case TRACE_LOCKON_ARG2:       lockon_ptr = a2;     break;
-		case TRACE_LOCKON_ARG3:       lockon_ptr = a3;     break;
-		case TRACE_LOCKON_ARG4:       lockon_ptr = a4;     break;
+		case TRACE_LOCKON_BACKEND:    lockon_ptr = ctx.be;     break;
+		case TRACE_LOCKON_CONNECTION: lockon_ptr = ctx.conn;   break;
+		case TRACE_LOCKON_FRONTEND:   lockon_ptr = ctx.fe;     break;
+		case TRACE_LOCKON_LISTENER:   lockon_ptr = ctx.li;     break;
+		case TRACE_LOCKON_SERVER:     lockon_ptr = ctx.srv;    break;
+		case TRACE_LOCKON_SESSION:    lockon_ptr = ctx.sess;   break;
+		case TRACE_LOCKON_STREAM:     lockon_ptr = ctx.strm;   break;
+		case TRACE_LOCKON_CHECK:      lockon_ptr = ctx.check;  break;
+		case TRACE_LOCKON_THREAD:     lockon_ptr = ti;         break;
+		case TRACE_LOCKON_QCON:       lockon_ptr = ctx.qc;     break;
+		case TRACE_LOCKON_APPCTX:     lockon_ptr = ctx.appctx; break;
+		case TRACE_LOCKON_ARG1:       lockon_ptr = a1;         break;
+		case TRACE_LOCKON_ARG2:       lockon_ptr = a2;         break;
+		case TRACE_LOCKON_ARG3:       lockon_ptr = a3;         break;
+		case TRACE_LOCKON_ARG4:       lockon_ptr = a4;         break;
 		default: break; // silence stupid gcc -Wswitch
 		}
 
 		if (src->lockon_ptr && src->lockon_ptr != lockon_ptr)
 			return 0;
 
-		if (*plockptr && !src->lockon_ptr && lockon_ptr && src->state == TRACE_STATE_RUNNING)
+		if (plockptr && !src->lockon_ptr && lockon_ptr && src->state == TRACE_STATE_RUNNING)
 			*plockptr = lockon_ptr;
+	}
+
+	/* or we may also follow another source's locked pointer */
+	if (origin) {
+		if (!origin->lockon_ptr)
+			return 0;
+
+		switch (origin->lockon) {
+		case TRACE_LOCKON_BACKEND:    lockon_ptr = ctx.be;     break;
+		case TRACE_LOCKON_CONNECTION: lockon_ptr = ctx.conn;   break;
+		case TRACE_LOCKON_FRONTEND:   lockon_ptr = ctx.fe;     break;
+		case TRACE_LOCKON_LISTENER:   lockon_ptr = ctx.li;     break;
+		case TRACE_LOCKON_SERVER:     lockon_ptr = ctx.srv;    break;
+		case TRACE_LOCKON_SESSION:    lockon_ptr = ctx.sess;   break;
+		case TRACE_LOCKON_STREAM:     lockon_ptr = ctx.strm;   break;
+		case TRACE_LOCKON_CHECK:      lockon_ptr = ctx.check;  break;
+		case TRACE_LOCKON_THREAD:     lockon_ptr = ti;         break;
+		case TRACE_LOCKON_QCON:       lockon_ptr = ctx.qc;     break;
+		case TRACE_LOCKON_APPCTX:     lockon_ptr = ctx.appctx; break;
+		case TRACE_LOCKON_ARG1:       lockon_ptr = a1;         break;
+		case TRACE_LOCKON_ARG2:       lockon_ptr = a2;         break;
+		case TRACE_LOCKON_ARG3:       lockon_ptr = a3;         break;
+		case TRACE_LOCKON_ARG4:       lockon_ptr = a4;         break;
+		default: break; // silence stupid gcc -Wswitch
+		}
+
+		if (origin->lockon_ptr != lockon_ptr)
+			return 0;
 	}
 
 	/* here the trace is running and is tracking a desired item */
@@ -313,11 +349,7 @@ void trace_no_cb(enum trace_level level, uint64_t mask, const struct trace_sourc
 	/* do nothing */
 }
 
-/* registers trace source <source>. Modifies the list element!
- * The {start,pause,stop,report} events are not changed so the source may
- * preset them.
- */
-void trace_register_source(struct trace_source *source)
+static void trace_source_reset(struct trace_source *source)
 {
 	source->lockon = TRACE_LOCKON_NOTHING;
 	source->level = TRACE_LEVEL_USER;
@@ -325,6 +357,16 @@ void trace_register_source(struct trace_source *source)
 	source->sink = NULL;
 	source->state = TRACE_STATE_STOPPED;
 	source->lockon_ptr = NULL;
+	source->cmdline = 0;
+}
+
+/* registers trace source <source>. Modifies the list element!
+ * The {start,pause,stop,report} events are not changed so the source may
+ * preset them.
+ */
+void trace_register_source(struct trace_source *source)
+{
+	trace_source_reset(source);
 	LIST_APPEND(&trace_sources, &source->source_link);
 }
 
@@ -376,15 +418,16 @@ static int trace_source_parse_verbosity(struct trace_source *src,
 	const struct name_desc *nd;
 	int ret;
 
+	/* Only "quiet" is defined for all sources. Other identifiers are
+	 * specific to trace source.
+	 */
 	if (strcmp(verbosity, "quiet") == 0) {
 		ret = 0;
 		goto end;
 	}
 
-	/* Only "quiet" is defined for all sources. Other identifiers are
-	 * specific to trace source.
-	 */
-	BUG_ON(!src);
+	if (!src)
+		return -1;
 
 	if (!src->decoding || !src->decoding[0].name) {
 		if (strcmp(verbosity, "default") != 0)
@@ -407,6 +450,45 @@ static int trace_source_parse_verbosity(struct trace_source *src,
 	return ret;
 }
 
+/* helper to get trace source sink name. Behavior is different during parsing
+ * time (<file> != NULL) and during runtime: this is to make sure that during
+ * parsing time sink name is properly postresolved
+ *
+ * Returns the sink pointer on success and NULL on error. <msg> will be set
+ * in case of error.
+ */
+static struct sink *_trace_get_sink(const char *name, char **msg,
+                                    const char *file, int line)
+{
+	struct sink *sink = NULL;
+
+	if (file) {
+		/* only during parsing time */
+		sink = sink_find_early(name, "traces", file, line);
+		if (!sink) {
+			memprintf(msg, "Memory error while setting up sink '%s' \n", name);
+			return NULL;
+		}
+	} else {
+		/* runtime */
+		sink = sink_find(name);
+		if (!sink) {
+			memprintf(msg, "No such trace sink '%s' \n", name);
+			return NULL;
+		}
+	}
+	return sink;
+}
+
+/* Returns true if <src> trace source configuration can be changed. */
+static int trace_enforce_origin_priority(const struct trace_source *src)
+{
+	/* Trace cannot be modified via configuration file (during startup) if
+	 * already activated via -dt command line argument.
+	 */
+	return !src->cmdline || !(global.mode & MODE_STARTING);
+}
+
 /* Parse a "trace" statement. Returns a severity as a LOG_* level and a status
  * message that may be delivered to the user, in <msg>. The message will be
  * nulled first and msg must be an allocated pointer. A null status message output
@@ -415,10 +497,11 @@ static int trace_source_parse_verbosity(struct trace_source *src,
  * function may/will use the trash buffer as the storage for the response
  * message so that the caller never needs to release anything.
  */
-static int trace_parse_statement(char **args, char **msg)
+static int _trace_parse_statement(char **args, char **msg, const char *file, int line)
 {
-	struct trace_source *src;
+	struct trace_source *orig_src, *src;
 	uint64_t *ev_ptr = NULL;
+	int cur_arg;
 
 	/* no error by default */
 	*msg = NULL;
@@ -428,6 +511,7 @@ static int trace_parse_statement(char **args, char **msg)
 		chunk_printf(&trash,
 			     "Supported trace sources and states (.=stopped, w=waiting, R=running) :\n"
 			     " [.] 0          : not a source, will immediately stop all traces\n"
+			     " [.] all        : all sources below, only for 'sink', 'level' and 'follow'\n"
 			     );
 
 		list_for_each_entry(src, &trace_sources, source_link)
@@ -446,18 +530,25 @@ static int trace_parse_statement(char **args, char **msg)
 		return LOG_NOTICE;
 	}
 
-	src = trace_find_source(args[1]);
-	if (!src) {
-		memprintf(msg, "No such trace source '%s'", args[1]);
-		return LOG_ERR;
+	if (strcmp(args[1], "all") == 0) {
+		orig_src = NULL;
+	}
+	else {
+		orig_src = trace_find_source(args[1]);
+		if (!orig_src) {
+			memprintf(msg, "No such trace source '%s'", args[1]);
+			return LOG_ERR;
+		}
 	}
 
-	if (!*args[2]) {
+	cur_arg = 2;
+	if (!*args[cur_arg]) {
 		*msg =  "Supported commands:\n"
 			"  event     : list/enable/disable source-specific event reporting\n"
 			//"  filter    : list/enable/disable generic filters\n"
 			"  level     : list/set trace reporting level\n"
 			"  lock      : automatic lock on thread/connection/stream/...\n"
+			"  follow    : passively follow another source's locked pointer (e.g. session)\n"
 			"  pause     : pause and automatically restart after a specific event\n"
 			"  sink      : list/set event sinks\n"
 			"  start     : start immediately or after a specific event\n"
@@ -466,12 +557,75 @@ static int trace_parse_statement(char **args, char **msg)
 		*msg = strdup(*msg);
 		return LOG_WARNING;
 	}
-	else if ((strcmp(args[2], "event") == 0 && (ev_ptr = &src->report_events)) ||
-	         (strcmp(args[2], "pause") == 0 && (ev_ptr = &src->pause_events)) ||
-	         (strcmp(args[2], "start") == 0 && (ev_ptr = &src->start_events)) ||
-	         (strcmp(args[2], "stop")  == 0 && (ev_ptr = &src->stop_events))) {
+
+  next_stmt:
+	if (!*args[cur_arg])
+		goto out;
+
+	src = orig_src;
+	if (src == NULL &&
+	    strcmp(args[cur_arg], "follow") != 0 &&
+	    strcmp(args[cur_arg], "sink") != 0 &&
+	    strcmp(args[cur_arg], "level") != 0) {
+		memprintf(msg, "'%s' not applicable to meta-source 'all'", args[cur_arg]);
+		return LOG_ERR;
+	}
+
+	if (src && !trace_enforce_origin_priority(src))
+		goto out;
+
+	if (strcmp(args[cur_arg], "follow") == 0) {
+		const struct trace_source *origin = src ? HA_ATOMIC_LOAD(&src->follow) : NULL;
+
+		if (!*args[cur_arg+1]) {
+			/* no arg => report the list of supported sources as a warning */
+			if (origin)
+				chunk_printf(&trash, "Currently following source '%s'.\n", origin->name.ptr);
+			else if (src)
+				chunk_printf(&trash, "Not currently following any other source.\n");
+			else
+				chunk_reset(&trash);
+
+			chunk_appendf(&trash,
+				     "Please specify another source to follow, among the following ones:\n"
+				     " [.] none       : follow no other source\n"
+				     );
+
+			list_for_each_entry(origin, &trace_sources, source_link)
+				chunk_appendf(&trash, " [%c] %-10s : %s\n", trace_state_char(origin->state), origin->name.ptr, origin->desc);
+
+			trash.area[trash.data] = 0;
+			*msg = strdup(trash.area);
+			return LOG_WARNING;
+		}
+
+		origin = NULL;
+		if (strcmp(args[cur_arg+1], "none") != 0) {
+			origin = trace_find_source(args[cur_arg+1]);
+			if (!origin) {
+				memprintf(msg, "No such trace source '%s'", args[cur_arg+1]);
+				return LOG_ERR;
+			}
+		}
+
+		if (src) {
+			HA_ATOMIC_STORE(&src->follow, origin);
+		}
+		else {
+			list_for_each_entry(src, &trace_sources, source_link) {
+				if (src != origin && trace_enforce_origin_priority(src))
+					HA_ATOMIC_STORE(&src->follow, origin);
+			}
+		}
+		cur_arg += 2;
+		goto next_stmt;
+	}
+	else if ((strcmp(args[cur_arg], "event") == 0 && (ev_ptr = &src->report_events)) ||
+	         (strcmp(args[cur_arg], "pause") == 0 && (ev_ptr = &src->pause_events)) ||
+	         (strcmp(args[cur_arg], "start") == 0 && (ev_ptr = &src->start_events)) ||
+	         (strcmp(args[cur_arg], "stop")  == 0 && (ev_ptr = &src->stop_events))) {
 		const struct trace_event *ev;
-		const char *name = args[3];
+		const char *name = args[cur_arg+1];
 		int neg = 0;
 		int i;
 
@@ -502,6 +656,13 @@ static int trace_parse_statement(char **args, char **msg)
 			return LOG_WARNING;
 		}
 
+		/* state transitions:
+		 *   - "start now" => TRACE_STATE_RUNNING
+		 *   - "stop now"  => TRACE_STATE_STOPPED
+		 *   - "pause now" => TRACE_STATE_WAITING
+		 *   - "start <evt>" && STATE_STOPPED => TRACE_STATE_WAITING
+		 */
+
 		if (strcmp(name, "now") == 0 && ev_ptr != &src->report_events) {
 			HA_ATOMIC_STORE(ev_ptr, 0);
 			if (ev_ptr == &src->pause_events) {
@@ -515,14 +676,19 @@ static int trace_parse_statement(char **args, char **msg)
 				HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 				HA_ATOMIC_STORE(&src->state, TRACE_STATE_STOPPED);
 			}
-			return 0;
 		}
-
-		if (strcmp(name, "none") == 0)
+		else if (strcmp(name, "none") == 0)
 			HA_ATOMIC_STORE(ev_ptr, 0);
-		else if (strcmp(name, "any") == 0)
+		else if (strcmp(name, "any") == 0) {
+			enum trace_state old = TRACE_STATE_STOPPED;
+
 			HA_ATOMIC_STORE(ev_ptr, ~0);
+			if (ev_ptr == &src->start_events)
+				HA_ATOMIC_CAS(&src->state, &old, TRACE_STATE_WAITING);
+		}
 		else {
+			enum trace_state old = TRACE_STATE_STOPPED;
+
 			ev = trace_find_event(src->known_events, name);
 			if (!ev) {
 				memprintf(msg, "No such trace event '%s'", name);
@@ -533,20 +699,28 @@ static int trace_parse_statement(char **args, char **msg)
 				HA_ATOMIC_OR(ev_ptr, ev->mask);
 			else
 				HA_ATOMIC_AND(ev_ptr, ~ev->mask);
+
+			if (ev_ptr == &src->start_events && HA_ATOMIC_LOAD(ev_ptr) != 0)
+				HA_ATOMIC_CAS(&src->state, &old, TRACE_STATE_WAITING);
 		}
+
+		cur_arg += 2;
+		goto next_stmt;
 	}
-	else if (strcmp(args[2], "sink") == 0) {
-		const char *name = args[3];
+	else if (strcmp(args[cur_arg], "sink") == 0) {
+		const char *name = args[cur_arg+1];
 		struct sink *sink;
 
 		if (!*name) {
-			chunk_printf(&trash, "Supported sinks for source %s (*=current):\n", src->name.ptr);
-			chunk_appendf(&trash, "  %c none       : no sink\n", src->sink ? ' ' : '*');
+			chunk_printf(&trash, "Supported sinks for source %s (*=current):\n", src ? src->name.ptr : "all");
+			chunk_appendf(&trash, "  %c none       : no sink\n", src && src->sink ? ' ' : '*');
 			list_for_each_entry(sink, &sink_list, sink_list) {
 				chunk_appendf(&trash, "  %c %-10s : %s\n",
-					      src->sink == sink ? '*' : ' ',
+					      src && src->sink == sink ? '*' : ' ',
 					      sink->name, sink->desc);
 			}
+			if (file)
+				chunk_appendf(&trash, "(forward-declared sinks are not displayed here!)\n");
 			trash.area[trash.data] = 0;
 			*msg = strdup(trash.area);
 			return LOG_WARNING;
@@ -555,48 +729,68 @@ static int trace_parse_statement(char **args, char **msg)
 		if (strcmp(name, "none") == 0)
 			sink = NULL;
 		else {
-			sink = sink_find(name);
-			if (!sink) {
-				memprintf(msg, "No such trace sink '%s'", name);
+			sink = _trace_get_sink(name, msg, file, line);
+			if (!sink)
 				return LOG_ERR;
+		}
+
+		if (src) {
+			HA_ATOMIC_STORE(&src->sink, sink);
+		}
+		else {
+			list_for_each_entry(src, &trace_sources, source_link) {
+				if (trace_enforce_origin_priority(src))
+					HA_ATOMIC_STORE(&src->sink, sink);
 			}
 		}
 
-		HA_ATOMIC_STORE(&src->sink, sink);
+		cur_arg += 2;
+		goto next_stmt;
 	}
-	else if (strcmp(args[2], "level") == 0) {
-		const char *name = args[3];
-		int level;
+	else if (strcmp(args[cur_arg], "level") == 0) {
+		const char *name = args[cur_arg+1];
+		int level = -1;
 
-		if (!*name) {
-			chunk_printf(&trash, "Supported trace levels for source %s:\n", src->name.ptr);
+		if (*name)
+			level = trace_parse_level(name);
+
+		if (level < 0) {
+			chunk_reset(&trash);
+			if (*name)
+				chunk_appendf(&trash, "No such trace level '%s'. ", name);
+			chunk_appendf(&trash, "Supported trace levels for source %s:\n", src ? src->name.ptr : "all");
 			chunk_appendf(&trash, "  %c error      : report errors\n",
-				      src->level == TRACE_LEVEL_ERROR ? '*' : ' ');
+				      src && src->level == TRACE_LEVEL_ERROR ? '*' : ' ');
 			chunk_appendf(&trash, "  %c user       : also information useful to the end user\n",
-				      src->level == TRACE_LEVEL_USER ? '*' : ' ');
+				      src && src->level == TRACE_LEVEL_USER ? '*' : ' ');
 			chunk_appendf(&trash, "  %c proto      : also protocol-level updates\n",
-				      src->level == TRACE_LEVEL_PROTO ? '*' : ' ');
+				      src && src->level == TRACE_LEVEL_PROTO ? '*' : ' ');
 			chunk_appendf(&trash, "  %c state      : also report internal state changes\n",
-				      src->level == TRACE_LEVEL_STATE ? '*' : ' ');
+				      src && src->level == TRACE_LEVEL_STATE ? '*' : ' ');
 			chunk_appendf(&trash, "  %c data       : also report data transfers\n",
-				      src->level == TRACE_LEVEL_DATA ? '*' : ' ');
+				      src && src->level == TRACE_LEVEL_DATA ? '*' : ' ');
 			chunk_appendf(&trash, "  %c developer  : also report information useful only to the developer\n",
-				      src->level == TRACE_LEVEL_DEVELOPER ? '*' : ' ');
+				      src && src->level == TRACE_LEVEL_DEVELOPER ? '*' : ' ');
 			trash.area[trash.data] = 0;
 			*msg = strdup(trash.area);
-			return LOG_WARNING;
+			return *name ? LOG_ERR : LOG_WARNING;
 		}
 
-		level = trace_parse_level(name);
-		if (level < 0) {
-			memprintf(msg, "No such trace level '%s'", name);
-			return LOG_ERR;
+		if (src) {
+			HA_ATOMIC_STORE(&src->level, level);
+		}
+		else {
+			list_for_each_entry(src, &trace_sources, source_link) {
+				if (trace_enforce_origin_priority(src))
+					HA_ATOMIC_STORE(&src->level, level);
+			}
 		}
 
-		HA_ATOMIC_STORE(&src->level, level);
+		cur_arg += 2;
+		goto next_stmt;
 	}
-	else if (strcmp(args[2], "lock") == 0) {
-		const char *name = args[3];
+	else if (strcmp(args[cur_arg], "lock") == 0) {
+		const char *name = args[cur_arg+1];
 
 		if (!*name) {
 			chunk_printf(&trash, "Supported lock-on criteria for source %s:\n", src->name.ptr);
@@ -608,15 +802,15 @@ static int trace_parse_statement(char **args, char **msg)
 				chunk_appendf(&trash, "  %c check      : lock on the check that started the trace\n",
 				              src->lockon == TRACE_LOCKON_CHECK ? '*' : ' ');
 
-			if (src->arg_def & TRC_ARGS_CONN)
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON))
 				chunk_appendf(&trash, "  %c connection : lock on the connection that started the trace\n",
 				              src->lockon == TRACE_LOCKON_CONNECTION ? '*' : ' ');
 
-			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM))
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c frontend   : lock on the frontend that started the trace\n",
 				              src->lockon == TRACE_LOCKON_FRONTEND ? '*' : ' ');
 
-			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM))
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c listener   : lock on the listener that started the trace\n",
 				              src->lockon == TRACE_LOCKON_LISTENER ? '*' : ' ');
 
@@ -626,8 +820,12 @@ static int trace_parse_statement(char **args, char **msg)
 			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c server     : lock on the server that started the trace\n",
 				              src->lockon == TRACE_LOCKON_SERVER ? '*' : ' ');
-
-			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM))
+#ifdef USE_QUIC
+			if (src->arg_def & TRC_ARGS_QCON)
+				chunk_appendf(&trash, "  %c qconn      : lock on the QUIC connection that started the trace\n",
+				              src->lockon == TRACE_LOCKON_QCON ? '*' : ' ');
+#endif
+			if (src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM))
 				chunk_appendf(&trash, "  %c session    : lock on the session that started the trace\n",
 				              src->lockon == TRACE_LOCKON_SESSION ? '*' : ' ');
 
@@ -674,15 +872,15 @@ static int trace_parse_statement(char **args, char **msg)
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_CHECK);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & TRC_ARGS_CONN) && strcmp(name, "connection") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON)) && strcmp(name, "connection") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_CONNECTION);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "frontend") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "frontend") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_FRONTEND);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "listener") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "listener") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_LISTENER);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
@@ -694,8 +892,12 @@ static int trace_parse_statement(char **args, char **msg)
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_SERVER);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
-		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "session") == 0) {
+		else if ((src->arg_def & (TRC_ARGS_CONN|TRC_ARGS_QCON|TRC_ARGS_SESS|TRC_ARGS_STRM)) && strcmp(name, "session") == 0) {
 			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_SESSION);
+			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
+		}
+		else if ((src->arg_def & TRC_ARGS_QCON) && strcmp(name, "qconn") == 0) {
+			HA_ATOMIC_STORE(&src->lockon, TRACE_LOCKON_QCON);
 			HA_ATOMIC_STORE(&src->lockon_ptr, NULL);
 		}
 		else if ((src->arg_def & TRC_ARGS_STRM) && strcmp(name, "stream") == 0) {
@@ -730,14 +932,23 @@ static int trace_parse_statement(char **args, char **msg)
 			memprintf(msg, "Unsupported lock-on criterion '%s'", name);
 			return LOG_ERR;
 		}
-	}
-	else if (strcmp(args[2], "verbosity") == 0) {
-		const char *name = args[3];
-		const struct name_desc *nd;
-		int verbosity;
 
-		if (!*name) {
-			chunk_printf(&trash, "Supported trace verbosities for source %s:\n", src->name.ptr);
+		cur_arg += 2;
+		goto next_stmt;
+	}
+	else if (strcmp(args[cur_arg], "verbosity") == 0) {
+		const char *name = args[cur_arg+1];
+		const struct name_desc *nd;
+		int verbosity = -1;
+
+		if (*name)
+			verbosity = trace_source_parse_verbosity(src, name);
+
+		if (verbosity < 0) {
+			chunk_reset(&trash);
+			if (*name)
+				chunk_appendf(&trash, "No such verbosity level '%s'. ", name);
+			chunk_appendf(&trash, "Supported trace verbosities for source %s:\n", src->name.ptr);
 			chunk_appendf(&trash, "  %c quiet      : only report basic information with no decoding\n",
 				      src->verbosity == 0 ? '*' : ' ');
 			if (!src->decoding || !src->decoding[0].name) {
@@ -751,42 +962,80 @@ static int trace_parse_statement(char **args, char **msg)
 			}
 			trash.area[trash.data] = 0;
 			*msg = strdup(trash.area);
-			return LOG_WARNING;
-		}
-
-		verbosity = trace_source_parse_verbosity(src, name);
-		if (verbosity < 0) {
-			memprintf(msg, "No such verbosity level '%s'", name);
-			return LOG_ERR;
+			return *name ? LOG_ERR : LOG_WARNING;
 		}
 
 		HA_ATOMIC_STORE(&src->verbosity, verbosity);
+
+		cur_arg += 2;
+		goto next_stmt;
 	}
 	else {
-		memprintf(msg, "Unknown trace keyword '%s'", args[2]);
+		memprintf(msg, "Unknown trace keyword '%s'", args[cur_arg]);
 		return LOG_ERR;
 	}
+
+  out:
 	return 0;
 
 }
 
+/* same as _trace_parse_statement but when no file:line context is available
+ * (during runtime)
+ */
+static int trace_parse_statement(char **args, char **msg)
+{
+	return _trace_parse_statement(args, msg, NULL, 0);
+}
+
 void _trace_parse_cmd(struct trace_source *src, int level, int verbosity)
 {
+	trace_source_reset(src);
 	src->sink = sink_find("stderr");
 	src->level = level >= 0 ? level : TRACE_LEVEL_ERROR;
 	src->verbosity = verbosity >= 0 ? verbosity : 1;
 	src->state = TRACE_STATE_RUNNING;
+	src->cmdline = 1;
 }
 
 /* Parse a process argument specified via "-dt".
  *
  * Returns 0 on success else non-zero.
  */
-int trace_parse_cmd(char *arg, char **errmsg)
+int trace_parse_cmd(const char *arg_src, char **errmsg)
 {
 	char *str;
+	char *arg, *oarg;
+	char *saveptr;
 
-	if (!arg) {
+	if (arg_src) {
+		if (strcmp(arg_src, "help") == 0) {
+			memprintf(errmsg,
+			  "-dt activates traces on stderr output via the command-line.\n"
+			  "Without argument, all registered trace sources are activated with error level as filter.\n"
+			  "A list can be specified as argument to configure several trace sources with comma as separator.\n"
+			  "Each entry can contains the trace name, a log level and a verbosity using colon as separator.\n"
+			  "Every fields are optional and can be left empty, or with a colon to specify the next one.\n\n"
+			  "An empty name or the alias 'all' will activate all registered sources.\n"
+			  "Verbosity cannot be configured in this case except 'quiet' as their values are specific to each source.\n\n"
+			  "Examples:\n"
+			  "-dt           activate every sources on error level\n"
+			  "-dt all:user  activate every sources on user level\n"
+			  "-dt h1        activate HTTP/1 traces on error level\n"
+			  "-dt h2:data   activate HTTP/2 traces on data level\n"
+			  "-dt quic::clean,qmux::minimal\n    activate both QUIC transport and MUX traces on error level with their custom verbosity\n");
+			return -1;
+		}
+
+		/* keep a copy of the ptr for strtok */
+		oarg = arg = strdup(arg_src);
+		if (!arg) {
+			memprintf(errmsg, "Can't allocate !");
+			return -2;
+		}
+	}
+
+	if (!arg_src) {
 		/* No trace specification, activate all sources on error level. */
 		struct trace_source *src = NULL;
 
@@ -795,7 +1044,7 @@ int trace_parse_cmd(char *arg, char **errmsg)
 		return 0;
 	}
 
-	while ((str = strtok(arg, ","))) {
+	while ((str = strtok_r(arg, ",", &saveptr))) {
 		struct trace_source *src = NULL;
 		char *field, *name;
 		char *sep;
@@ -812,11 +1061,12 @@ int trace_parse_cmd(char *arg, char **errmsg)
 			str = NULL;
 		}
 
-		if (strlen(name)) {
+		if (strlen(name) && strcmp(name, "all") != 0) {
 			src = trace_find_source(name);
 			if (!src) {
 				memprintf(errmsg, "unknown trace source '%s'", name);
-				return 1;
+				ha_free(&oarg);
+				return -2;
 			}
 		}
 
@@ -837,8 +1087,9 @@ int trace_parse_cmd(char *arg, char **errmsg)
 		if (strlen(field)) {
 			level = trace_parse_level(field);
 			if (level < 0) {
-				memprintf(errmsg, "no such level '%s'", field);
-				return 1;
+				memprintf(errmsg, "no such trace level '%s', available levels are 'error', 'user', 'proto', 'state', 'data', and 'developer'", field);
+				ha_free(&oarg);
+				return -2;
 			}
 		}
 
@@ -848,19 +1099,26 @@ int trace_parse_cmd(char *arg, char **errmsg)
 		/* 3. verbosity */
 		field = str;
 		if (strchr(field, ':')) {
-			memprintf(errmsg, "too many double-colon separator");
-			return 1;
-		}
-
-		if (!src && strcmp(field, "quiet") != 0) {
-			memprintf(errmsg, "trace source must be specified for verbosity other than 'quiet'");
-			return 1;
+			memprintf(errmsg, "too many colon separators in trace definition");
+			ha_free(&oarg);
+			return -2;
 		}
 
 		verbosity = trace_source_parse_verbosity(src, field);
 		if (verbosity < 0) {
-			memprintf(errmsg, "no such verbosity '%s' for source '%s'", field, name);
-			return 1;
+			const struct name_desc *nd;
+
+			if (!src) {
+				memprintf(errmsg, "trace source must be specified for verbosity other than 'quiet'");
+			}
+			else {
+				memprintf(errmsg, "no such trace verbosity '%s' for source '%s', available verbosities for this source are: 'quiet'", field, name);
+				for (nd = src->decoding; nd->name && nd->desc; nd++)
+					memprintf(errmsg, "%s, %s'%s'", *errmsg, (nd + 1)->name ? "" : "and ", nd->name);
+			}
+
+			ha_free(&oarg);
+			return -2;
 		}
 
  parse:
@@ -875,7 +1133,7 @@ int trace_parse_cmd(char *arg, char **errmsg)
 		/* Reset arg to NULL for strtok. */
 		arg = NULL;
 	}
-
+	ha_free(&oarg);
 	return 0;
 }
 
@@ -887,7 +1145,7 @@ static int cfg_parse_trace(char **args, int section_type, struct proxy *curpx,
 	char *msg;
 	int severity;
 
-	severity = trace_parse_statement(args, &msg);
+	severity = _trace_parse_statement(args, &msg, file, line);
 	if (msg) {
 		if (severity >= LOG_NOTICE)
 			ha_notice("parsing [%s:%d] : '%s': %s\n", file, line, args[0], msg);
@@ -900,7 +1158,72 @@ static int cfg_parse_trace(char **args, int section_type, struct proxy *curpx,
 		}
 		ha_free(&msg);
 	}
+
 	return 0;
+}
+
+/*
+ * parse a line in a <traces> section. Returns the error code, 0 if OK, or
+ * any combination of :
+ *  - ERR_ABORT: must abort ASAP
+ *  - ERR_FATAL: we can continue parsing but not start the service
+ *  - ERR_WARN: a warning has been emitted
+ *  - ERR_ALERT: an alert has been emitted
+ * Only the two first ones can stop processing, the two others are just
+ * indicators.
+ */
+int cfg_parse_traces(const char *file, int linenum, char **args, int inv)
+{
+	int err_code = 0;
+	char *errmsg = NULL;
+
+	if (strcmp(args[0], "traces") == 0) {  /* new section */
+		/* no option, nothing special to do */
+		alertif_too_many_args(0, file, linenum, args, &err_code);
+		goto out;
+	}
+	else {
+		struct cfg_kw_list *kwl;
+		const char *best;
+		int index;
+		int rc;
+
+		list_for_each_entry(kwl, &cfg_keywords.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if (kwl->kw[index].section != CFG_TRACES)
+					continue;
+				if (strcmp(kwl->kw[index].kw, args[0]) == 0) {
+					if (check_kw_experimental(&kwl->kw[index], file, linenum, &errmsg)) {
+						ha_alert("%s\n", errmsg);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+
+					rc = kwl->kw[index].parse(args, CFG_TRACES, NULL, NULL, file, linenum, &errmsg);
+					if (rc < 0) {
+						ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+						err_code |= ERR_ALERT | ERR_FATAL;
+					}
+					else if (rc > 0) {
+						ha_warning("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+						err_code |= ERR_WARN;
+					}
+					goto out;
+				}
+			}
+		}
+
+		best = cfg_find_best_match(args[0], &cfg_keywords.list, CFG_TRACES, NULL);
+		if (best)
+			ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section; did you mean '%s' maybe ?\n", file, linenum, args[0], cursection, best);
+		else
+			ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section\n", file, linenum, args[0], "global");
+		err_code |= ERR_ALERT | ERR_FATAL;
+	}
+
+  out:
+	free(errmsg);
+	return err_code;
 }
 
 /* parse the command, returns 1 if a message is returned, otherwise zero */
@@ -983,7 +1306,7 @@ static struct cli_kw_list cli_kws = {{ },{
 INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
 
 static struct cfg_kw_list cfg_kws = {ILH, {
-	{ CFG_GLOBAL, "trace", cfg_parse_trace, KWF_EXPERIMENTAL },
+	{ CFG_TRACES, "trace", cfg_parse_trace },
 	{ /* END */ },
 }};
 

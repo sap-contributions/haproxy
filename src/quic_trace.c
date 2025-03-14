@@ -12,7 +12,10 @@
 
 #include <inttypes.h>
 
+#include <haproxy/api-t.h>
+#include <haproxy/chunk.h>
 #include <haproxy/quic_conn.h>
+#include <haproxy/quic_ssl.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_trace.h>
 #include <haproxy/quic_tp.h>
@@ -68,7 +71,7 @@ static const struct trace_event quic_trace_events[] = {
 	{ .mask = QUIC_EV_CONN_IDLE_TIMER, .name = "idle_timer",     .desc = "idle timer task"},
 	{ .mask = QUIC_EV_CONN_SUB,      .name = "xprt_sub",         .desc = "RX/TX subscription or unsubscription to QUIC xprt"},
 	{ .mask = QUIC_EV_CONN_RCV,      .name = "conn_recv",        .desc = "RX on connection" },
-	{ .mask = QUIC_EV_CONN_SET_AFFINITY, .name = "conn_set_affinity", .desc = "set connection thread affinity" },
+	{ .mask = QUIC_EV_CONN_BIND_TID, .name = "conn_bind_tid",    .desc = "change connection thread affinity" },
 	{ /* end */ }
 };
 
@@ -258,9 +261,16 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 
 		if (mask & QUIC_EV_CONN_IO_CB) {
 			const enum quic_handshake_state *state = a2;
+			const int *ssl_err = a3;
+			const SSL *ssl = a4;
 
 			if (state)
 				chunk_appendf(&trace_buf, " state=%s", quic_hdshk_state_str(*state));
+			if (ssl_err)
+				chunk_appendf(&trace_buf, "  ssl_err=%d", *ssl_err);
+			if (ssl)
+				chunk_appendf(&trace_buf, " early_data_status=%s",
+				              quic_ssl_early_data_status_str(ssl));
 		}
 
 		if (mask & (QUIC_EV_CONN_TRMHP|QUIC_EV_CONN_ELRMHP|QUIC_EV_CONN_SPKT)) {
@@ -402,7 +412,7 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 			const struct qc_stream_desc *stream = a3;
 
 			if (strm_frm)
-				chunk_appendf(&trace_buf, " off=%llu len=%llu", (ull)strm_frm->offset.key, (ull)strm_frm->len);
+				chunk_appendf(&trace_buf, " off=%llu len=%llu", (ull)strm_frm->offset, (ull)strm_frm->len);
 			if (stream)
 				chunk_appendf(&trace_buf, " ack_offset=%llu", (ull)stream->ack_offset);
 		}
@@ -630,4 +640,10 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 			quic_cid_dump(&trace_buf, cid);
 	}
 
+}
+
+void quic_dump_qc_info(struct buffer *msg, const struct quic_conn *qc)
+{
+	chunk_appendf(msg, " qc.wnd=%llu/%llu", (ullong)qc->path->in_flight,
+	                                        (ullong)qc->path->cwnd);
 }

@@ -46,7 +46,7 @@ static void quic_dflt_transport_params_cpy(struct quic_transport_params *dst)
  */
 void quic_transport_params_init(struct quic_transport_params *p, int server)
 {
-	const uint64_t ncb_size = global.tune.bufsize - NCB_RESERVED_SZ;
+	const uint64_t stream_rx_bufsz = qmux_stream_rx_bufsz();
 	const int max_streams_bidi = global.tune.quic_frontend_max_streams_bidi;
 	const int max_streams_uni = 3;
 
@@ -64,10 +64,10 @@ void quic_transport_params_init(struct quic_transport_params *p, int server)
 
 	p->initial_max_streams_bidi            = max_streams_bidi;
 	p->initial_max_streams_uni             = max_streams_uni;
-	p->initial_max_stream_data_bidi_local  = ncb_size;
-	p->initial_max_stream_data_bidi_remote = ncb_size;
-	p->initial_max_stream_data_uni         = ncb_size;
-	p->initial_max_data = (max_streams_bidi + max_streams_uni) * ncb_size;
+	p->initial_max_stream_data_bidi_local  = stream_rx_bufsz;
+	p->initial_max_stream_data_bidi_remote = stream_rx_bufsz * QMUX_STREAM_RX_BUF_FACTOR;
+	p->initial_max_stream_data_uni         = stream_rx_bufsz;
+	p->initial_max_data = (max_streams_bidi + max_streams_uni) * stream_rx_bufsz;
 
 	if (server) {
 		p->with_stateless_reset_token  = 1;
@@ -171,23 +171,23 @@ static int quic_transport_param_dec_version_info(struct tp_version_information *
                                                  const unsigned char *end, int server)
 {
 	size_t tp_len = end - *buf;
-	const uint32_t *ver, *others;
+	const unsigned char *ver, *others;
 
 	/* <tp_len> must be a multiple of sizeof(uint32_t) */
 	if (tp_len < sizeof tp->chosen || (tp_len & 0x3))
 		return 0;
 
-	tp->chosen = ntohl(*(uint32_t *)*buf);
+	tp->chosen = ntohl(read_u32(*buf));
 	/* Must not be null */
 	if (!tp->chosen)
 		return 0;
 
 	*buf += sizeof tp->chosen;
-	others = (const uint32_t *)*buf;
+	others = *buf;
 
 	/* Others versions must not be null */
-	for (ver = others; ver < (const uint32_t *)end; ver++) {
-		if (!*ver)
+	for (ver = others; ver < end; ver += 4) {
+		if (!read_u32(ver))
 			return 0;
 	}
 
@@ -195,19 +195,19 @@ static int quic_transport_param_dec_version_info(struct tp_version_information *
 		/* TODO: not supported */
 		return 0;
 
-	for (ver = others; ver < (const uint32_t *)end; ver++) {
+	for (ver = others; ver < end; ver += 4) {
 		if (!tp->negotiated_version) {
 			int i;
 
 			for (i = 0; i < quic_versions_nb; i++) {
-				if (ntohl(*ver) == quic_versions[i].num) {
+				if (ntohl(read_u32(ver)) == quic_versions[i].num) {
 					tp->negotiated_version = &quic_versions[i];
 					break;
 				}
 			}
 		}
 
-		if (preferred_version && ntohl(*ver) == preferred_version->num) {
+		if (preferred_version && ntohl(read_u32(ver)) == preferred_version->num) {
 			tp->negotiated_version = preferred_version;
 			goto out;
 		}

@@ -72,12 +72,16 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 	 */
 	if (unlikely(!(fdtab[conn->handle.fd].state & FD_POLL_IN))) {
 		/* stop here if we reached the end of data */
-		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP)
+		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_hup);
 			goto out_read0;
+		}
 
 		/* report error on POLL_ERR before connection establishment */
 		if ((fdtab[conn->handle.fd].state & FD_POLL_ERR) && (conn->flags & CO_FL_WAIT_L4_CONN)) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errcode(conn, CO_ER_POLLERR);
 			errno = 0; /* let the caller do a getsockopt() if it wants it */
 			goto leave;
 		}
@@ -91,8 +95,10 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 			     SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 
 		if (ret <= 0) {
-			if (ret == 0)
+			if (ret == 0) {
+				conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_shutr);
 				goto out_read0;
+			}
 
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				/* there are two reasons for EAGAIN :
@@ -126,7 +132,9 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 				continue;
 			}
 			/* here we have another error */
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_rcv_err);
 			conn->flags |= CO_FL_ERROR;
+			conn_set_errno(conn, errno);
 			break;
 		} /* ret <= 0 */
 
@@ -176,6 +184,7 @@ int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pip
 		/* it's already closed */
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH;
 		errno = EPIPE;
+		conn_set_errno(conn, errno);
 		return 0;
 	}
 
@@ -196,7 +205,9 @@ int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pip
 				continue;
 
 			/* here we have another error */
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_snd_err);
 			conn->flags |= CO_FL_ERROR;
+			conn_set_errno(conn, errno);
 			break;
 		}
 
@@ -242,12 +253,16 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 
 	if (unlikely(!(fdtab[conn->handle.fd].state & FD_POLL_IN))) {
 		/* stop here if we reached the end of data */
-		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP)
+		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_hup);
 			goto read0;
+		}
 
 		/* report error on POLL_ERR before connection establishment */
 		if ((fdtab[conn->handle.fd].state & FD_POLL_ERR) && (conn->flags & CO_FL_WAIT_L4_CONN)) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_connect_poll_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errcode(conn, CO_ER_POLLERR);
 			goto leave;
 		}
 	}
@@ -283,8 +298,10 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 				 * to read an unlikely close from the client since we'll
 				 * close first anyway.
 				 */
-				if (fdtab[conn->handle.fd].state & FD_POLL_HUP)
+				if (fdtab[conn->handle.fd].state & FD_POLL_HUP) {
+					conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_hup);
 					goto read0;
+				}
 
 				if (!(fdtab[conn->handle.fd].state & FD_LINGER_RISK) ||
 				    (cur_poller.flags & HAP_POLL_F_RDHUP)) {
@@ -297,6 +314,7 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 				break;
 		}
 		else if (ret == 0) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_shutr);
 			goto read0;
 		}
 		else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN) {
@@ -305,7 +323,9 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 			break;
 		}
 		else if (errno != EINTR) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_rcv_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errno(conn, errno);
 			break;
 		}
 	}
@@ -327,8 +347,11 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	 * of recv()'s return value 0, so we have no way to tell there was
 	 * an error without checking.
 	 */
-	if (unlikely(!done && fdtab[conn->handle.fd].state & FD_POLL_ERR))
+	if (unlikely(!done && fdtab[conn->handle.fd].state & FD_POLL_ERR)) {
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_err);
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+		conn_set_errcode(conn, CO_ER_POLLERR);
+	}
 	goto leave;
 }
 
@@ -360,15 +383,19 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 
 	if (unlikely(fdtab[conn->handle.fd].state & FD_POLL_ERR)) {
 		/* an error was reported on the FD, we can't send anymore */
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_err);
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_WR_SH | CO_FL_SOCK_RD_SH;
+		conn_set_errcode(conn, CO_ER_POLLERR);
 		errno = EPIPE;
 		return 0;
 	}
 
 	if (conn->flags & CO_FL_SOCK_WR_SH) {
 		/* it's already closed */
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_snd_err);
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH;
 		errno = EPIPE;
+		conn_set_errno(conn, errno);
 		return 0;
 	}
 
@@ -406,7 +433,9 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 			break;
 		}
 		else if (errno != EINTR) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_snd_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errno(conn, errno);
 			break;
 		}
 	}

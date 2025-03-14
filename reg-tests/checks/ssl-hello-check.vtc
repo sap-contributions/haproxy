@@ -1,6 +1,5 @@
 varnishtest "Health-checks: ssl-hello health-check"
 #REQUIRE_OPTION=OPENSSL
-#REQUIRE_VERSION=2.2
 #REGTEST_TYPE=slow
 feature ignore_unknown_macro
 
@@ -25,7 +24,9 @@ syslog S3 -level notice {
 
 haproxy htst -conf {
     global
+    .if !ssllib_name_startswith(AWS-LC)
         tune.ssl.default-dh-param 2048
+    .endif
 
     defaults
         mode tcp

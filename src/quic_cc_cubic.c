@@ -1,4 +1,6 @@
+#include <haproxy/global-t.h>
 #include <haproxy/quic_cc.h>
+#include <haproxy/quic_cc_hystart.h>
 #include <haproxy/quic_trace.h>
 #include <haproxy/ticks.h>
 #include <haproxy/trace.h>
@@ -79,6 +81,10 @@ struct cubic {
 	 * in recovery period) (in ms).
 	 */
 	uint32_t recovery_start_time;
+	/* HyStart++ state. */
+	struct quic_hystart hystart;
+	/* Consecutive number of losses since last ACK */
+	uint32_t consecutive_losses;
 };
 
 static void quic_cc_cubic_reset(struct quic_cc *cc)
@@ -96,12 +102,17 @@ static void quic_cc_cubic_reset(struct quic_cc *cc)
 	c->last_w_max = 0;
 	c->W_est = 0;
 	c->recovery_start_time = 0;
+	if (global.tune.options & GTUNE_QUIC_CC_HYSTART)
+		quic_cc_hystart_reset(&c->hystart);
 	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
 }
 
 static int quic_cc_cubic_init(struct quic_cc *cc)
 {
+	struct cubic *c = quic_cc_priv(cc);
+
 	quic_cc_cubic_reset(cc);
+	c->consecutive_losses = 0;
 	return 1;
 }
 
@@ -237,13 +248,24 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 			c->W_target = path->cwnd;
 		}
 		else {
+			uint64_t wnd_diff;
+
 			/* K value computing (in seconds):
 			 * K = cubic_root((W_max - cwnd_epoch)/C) (Figure 2)
-			 * Note that K is stored in milliseconds.
+			 * Note that K is stored in milliseconds and that
+			 * 8000 * 125000 = 1000^3.
+			 *
+			 * Supporting 2^40 windows, shifted by 10, leaves ~13 bits of unused
+			 * precision. We exploit this precision for our NS conversion by
+			 * multiplying by 8000 without overflowing, then later by 125000
+			 * after the divide so that we limit the precision loss to the minimum
+			 * before the cubic_root() call."
 			 */
-			c->K = cubic_root(((c->last_w_max - path->cwnd) << CUBIC_SCALE_FACTOR_SHIFT) / (CUBIC_C_SCALED * path->mtu));
-			/* Convert to miliseconds. */
-			c->K *= 1000;
+			wnd_diff = (c->last_w_max - path->cwnd) << CUBIC_SCALE_FACTOR_SHIFT;
+			wnd_diff *= 8000ULL;
+			wnd_diff /= CUBIC_C_SCALED * path->mtu;
+			wnd_diff *= 125000ULL;
+			c->K = cubic_root(wnd_diff);
 			c->W_target = c->last_w_max;
 		}
 
@@ -360,9 +382,11 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 			inc = W_est_inc;
 	}
 
-	path->cwnd += inc;
-	path->cwnd = QUIC_MIN(path->max_cwnd, path->cwnd);
-	path->mcwnd = QUIC_MAX(path->cwnd, path->mcwnd);
+	if (quic_cwnd_may_increase(path)) {
+		path->cwnd += inc;
+		path->cwnd = QUIC_MIN(path->max_cwnd, path->cwnd);
+		path->mcwnd = QUIC_MAX(path->cwnd, path->mcwnd);
+	}
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
 }
@@ -424,9 +448,31 @@ static void quic_cc_cubic_ss_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, ev);
 	switch (ev->type) {
 	case QUIC_CC_EVT_ACK:
-		if (path->cwnd < QUIC_CC_INFINITE_SSTHESH - ev->ack.acked) {
-			path->cwnd += ev->ack.acked;
-			path->cwnd = QUIC_MIN(path->max_cwnd, path->cwnd);
+		if (global.tune.options & GTUNE_QUIC_CC_HYSTART) {
+			struct quic_hystart *h = &c->hystart;
+			unsigned int acked = QUIC_MIN(ev->ack.acked, (uint64_t)HYSTART_LIMIT * path->mtu);
+
+			if (path->cwnd >= QUIC_CC_INFINITE_SSTHESH - acked)
+				goto out;
+
+			if (quic_cwnd_may_increase(path)) {
+				path->cwnd += acked;
+				path->mcwnd = QUIC_MAX(path->cwnd, path->mcwnd);
+			}
+			quic_cc_hystart_track_min_rtt(cc, h, path->loss.latest_rtt);
+			if (ev->ack.pn >= h->wnd_end)
+				h->wnd_end = UINT64_MAX;
+			if (quic_cc_hystart_may_enter_cs(&c->hystart)) {
+				/* Exit slow start and enter conservative slow start */
+				c->state = QUIC_CC_ST_CS;
+				goto out;
+			}
+		}
+		else if (path->cwnd < QUIC_CC_INFINITE_SSTHESH - ev->ack.acked) {
+			if (quic_cwnd_may_increase(path)) {
+				path->cwnd += ev->ack.acked;
+				path->cwnd = QUIC_MIN(path->max_cwnd, path->cwnd);
+			}
 		}
 		/* Exit to congestion avoidance if slow start threshold is reached. */
 		if (path->cwnd >= c->ssthresh)
@@ -451,12 +497,92 @@ static void quic_cc_cubic_ss_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 /* Congestion avoidance callback. */
 static void quic_cc_cubic_ca_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 {
+	struct cubic *c = quic_cc_priv(cc);
+
 	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
 	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, ev);
 	switch (ev->type) {
 	case QUIC_CC_EVT_ACK:
+		c->consecutive_losses = 0;
 		quic_cubic_update(cc, ev->ack.acked);
 		break;
+	case QUIC_CC_EVT_LOSS:
+		/* Principle: we may want to tolerate one or a few occasional
+		 * losses that are *not* caused by congestion that we'd have
+		 * any control on. Tests show that over long distances this
+		 * significantly improves the transfer stability and
+		 * performance, but can quickly result in a massive loss
+		 * increase if set too high. This counter is reset upon ACKs.
+		 * Maybe we could refine this to consider only certain ACKs
+		 * though.
+		 */
+		c->consecutive_losses += ev->loss.count;
+		if (c->consecutive_losses <= global.tune.quic_cubic_loss_tol)
+			goto out;
+		quic_enter_recovery(cc);
+		break;
+	case QUIC_CC_EVT_ECN_CE:
+		/* TODO */
+		break;
+	}
+
+ out:
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, NULL, cc);
+	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
+}
+
+/* Conservative slow start callback. */
+static void quic_cc_cubic_cs_cb(struct quic_cc *cc, struct quic_cc_event *ev)
+{
+	struct quic_cc_path *path = container_of(cc, struct quic_cc_path, cc);
+
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, ev);
+
+	switch (ev->type) {
+	case QUIC_CC_EVT_ACK:
+	{
+		struct cubic *c = quic_cc_priv(cc);
+		struct quic_hystart *h = &c->hystart;
+		unsigned int acked =
+			QUIC_MIN(ev->ack.acked, (uint64_t)HYSTART_LIMIT * path->mtu) / HYSTART_CSS_GROWTH_DIVISOR;
+
+		if (path->cwnd >= QUIC_CC_INFINITE_SSTHESH - acked)
+			goto out;
+
+		if (quic_cwnd_may_increase(path)) {
+			path->cwnd += acked;
+			path->mcwnd = QUIC_MAX(path->cwnd, path->mcwnd);
+		}
+		quic_cc_hystart_track_min_rtt(cc, h, path->loss.latest_rtt);
+		if (quic_cc_hystart_may_reenter_ss(h)) {
+			/* Exit to slow start */
+			c->state = QUIC_CC_ST_SS;
+			goto out;
+		}
+
+		if (h->css_rnd_count >= HYSTART_CSS_ROUNDS) {
+			/* Exit to congestion avoidance
+			 *
+			 * RFC 9438 4.10. Slow start
+			 *
+			 * When CUBIC uses HyStart++ [RFC9406], it may exit the first slow start
+			 * without incurring any packet loss and thus _W_max_ is undefined. In
+			 * this special case, CUBIC sets _cwnd_prior = cwnd_ and switches to
+			 * congestion avoidance. It then increases its congestion window size
+			 * using Figure 1, where _t_ is the elapsed time since the beginning of
+			 * the current congestion avoidance stage, _K_ is set to 0, and _W_max_
+			 * is set to the congestion window size at the beginning of the current
+			 * congestion avoidance stage.
+			 */
+			c->last_w_max = path->cwnd;
+			c->t_epoch = 0;
+			c->state = QUIC_CC_ST_CA;
+		}
+
+		break;
+	}
+
 	case QUIC_CC_EVT_LOSS:
 		quic_enter_recovery(cc);
 		break;
@@ -507,6 +633,7 @@ static void quic_cc_cubic_rp_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 static void (*quic_cc_cubic_state_cbs[])(struct quic_cc *cc,
                                       struct quic_cc_event *ev) = {
 	[QUIC_CC_ST_SS] = quic_cc_cubic_ss_cb,
+	[QUIC_CC_ST_CS] = quic_cc_cubic_cs_cb,
 	[QUIC_CC_ST_CA] = quic_cc_cubic_ca_cb,
 	[QUIC_CC_ST_RP] = quic_cc_cubic_rp_cb,
 };
@@ -516,6 +643,17 @@ static void quic_cc_cubic_event(struct quic_cc *cc, struct quic_cc_event *ev)
 	struct cubic *c = quic_cc_priv(cc);
 
 	return quic_cc_cubic_state_cbs[c->state](cc, ev);
+}
+
+static void quic_cc_cubic_hystart_start_round(struct quic_cc *cc, uint64_t pn)
+{
+	struct cubic *c = quic_cc_priv(cc);
+	struct quic_hystart *h = &c->hystart;
+
+	if (c->state != QUIC_CC_ST_SS && c->state != QUIC_CC_ST_CS)
+		return;
+
+	quic_cc_hystart_start_round(h, pn);
 }
 
 static void quic_cc_cubic_state_trace(struct buffer *buf, const struct quic_cc *cc)
@@ -533,10 +671,32 @@ static void quic_cc_cubic_state_trace(struct buffer *buf, const struct quic_cc *
 	              TICKS_TO_MS(tick_remain(c->recovery_start_time, now_ms)));
 }
 
+static void quic_cc_cubic_state_cli(struct buffer *buf, const struct quic_cc_path *path)
+{
+	struct cubic *c = quic_cc_priv(&path->cc);
+
+	chunk_appendf(buf, "  cc: state=%s ssthresh=%u K=%u last_w_max=%u wdiff=%lld\n",
+	              quic_cc_state_str(c->state), c->ssthresh, c->K, c->last_w_max,
+	              (long long)(path->cwnd - c->last_w_max));
+}
+
 struct quic_cc_algo quic_cc_algo_cubic = {
 	.type        = QUIC_CC_ALGO_TP_CUBIC,
+	.flags       = QUIC_CC_ALGO_FL_OPT_PACING,
 	.init        = quic_cc_cubic_init,
 	.event       = quic_cc_cubic_event,
 	.slow_start  = quic_cc_cubic_slow_start,
+	.hystart_start_round = quic_cc_cubic_hystart_start_round,
+	.pacing_inter = quic_cc_default_pacing_inter,
+	.pacing_burst = NULL,
 	.state_trace = quic_cc_cubic_state_trace,
+	.state_cli   = quic_cc_cubic_state_cli,
 };
+
+void quic_cc_cubic_check(void)
+{
+	struct quic_cc *cc;
+	BUG_ON_HOT(sizeof(struct cubic) > sizeof(cc->priv));
+}
+
+INITCALL0(STG_REGISTER, quic_cc_cubic_check);

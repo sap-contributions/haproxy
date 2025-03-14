@@ -27,13 +27,14 @@
 #include <haproxy/dynbuf-t.h>
 #include <haproxy/freq_ctr-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/show_flags-t.h>
 #include <haproxy/task-t.h>
 #include <haproxy/xref-t.h>
 
 /* flags for appctx->state */
 
 /* Room for per-command context (mostly CLI commands but not only) */
-#define APPLET_MAX_SVCCTX 88
+#define APPLET_MAX_SVCCTX 256
 
 /* Appctx Flags */
 #define APPCTX_FL_INBLK_ALLOC    0x00000001
@@ -48,12 +49,37 @@
 #define APPCTX_FL_WANT_DIE       0x00000200  /* applet was running and requested to die */
 #define APPCTX_FL_INOUT_BUFS     0x00000400  /* applet uses its own buffers */
 #define APPCTX_FL_FASTFWD        0x00000800  /* zero-copy forwarding is in-use, don't fill the outbuf */
+#define APPCTX_FL_IN_MAYALLOC    0x00001000  /* applet may try again to allocate its inbuf */
+#define APPCTX_FL_OUT_MAYALLOC   0x00002000  /* applet may try again to allocate its outbuf */
 
 struct appctx;
 struct proxy;
 struct stconn;
 struct sedesc;
+struct se_abort_info;
 struct session;
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *appctx_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(APPCTX_FL_INBLK_ALLOC, _(APPCTX_FL_INBLK_FULL,
+	_(APPCTX_FL_OUTBLK_ALLOC, _(APPCTX_FL_OUTBLK_FULL,
+	_(APPCTX_FL_EOI, _(APPCTX_FL_EOS,
+	_(APPCTX_FL_ERR_PENDING, _(APPCTX_FL_ERROR,
+	_(APPCTX_FL_SHUTDOWN, _(APPCTX_FL_WANT_DIE, _(APPCTX_FL_INOUT_BUFS,
+	_(APPCTX_FL_FASTFWD, _(APPCTX_FL_IN_MAYALLOC, _(APPCTX_FL_OUT_MAYALLOC))))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
 
 /* Applet descriptor */
 struct applet {
@@ -66,6 +92,7 @@ struct applet {
 	size_t (*rcv_buf)(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags); /* called from the upper layer to get data */
 	size_t (*snd_buf)(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags); /* Called from the upper layet to put data */
 	size_t (*fastfwd)(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags); /* Callback to fast-forward data */
+	void (*shut)(struct appctx *appctx, unsigned int mode, struct se_abort_info *reason); /* shutdown function */
 	void (*release)(struct appctx *);  /* callback to release resources, may be NULL */
 	unsigned int timeout;              /* execution timeout. */
 };
@@ -97,7 +124,7 @@ struct appctx {
 	struct buffer_wait buffer_wait; /* position in the list of objects waiting for a buffer */
 	struct task *t;                  /* task associated to the applet */
 	struct freq_ctr call_rate;       /* appctx call rate */
-	struct list wait_entry;          /* entry in a list of waiters for an event (e.g. ring events) */
+	struct mt_list wait_entry;       /* entry in a list of waiters for an event (e.g. ring events) */
 
 	/* The pointer seen by application code is appctx->svcctx. In 2.7 the
 	 * anonymous union and the "ctx" struct disappeared, and the struct

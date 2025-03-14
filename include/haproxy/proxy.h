@@ -39,6 +39,7 @@ extern struct eb_root proxy_by_name;    /* tree of proxies sorted by name */
 
 extern const struct cfg_opt cfg_opts[];
 extern const struct cfg_opt cfg_opts2[];
+extern const struct cfg_opt cfg_opts3[];
 
 struct task *manage_proxy(struct task *t, void *context, unsigned int state);
 void proxy_cond_pause(struct proxy *p);
@@ -68,6 +69,7 @@ void proxy_destroy_defaults(struct proxy *px);
 void proxy_destroy_all_unref_defaults(void);
 void proxy_ref_defaults(struct proxy *px, struct proxy *defpx);
 void proxy_unref_defaults(struct proxy *px);
+void proxy_unref_or_destroy_defaults(struct proxy *px);
 struct proxy *alloc_new_proxy(const char *name, unsigned int cap,
                               char **errmsg);
 struct proxy *parse_new_proxy(const char *name, unsigned int cap,
@@ -86,6 +88,7 @@ struct proxy *cli_find_frontend(struct appctx *appctx, const char *arg);
 int resolve_stick_rule(struct proxy *curproxy, struct sticking_rule *mrule);
 void free_stick_rules(struct list *rules);
 void free_server_rules(struct list *srules);
+int proxy_init_per_thr(struct proxy *px);
 
 /*
  * This function returns a string containing the type of the proxy in a format
@@ -134,7 +137,7 @@ static inline void proxy_inc_fe_conn_ctr(struct listener *l, struct proxy *fe)
 	if (l && l->counters)
 		_HA_ATOMIC_INC(&l->counters->cum_conn);
 	HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.cps_max,
-			     update_freq_ctr(&fe->fe_conn_per_sec, 1));
+	                     update_freq_ctr(&fe->fe_counters.conn_per_sec, 1));
 }
 
 /* increase the number of cumulated connections accepted by the designated frontend */
@@ -145,7 +148,7 @@ static inline void proxy_inc_fe_sess_ctr(struct listener *l, struct proxy *fe)
 	if (l && l->counters)
 		_HA_ATOMIC_INC(&l->counters->cum_sess);
 	HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.sps_max,
-			     update_freq_ctr(&fe->fe_sess_per_sec, 1));
+			     update_freq_ctr(&fe->fe_counters.sess_per_sec, 1));
 }
 
 /* increase the number of cumulated HTTP sessions on the designated frontend.
@@ -163,12 +166,12 @@ static inline void proxy_inc_fe_cum_sess_ver_ctr(struct listener *l, struct prox
 		_HA_ATOMIC_INC(&l->counters->cum_sess_ver[http_ver - 1]);
 }
 
-/* increase the number of cumulated connections on the designated backend */
+/* increase the number of cumulated streams on the designated backend */
 static inline void proxy_inc_be_ctr(struct proxy *be)
 {
-	_HA_ATOMIC_INC(&be->be_counters.cum_conn);
+	_HA_ATOMIC_INC(&be->be_counters.cum_sess);
 	HA_ATOMIC_UPDATE_MAX(&be->be_counters.sps_max,
-			     update_freq_ctr(&be->be_sess_per_sec, 1));
+			     update_freq_ctr(&be->be_counters.sess_per_sec, 1));
 }
 
 /* increase the number of cumulated requests on the designated frontend.
@@ -185,7 +188,7 @@ static inline void proxy_inc_fe_req_ctr(struct listener *l, struct proxy *fe,
 	if (l && l->counters)
 		_HA_ATOMIC_INC(&l->counters->p.http.cum_req[http_ver]);
 	HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.p.http.rps_max,
-			     update_freq_ctr(&fe->fe_req_per_sec, 1));
+	                     update_freq_ctr(&fe->fe_counters.req_per_sec, 1));
 }
 
 /* Returns non-zero if the proxy is configured to retry a request if we got that status, 0 otherwise */
@@ -204,8 +207,12 @@ static inline int l7_status_match(struct proxy *p, int status)
 		return (p->retry_type & PR_RE_404);
 	case 408:
 		return (p->retry_type & PR_RE_408);
+	case 421:
+		return (p->retry_type & PR_RE_421);
 	case 425:
 		return (p->retry_type & PR_RE_425);
+	case 429:
+		return (p->retry_type & PR_RE_429);
 	case 500:
 		return (p->retry_type & PR_RE_500);
 	case 501:

@@ -16,6 +16,7 @@
 #include <import/ebmbtree.h>
 #include <haproxy/list.h>
 #include <haproxy/shctx.h>
+#include <haproxy/tools.h>
 
 /*
  * Reserve a new row if <first> is null, put it in the hotlist, set the refcount to 1
@@ -269,13 +270,14 @@ int shctx_row_data_get(struct shared_context *shctx, struct shared_block *first,
  * and 0 if cache is already allocated.
  */
 int shctx_init(struct shared_context **orig_shctx, int maxblocks, int blocksize,
-               unsigned int maxobjsz, int extra)
+               unsigned int maxobjsz, int extra, const char *name)
 {
 	int i;
 	struct shared_context *shctx;
 	int ret;
 	void *cur;
 	int maptype = MAP_SHARED;
+	size_t totalsize = sizeof(struct shared_context) + extra + (maxblocks * (sizeof(struct shared_block) + blocksize));
 
 	if (maxblocks <= 0)
 		return 0;
@@ -284,13 +286,14 @@ int shctx_init(struct shared_context **orig_shctx, int maxblocks, int blocksize,
 	blocksize = (blocksize + sizeof(void *) - 1) & -sizeof(void *);
 	extra     = (extra     + sizeof(void *) - 1) & -sizeof(void *);
 
-	shctx = (struct shared_context *)mmap(NULL, sizeof(struct shared_context) + extra + (maxblocks * (sizeof(struct shared_block) + blocksize)),
-	                                      PROT_READ | PROT_WRITE, maptype | MAP_ANON, -1, 0);
+	shctx = (struct shared_context *)mmap(NULL, totalsize, PROT_READ | PROT_WRITE, maptype | MAP_ANON, -1, 0);
 	if (!shctx || shctx == MAP_FAILED) {
 		shctx = NULL;
 		ret = SHCTX_E_ALLOC_CACHE;
 		goto err;
 	}
+
+	vma_set_name(shctx, totalsize, "shctx", name);
 
 	shctx->nbav = 0;
 

@@ -26,6 +26,7 @@
 #include <haproxy/connection-t.h>
 #include <haproxy/pipe-t.h>
 #include <haproxy/show_flags-t.h>
+#include <haproxy/task-t.h>
 #include <haproxy/xref-t.h>
 
 enum iobuf_flags {
@@ -38,6 +39,7 @@ enum iobuf_flags {
 						 *  .done_fastfwd() on consumer side must take care of this flag
 						 */
 	IOBUF_FL_EOI              = 0x00000010, /* A EOI was encountered on producer side */
+	IOBUF_FL_FF_WANT_ROOM     = 0x00000020, /* Producer need more room in the IOBUF to forward data */
 };
 
 /* Flags used */
@@ -112,6 +114,14 @@ enum se_flags {
 	SE_FL_WONT_CONSUME  = 0x20000000,  /* stream endpoint will not consume more data */
 	SE_FL_HAVE_NO_DATA  = 0x40000000,  /* the endpoint has no more data to deliver to the stream */
 	SE_FL_APPLET_NEED_CONN = 0x80000000,  /* applet is waiting for the other side to (fail to) connect */
+};
+
+/* Shutdown modes */
+enum se_shut_mode {
+	SE_SHR_DRAIN  = 0x00000001, /* read shutdown, drain any extra stuff */
+	SE_SHR_RESET  = 0x00000002, /* read shutdown, reset any extra stuff */
+	SE_SHW_NORMAL = 0x00000004, /* regular write shutdown */
+	SE_SHW_SILENT = 0x00000008, /* imminent close, don't notify peer */
 };
 
 /* This function is used to report flags in debugging tools. Please reflect
@@ -195,6 +205,7 @@ enum sc_flags {
 	SC_FL_SHUT_DONE     = 0x00020000,  /* A shutdown was performed for the SC */
 
 	SC_FL_EOS           = 0x00040000,  /* End of stream was reached (from down side to up side) */
+	SC_FL_HAVE_BUFF     = 0x00080000,  /* A buffer is ready, flag will be cleared once allocated */
 };
 
 /* This function is used to report flags in debugging tools. Please reflect
@@ -212,7 +223,7 @@ static forceinline char *sc_show_flags(char *buf, size_t len, const char *delim,
 	_(SC_FL_NEED_BUFF, _(SC_FL_NEED_ROOM,
         _(SC_FL_RCV_ONCE, _(SC_FL_SND_ASAP, _(SC_FL_SND_NEVERWAIT, _(SC_FL_SND_EXP_MORE,
 	_(SC_FL_ABRT_WANTED, _(SC_FL_SHUT_WANTED, _(SC_FL_ABRT_DONE, _(SC_FL_SHUT_DONE,
-	_(SC_FL_EOS)))))))))))))))))));
+	_(SC_FL_EOS, _(SC_FL_HAVE_BUFF))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -257,6 +268,25 @@ enum sc_state_bit {
 
 struct stconn;
 
+/* represent the abort code, enriched with contextual info:
+ *  - First 5 bits are used for the source (31 possible sources)
+ *  - other bits are reserved for now
+ */
+#define SE_ABRT_SRC_SHIFT 0
+#define SE_ABRT_SRC_MASK  0x0000001f
+
+#define SE_ABRT_SRC_MUX_PT    0x01 /* Code set by the PT mux */
+#define SE_ABRT_SRC_MUX_H1    0x02 /* Code set by the H1 mux */
+#define SE_ABRT_SRC_MUX_H2    0x03 /* Code set by the H2 mux */
+#define SE_ABRT_SRC_MUX_QUIC  0x04 /* Code set by the QUIC/H3 mux */
+#define SE_ABRT_SRC_MUX_FCGI  0x05 /* Code set by the FCGI mux */
+#define SE_ABRT_SRC_MUX_SPOP  0x06 /* Code set by the SPOP mux */
+
+struct se_abort_info {
+	uint32_t info;
+	uint64_t code;
+};
+
 /* A Stream Endpoint Descriptor (sedesc) is the link between the stream
  * connector (ex. stconn) and the Stream Endpoint (mux or appctx).
  * It always exists for either of them, and binds them together. It also
@@ -287,9 +317,10 @@ struct sedesc {
 	struct stconn *sc;         /* the stream connector we're attached to, or NULL */
 	struct iobuf iobuf;        /* contains data forwarded by the other side and that must be sent by the stream endpoint */
 	unsigned int flags;        /* SE_FL_* */
+	uint32_t term_evts_log;    /* Termination events log: first 4 events reported */
+	struct se_abort_info abort_info; /* Info about abort, as reported by the endpoint and eventually enriched by the app level */
 	unsigned int lra;          /* the last read activity */
 	unsigned int fsb;          /* the first send blocked */
-	/* 4 bytes hole here */
 	struct xref xref;          /* cross reference with the opposite SC */
 };
 
@@ -316,6 +347,7 @@ struct stconn {
 
 	unsigned int flags;                  /* SC_FL_* */
 	unsigned int ioto;                   /* I/O activity timeout */
+	uint32_t term_evts_log;              /* termination events log aggregating SE + connection events */
 	ssize_t room_needed;                 /* free space in the input buffer required to receive more data.
 					      *    -1   : the SC is waiting for room but not on a specific amount of data
 					      *    >= 0 : min free space required to progress. 0 means SC must be unblocked ASAP

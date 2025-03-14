@@ -30,6 +30,7 @@
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/namespace.h>
+#include <haproxy/protocol.h>
 #include <haproxy/proto_sockpair.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
@@ -108,6 +109,9 @@ struct connection *sock_accept_conn(struct listener *l, int *status)
 				 p->id);
 			goto fail_conn;
 		}
+
+		if (unlikely(port_is_restricted(addr, HA_PROTO_TCP)))
+			goto fail_conn;
 
 		/* Perfect, the connection was accepted */
 		conn = conn_new(&l->obj_type);
@@ -195,16 +199,77 @@ struct connection *sock_accept_conn(struct listener *l, int *status)
 	goto done;
 }
 
+/* Common code to handle in one place different ERRNOs, that socket() et setns()
+ * may return
+ */
+static int sock_handle_system_err(struct connection *conn, struct proxy *be)
+{
+	qfprintf(stderr, "Cannot get a server socket.\n");
+
+	conn->flags |= CO_FL_ERROR;
+	conn->err_code = CO_ER_SOCK_ERR;
+
+	switch(errno) {
+		case ENFILE:
+			conn->err_code = CO_ER_SYS_FDLIM;
+			send_log(be, LOG_EMERG,
+				 "Proxy %s reached system FD limit (maxsock=%d). "
+				 "Please check system tunables.\n", be->id, global.maxsock);
+
+			return SF_ERR_RESOURCE;
+
+		case EMFILE:
+			conn->err_code = CO_ER_PROC_FDLIM;
+			send_log(be, LOG_EMERG,
+				 "Proxy %s reached process FD limit (maxsock=%d). "
+				 "Please check 'ulimit-n' and restart.\n", be->id, global.maxsock);
+
+			return SF_ERR_RESOURCE;
+
+		case ENOBUFS:
+		case ENOMEM:
+			conn->err_code = CO_ER_SYS_MEMLIM;
+			send_log(be, LOG_EMERG,
+				 "Proxy %s reached system memory limit (maxsock=%d). "
+				 "Please check system tunables.\n", be->id, global.maxsock);
+
+			return SF_ERR_RESOURCE;
+
+		case EAFNOSUPPORT:
+		case EPROTONOSUPPORT:
+			conn->err_code = CO_ER_NOPROTO;
+			break;
+
+		case EPERM:
+			conn->err_code = CO_ER_SOCK_ERR;
+			send_log(be, LOG_EMERG,
+				 "Proxy %s has insufficient permissions to open server socket.\n",
+				 be->id);
+
+			return SF_ERR_PRXCOND;
+
+		default:
+			send_log(be, LOG_EMERG,
+				 "Proxy %s cannot create a server socket: %s\n",
+				 be->id, strerror(errno));
+	}
+
+	return SF_ERR_INTERNAL;
+}
+
 /* Create a socket to connect to the server in conn->dst (which MUST be valid),
  * using the configured namespace if needed, or the one passed by the proxy
  * protocol if required to do so. It then calls socket() or socketat(). On
  * success, checks if mark or tos sockopts need to be set on the file handle.
- * Returns the FD or error code.
+ * Returns backend connection socket FD on success, stream_err flag needed by
+ * upper level is set as SF_ERR_NONE; -1 on failure, stream_err is set to
+ * appropriate value.
  */
-int sock_create_server_socket(struct connection *conn)
+int sock_create_server_socket(struct connection *conn, struct proxy *be, int *stream_err)
 {
 	const struct netns_entry *ns = NULL;
-	int sock;
+	const struct protocol *proto;
+	int sock_fd;
 
 #ifdef USE_NS
 	if (objt_server(conn->target)) {
@@ -214,16 +279,63 @@ int sock_create_server_socket(struct connection *conn)
 			ns = __objt_server(conn->target)->netns;
 	}
 #endif
-	sock = my_socketat(ns, conn->dst->ss_family, SOCK_STREAM, 0);
-	if (sock == -1)
-		goto end;
-	if (conn->flags & CO_FL_OPT_MARK)
-		sock_set_mark(sock, conn->mark);
-	if (conn->flags & CO_FL_OPT_TOS)
-		sock_set_tos(sock, conn->dst, conn->tos);
+	proto = protocol_lookup(conn->dst->ss_family, PROTO_TYPE_STREAM, conn->ctrl->sock_prot == IPPROTO_MPTCP);
+	BUG_ON(!proto);
+	sock_fd = my_socketat(ns, proto->fam->sock_domain, SOCK_STREAM, proto->sock_prot);
 
- end:
-	return sock;
+	/* at first, handle common to all proto families system limits and permission related errors */
+	if (sock_fd == -1) {
+		*stream_err = sock_handle_system_err(conn, be);
+
+		return -1;
+	}
+
+	/* now perform some runtime condition checks */
+	if (sock_fd >= global.maxsock) {
+		/* do not log anything there, it's a normal condition when this option
+		 * is used to serialize connections to a server !
+		 */
+		ha_alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
+		send_log(be, LOG_EMERG, "socket(): not enough free sockets. Raise -n argument. Giving up.\n");
+		close(sock_fd);
+		conn->err_code = CO_ER_CONF_FDLIM;
+		conn->flags |= CO_FL_ERROR;
+		*stream_err = SF_ERR_PRXCOND; /* it is a configuration limit */
+
+		return -1;
+	}
+
+	if (fd_set_nonblock(sock_fd) == -1 ||
+		((conn->ctrl->sock_prot == IPPROTO_TCP || conn->ctrl->sock_prot == IPPROTO_MPTCP) &&
+		 (setsockopt(sock_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == -1))) {
+		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
+		send_log(be, LOG_EMERG, "Cannot set client socket to non blocking mode.\n");
+		close(sock_fd);
+		conn->err_code = CO_ER_SOCK_ERR;
+		conn->flags |= CO_FL_ERROR;
+		*stream_err = SF_ERR_INTERNAL;
+
+		return -1;
+	}
+
+	if (master == 1 && fd_set_cloexec(sock_fd) == -1) {
+		ha_alert("Cannot set CLOEXEC on client socket.\n");
+		send_log(be, LOG_EMERG, "Cannot set CLOEXEC on client socket.\n");
+		close(sock_fd);
+		conn->err_code = CO_ER_SOCK_ERR;
+		conn->flags |= CO_FL_ERROR;
+		*stream_err = SF_ERR_INTERNAL;
+
+		return -1;
+	}
+
+	if (conn->flags & CO_FL_OPT_MARK)
+		sock_set_mark(sock_fd, conn->ctrl->fam->sock_family, conn->mark);
+	if (conn->flags & CO_FL_OPT_TOS)
+		sock_set_tos(sock_fd, conn->dst, conn->tos);
+
+	*stream_err = SF_ERR_NONE;
+	return sock_fd;
 }
 
 /* Enables receiving on receiver <rx> once already bound. */
@@ -273,6 +385,28 @@ void sock_unbind(struct receiver *rx)
 	rx->fd = -1;
 }
 
+/* restore effective family for UNIX type sockets if needed. Indeed since
+ * kernel doesn't know about custom UNIX families (internal to HAproxy),
+ * they lost when leveraging syscalls such as getsockname() or getpeername().
+ *
+ * This function guesses the effective family by analyzing address and address
+ * length as returned by getsockname() and getpeername() calls.
+ */
+static void sock_restore_unix_family(struct sockaddr_un *un, socklen_t socklen)
+{
+	BUG_ON(un->sun_family != AF_UNIX);
+
+	if (un->sun_path[0]); // regular UNIX socket, not a custom family
+	else if (socklen == sizeof(*un))
+		un->sun_family = AF_CUST_ABNS;
+	else {
+		/* not all struct sockaddr_un space is used..
+		 * (sun_path is partially filled)
+		 */
+		un->sun_family = AF_CUST_ABNSZ;
+	}
+}
+
 /*
  * Retrieves the source address for the socket <fd>, with <dir> indicating
  * if we're a listener (=0) or an initiator (!=0). It returns 0 in case of
@@ -281,10 +415,19 @@ void sock_unbind(struct receiver *rx)
  */
 int sock_get_src(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 {
+	int ret;
+
 	if (dir)
-		return getsockname(fd, sa, &salen);
+		ret = getsockname(fd, sa, &salen);
 	else
-		return getpeername(fd, sa, &salen);
+		ret = getpeername(fd, sa, &salen);
+
+	if (ret)
+		return ret;
+	if (sa->sa_family == AF_UNIX)
+		sock_restore_unix_family((struct sockaddr_un *)sa, salen);
+
+	return ret;
 }
 
 /*
@@ -295,10 +438,19 @@ int sock_get_src(int fd, struct sockaddr *sa, socklen_t salen, int dir)
  */
 int sock_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 {
+	int ret;
+
 	if (dir)
-		return getpeername(fd, sa, &salen);
+		ret = getpeername(fd, sa, &salen);
 	else
-		return getsockname(fd, sa, &salen);
+		ret = getsockname(fd, sa, &salen);
+
+	if (ret)
+		return ret;
+	if (sa->sa_family == AF_UNIX)
+		sock_restore_unix_family((struct sockaddr_un *)sa, salen);
+
+	return ret;
 }
 
 /* Try to retrieve exported sockets from worker at CLI <unixsocket>. These
@@ -328,6 +480,17 @@ int sock_get_old_sockets(const char *unixsocket)
 		int sv[2];
 		int dst_fd;
 
+		/* dst_fd is always open in the worker process context because
+		 * it's inherited from the master via -x cmd option. It's closed
+		 * futher in main (after bind_listeners()) and not here for the
+		 * simplicity. In main(), after bind_listeners(), it's safe just
+		 * to loop over all workers list, launched before this reload and
+		 * to close its ipc_fd[0], thus we also close this fd. If we
+		 * would close dst_fd here, it might be potentially "reused" in
+		 * bind_listeners() followed this call, thus it would be difficult
+		 * to exclude it, in the case if it was bound again when we will
+		 * filter the previous workers list.
+		 */
 		dst_fd = strtoll(unixsocket + strlen("sockpair@"), NULL, 0);
 
 		if (socketpair(PF_UNIX, SOCK_STREAM, 0, sv) == -1) {
@@ -477,6 +640,13 @@ int sock_get_old_sockets(const char *unixsocket)
 			ha_free(&xfer_sock);
 			continue;
 		}
+		if (xfer_sock->addr.ss_family == AF_UNIX) {
+			/* restore effective family if needed, because getsockname()
+			 * only knows about real families:
+			 */
+			sock_restore_unix_family((struct sockaddr_un *)&xfer_sock->addr, socklen);
+		}
+
 
 		if (curoff >= maxoff) {
 			ha_warning("Inconsistency while transferring sockets\n");
@@ -775,6 +945,31 @@ int sock_conn_check(struct connection *conn)
 			goto done;
 		if (!(fdtab[fd].state & (FD_POLL_ERR|FD_POLL_HUP)))
 			goto wait;
+
+		/* Removing HUP if there is no ERR reported.
+		 *
+		 * After a first connect() returning EINPROGRESS, it seems
+		 * possible to have EPOLLHUP or EPOLLRDHUP reported by
+		 * epoll_wait() and turned to an error while the following
+		 * connect() will return a success. So the connection is
+		 * validated but the error is saved and reported on the first
+		 * subsequent read.
+		 *
+		 * We have no explanation for now. Why epoll report the
+		 * connection is closed while the connect() it able to validate
+		 * it ? no idea. But, it seems reasonnable in this case, and if
+		 * no error was reported, to remove the the HUP flag. At worst, if
+		 * the connection is really closed, this will be reported later.
+		 *
+		 * Only observed on Ubuntu kernel (5.4/5.15). See:
+		 *   - https://github.com/haproxy/haproxy/issues/1863
+		 *   - https://www.spinics.net/lists/netdev/msg876470.html
+		 */
+		if (unlikely((fdtab[fd].state & (FD_POLL_HUP|FD_POLL_ERR)) == FD_POLL_HUP)) {
+			COUNT_IF(1, "Removing FD_POLL_HUP if no FD_POLL_ERR to let connect() decide");
+			fdtab[fd].state &= ~FD_POLL_HUP;
+		}
+
 		/* error present, fall through common error check path */
 	}
 
@@ -793,8 +988,10 @@ int sock_conn_check(struct connection *conn)
 		if (errno == EALREADY || errno == EINPROGRESS)
 			goto wait;
 
-		if (errno && errno != EISCONN)
+		if (errno && errno != EISCONN) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_connect_err);
 			goto out_error;
+		}
 	}
 
  done:
@@ -818,6 +1015,15 @@ int sock_conn_check(struct connection *conn)
 	return 0;
 
  wait:
+	/* we may arrive here due to connect() misleadingly reporting EALREADY
+	 * in some corner cases while the system disagrees and reports an error
+	 * on the FD.
+	 */
+	if (fdtab[fd].state & FD_POLL_ERR) {
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_connect_poll_err);
+		goto out_error;
+	}
+
 	fd_cant_send(fd);
 	fd_want_send(fd);
 	return 0;
@@ -1032,7 +1238,7 @@ int _sock_supports_reuseport(const struct proto_fam *fam, int type, int protocol
 	fd1 = fd2 = -1;
 
 	/* ignore custom sockets */
-	if (!fam || fam->sock_domain >= AF_MAX)
+	if (!fam || real_family(fam->sock_family) >= AF_MAX)
 		goto leave;
 
 	fd1 = socket(fam->sock_domain, type, protocol);
@@ -1044,7 +1250,7 @@ int _sock_supports_reuseport(const struct proto_fam *fam, int type, int protocol
 
 	/* bind to any address assigned by the kernel, we'll then try to do it twice */
 	memset(&ss, 0, sizeof(ss));
-	ss.ss_family = fam->sock_family;
+	ss.ss_family = real_family(fam->sock_family);
 	if (bind(fd1, (struct sockaddr *)&ss, fam->sock_addrlen) < 0)
 		goto leave;
 

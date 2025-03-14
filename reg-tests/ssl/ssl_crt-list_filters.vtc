@@ -1,7 +1,7 @@
 #REGTEST_TYPE=bug
 varnishtest "Test for ECDSA/RSA selection and crt-list filters"
 feature cmd "$HAPROXY_PROGRAM -cc 'version_atleast(2.8)'"
-feature cmd "$HAPROXY_PROGRAM -cc 'feature(OPENSSL) && ssllib_name_startswith(OpenSSL) && openssl_version_atleast(1.1.1)'"
+feature cmd "$HAPROXY_PROGRAM -cc 'feature(OPENSSL) && ssllib_name_startswith(OpenSSL) && openssl_version_atleast(1.1.1) || feature(OPENSSL_AWSLC)'"
 # This test checks if the multiple certificate types works correctly with the
 # SNI, and that the negative filters are correctly excluded
 #
@@ -16,7 +16,9 @@ server s1 -repeat 6 {
 
 haproxy h1 -conf {
     global
+    .if !ssllib_name_startswith(AWS-LC)
         tune.ssl.default-dh-param 2048
+    .endif
         crt-base ${testdir}
         stats socket "${tmpdir}/h1/stats" level admin
 

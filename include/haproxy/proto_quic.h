@@ -21,15 +21,13 @@
 #ifndef _HAPROXY_PROTO_QUIC_H
 #define _HAPROXY_PROTO_QUIC_H
 
+#include <import/ebtree.h>
+#include <haproxy/api-t.h>
+#include <haproxy/thread-t.h>
+
 extern struct protocol proto_quic4;
 extern struct protocol proto_quic6;
 
-struct quic_cid_tree {
-	struct eb_root root;
-	__decl_thread(HA_RWLOCK_T lock);
-};
-
 extern struct quic_dghdlr *quic_dghdlrs;
-extern struct quic_cid_tree *quic_cid_trees;
 
 #endif /* _HAPROXY_PROTO_QUIC_H  */

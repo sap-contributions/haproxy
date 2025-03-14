@@ -35,7 +35,7 @@
 #define	MODE_STARTING	0x20
 #define	MODE_FOREGROUND	0x40
 #define	MODE_MWORKER	0x80    /* Master Worker */
-#define	MODE_MWORKER_WAIT	0x100    /* Master Worker wait mode */
+/* (1<<8) unused */
 #define	MODE_ZERO_WARNING       0x200    /* warnings cause a failure */
 #define	MODE_DIAG	0x400   /* extra warnings */
 #define	MODE_CHECK_CONDITION	0x800    /* -cc mode */
@@ -44,9 +44,10 @@
 #define	MODE_DUMP_KWD   0x4000  /* dump registered keywords (see kwd_dump for the list) */
 #define	MODE_DUMP_CFG   0x8000  /* dump the configuration file */
 #define	MODE_DUMP_NB_L  0x10000 /* dump line numbers when the configuration file is dump */
+#define	MODE_DISCOVERY  0x20000 /* parse only keywords with KW_DISCOVERY flag to discover other global modes, i.e. daemon, master-worker */
 
 /* list of last checks to perform, depending on config options */
-#define LSTCHK_CAP_BIND	0x00000001	/* check that we can bind to any port */
+#define LSTCHK_SYSADM	0x00000001	/* check that we have CAP_SYS_ADMIN */
 #define LSTCHK_NETADM	0x00000002	/* check that we have CAP_NET_ADMIN */
 
 /* Global tuning options */
@@ -84,6 +85,8 @@
 #define GTUNE_LISTENER_MQ_FAIR   (1<<27)
 #define GTUNE_LISTENER_MQ_OPT    (1<<28)
 #define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
+#define GTUNE_QUIC_CC_HYSTART    (1<<29)
+#define GTUNE_QUIC_NO_UDP_GSO    (1<<30)
 
 #define NO_ZERO_COPY_FWD             0x0001 /* Globally disable zero-copy FF */
 #define NO_ZERO_COPY_FWD_PT          0x0002 /* disable zero-copy FF for PT (recv & send are disabled automatically) */
@@ -104,6 +107,13 @@ extern int cluster_secret_isset; /* non zero means a cluster secret was initiali
 enum {
 	SSL_SERVER_VERIFY_NONE = 0,
 	SSL_SERVER_VERIFY_REQUIRED = 1,
+};
+
+/* Takeover across thread groups */
+enum threadgroup_takeover {
+	NO_THREADGROUP_TAKEOVER = 0,
+	RESTRICTED_THREADGROUP_TAKEOVER = 1,
+	FULL_THREADGROUP_TAKEOVER = 2,
 };
 
 /* bit values to go with "warned" above */
@@ -154,26 +164,29 @@ struct global {
 	char *log_send_hostname;   /* set hostname in syslog header */
 	char *server_state_base;   /* path to a directory where server state files can be found */
 	char *server_state_file;   /* path to the file where server states are loaded from */
+	char *stats_file;          /* path to stats-file */
 	unsigned char cluster_secret[16]; /* 128 bits of an SHA1 digest of a secret defined as ASCII string */
 	struct {
 		int maxpollevents; /* max number of poll events at once */
+		int max_rules_at_once; /* max number of rules excecuted in a single evaluation loop */
 		int maxaccept;     /* max number of consecutive accept() */
 		int options;       /* various tuning options */
 		int runqueue_depth;/* max number of tasks to run at once */
-		int recv_enough;   /* how many input bytes at once are "enough" */
-		int bufsize;       /* buffer size in bytes, defaults to BUFSIZE */
+		uint recv_enough;  /* how many input bytes at once are "enough" */
+		uint bufsize;      /* buffer size in bytes, defaults to BUFSIZE */
+		uint bufsize_small;/* small buffer size in bytes */
 		int maxrewrite;    /* buffer max rewrite size in bytes, defaults to MAXREWRITE */
 		int reserved_bufs; /* how many buffers can only be allocated for response */
 		int buf_limit;     /* if not null, how many total buffers may only be allocated */
-		int client_sndbuf; /* set client sndbuf to this value if not null */
-		int client_rcvbuf; /* set client rcvbuf to this value if not null */
-		int server_sndbuf; /* set server sndbuf to this value if not null */
-		int server_rcvbuf; /* set server rcvbuf to this value if not null */
-		int frontend_sndbuf; /* set frontend dgram sndbuf to this value if not null */
-		int frontend_rcvbuf; /* set frontend dgram rcvbuf to this value if not null */
-		int backend_sndbuf;  /* set backend dgram sndbuf to this value if not null */
-		int backend_rcvbuf;  /* set backend dgram rcvbuf to this value if not null */
-		int pipesize;      /* pipe size in bytes, system defaults if zero */
+		uint client_sndbuf;   /* set client sndbuf to this value if not null */
+		uint client_rcvbuf;   /* set client rcvbuf to this value if not null */
+		uint server_sndbuf;   /* set server sndbuf to this value if not null */
+		uint server_rcvbuf;   /* set server rcvbuf to this value if not null */
+		uint frontend_sndbuf; /* set frontend dgram sndbuf to this value if not null */
+		uint frontend_rcvbuf; /* set frontend dgram rcvbuf to this value if not null */
+		uint backend_sndbuf;  /* set backend dgram sndbuf to this value if not null */
+		uint backend_rcvbuf;  /* set backend dgram rcvbuf to this value if not null */
+		uint pipesize;     /* pipe size in bytes, system defaults if zero */
 		int max_http_hdr;  /* max number of HTTP headers, use MAX_HTTP_HDR if zero */
 		int requri_len;    /* max len of request URI, use REQURI_LEN if zero */
 		int cookie_len;    /* max length of cookie captures */
@@ -185,19 +198,25 @@ struct global {
 		int pool_low_count;   /* max number of opened fd before we stop using new idle connections */
 		int pool_high_count;  /* max number of opened fd before we start killing idle connections when creating new connections */
 		size_t pool_cache_size;    /* per-thread cache size per pool (defaults to CONFIG_HAP_POOL_CACHE_SIZE) */
+		int renice_startup;     /* startup nice()+100 value during startup; 0 = unset */
+		int renice_runtime;     /* startup nice()+100 value during runtime; 0 = unset */
 		unsigned short idle_timer; /* how long before an empty buffer is considered idle (ms) */
 		unsigned short no_zero_copy_fwd; /* Flags to disable zero-copy fast-forwarding (global & per-protocols) */
 		int nb_stk_ctr;       /* number of stick counters, defaults to MAX_SESS_STKCTR */
 		int default_shards; /* default shards for listeners, or -1 (by-thread) or -2 (by-group) */
 		uint max_checks_per_thread; /* if >0, no more than this concurrent checks per thread */
+		uint ring_queues;   /* if >0, #ring queues, otherwise equals #thread groups */
+		enum threadgroup_takeover tg_takeover; /* Policy for threadgroup takeover */
 #ifdef USE_QUIC
 		unsigned int quic_backend_max_idle_timeout;
 		unsigned int quic_frontend_max_idle_timeout;
+		unsigned int quic_frontend_glitches_threshold;
 		unsigned int quic_frontend_max_streams_bidi;
+		size_t quic_frontend_max_window_size;
 		unsigned int quic_retry_threshold;
 		unsigned int quic_reorder_ratio;
-		unsigned int quic_streams_buf;
 		unsigned int quic_max_frame_loss;
+		unsigned int quic_cubic_loss_tol;
 #endif /* USE_QUIC */
 	} tune;
 	struct {
@@ -210,10 +229,18 @@ struct global {
 	} unix_bind;
 	struct proxy *cli_fe;           /* the frontend holding the stats settings */
 	int numa_cpu_mapping;
+	int thread_limit;               /* hard limit on the number of threads */
 	int prealloc_fd;
+	uchar clt_privileged_ports;     /* bitmask to allow client privileged ports exchanges per protocol */
+	unsigned char argc;		/* cast int argc to unsigned char in order to fill better the previous
+					 * 3 bytes hole, it seems unreal, that oneday we could start with more
+					 * than 255 arguments
+					 */
+	/* 2-bytes hole */
 	int cfg_curr_line;              /* line number currently being parsed */
 	const char *cfg_curr_file;      /* config file currently being parsed or NULL */
 	char *cfg_curr_section;         /* config section name currently being parsed or NULL */
+	char **argv;			/* ptr to array with args */
 
 	/* The info above is config stuff, it doesn't change during the process' life */
 	/* A number of the elements below are updated by all threads in real time and

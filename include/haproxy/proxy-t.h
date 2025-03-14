@@ -34,7 +34,7 @@
 #include <haproxy/backend-t.h>
 #include <haproxy/compression-t.h>
 #include <haproxy/counters-t.h>
-#include <haproxy/freq_ctr-t.h>
+#include <haproxy/guid-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/queue-t.h>
 #include <haproxy/server-t.h>
@@ -45,14 +45,19 @@
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/http_ext-t.h>
 
-/* values for proxy->mode */
+/* values for proxy->mode, only one value per proxy.
+ *
+ * values are bitfield compatible so that functions may
+ * take a bitfield of compatible modes as parameter
+ */
 enum pr_mode {
-	PR_MODE_TCP = 0,
-	PR_MODE_HTTP,
-	PR_MODE_CLI,
-	PR_MODE_SYSLOG,
-	PR_MODE_PEERS,
-	PR_MODES
+	PR_MODES       = 0x00,
+	PR_MODE_TCP    = 0x01,
+	PR_MODE_HTTP   = 0x02,
+	PR_MODE_CLI    = 0x04,
+	PR_MODE_SYSLOG = 0x08,
+	PR_MODE_PEERS  = 0x10,
+	PR_MODE_SPOP   = 0x20,
 } __attribute__((packed));
 
 enum PR_SRV_STATE_FILE {
@@ -150,7 +155,8 @@ enum PR_SRV_STATE_FILE {
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_DEL  0x00800000 /* remove request header names containing chars outside of [0-9a-zA-Z-] charset */
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_NOOP 0x01000000 /* preserve request header names containing chars outside of [0-9a-zA-Z-] charset */
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_MASK 0x01c00000 /* mask for restrict-http-header-names option */
-/* unused : 0x0000000..0x80000000 */
+
+/* unused : 0x02000000 ... 0x08000000 */
 
 /* server health checks */
 #define PR_O2_CHK_NONE  0x00000000      /* no L7 health checks configured (TCP by default) */
@@ -159,6 +165,23 @@ enum PR_SRV_STATE_FILE {
 /* unused: 0xB0000000 to 0xF000000, reserved for health checks */
 #define PR_O2_CHK_ANY   0xF0000000      /* Mask to cover any check */
 /* end of proxy->options2 */
+
+/* bits for proxy->options3 */
+
+/*   bits for log-forward proxies */
+#define PR_O3_DONTPARSELOG       0x00000001 /* don't parse log messages */
+#define PR_O3_ASSUME_RFC6587_NTF 0x00000002 /* assume that we are going to receive just non-transparent framing messages */
+
+/* unused: 0x00000004 to 0x00000008 */
+
+#define PR_O3_LOGF_HOST_REPLACE  0x00000010
+#define PR_O3_LOGF_HOST_FILL     0x00000020
+#define PR_O3_LOGF_HOST_KEEP     0x00000040
+#define PR_O3_LOGF_HOST_APPEND   0x00000080
+#define PR_O3_LOGF_HOST          0x000000F0
+
+/* unused: 0x00000100 to  0x80000000 */
+/* end of proxy->options3 */
 
 /* Cookie settings for pr->ck_opts */
 #define PR_CK_RW        0x00000001      /* rewrite all direct cookies with the right serverid */
@@ -191,16 +214,18 @@ enum PR_SRV_STATE_FILE {
 #define PR_RE_403                 0x00000010 /* Retry if we got a 403 */
 #define PR_RE_404                 0x00000020 /* Retry if we got a 404 */
 #define PR_RE_408                 0x00000040 /* Retry if we got a 408 */
-#define PR_RE_425                 0x00000080 /* Retry if we got a 425 */
-#define PR_RE_500                 0x00000100 /* Retry if we got a 500 */
-#define PR_RE_501                 0x00000200 /* Retry if we got a 501 */
-#define PR_RE_502                 0x00000400 /* Retry if we got a 502 */
-#define PR_RE_503                 0x00000800 /* Retry if we got a 503 */
-#define PR_RE_504                 0x00001000 /* Retry if we got a 504 */
+#define PR_RE_421                 0x00000080 /* Retry if we got a 421 */
+#define PR_RE_425                 0x00000100 /* Retry if we got a 425 */
+#define PR_RE_429                 0x00000200 /* Retry if we got a 429 */
+#define PR_RE_500                 0x00000400 /* Retry if we got a 500 */
+#define PR_RE_501                 0x00000800 /* Retry if we got a 501 */
+#define PR_RE_502                 0x00001000 /* Retry if we got a 502 */
+#define PR_RE_503                 0x00002000 /* Retry if we got a 503 */
+#define PR_RE_504                 0x00004000 /* Retry if we got a 504 */
 #define PR_RE_STATUS_MASK         (PR_RE_401 | PR_RE_403 | PR_RE_404 | \
-                                   PR_RE_408 | PR_RE_425 | PR_RE_500 | \
-                                   PR_RE_501 | PR_RE_502 | PR_RE_503 | \
-                                   PR_RE_504)
+                                   PR_RE_408 | PR_RE_421 | PR_RE_425 | \
+                                   PR_RE_429 | PR_RE_500 | PR_RE_501 | \
+                                   PR_RE_502 | PR_RE_503 | PR_RE_504)
 /* 0x00000800, 0x00001000, 0x00002000, 0x00004000 and 0x00008000 unused,
  * reserved for eventual future status codes
  */
@@ -214,6 +239,7 @@ enum PR_SRV_STATE_FILE {
 #define PR_FL_EXPLICIT_REF       0x08  /* The default proxy is explicitly referenced by another proxy */
 #define PR_FL_IMPLICIT_REF       0x10  /* The default proxy is implicitly referenced by another proxy */
 #define PR_FL_PAUSED             0x20  /* The proxy was paused at run time (reversible) */
+#define PR_FL_CHECKED            0x40  /* The proxy configuration was fully checked (including postparsing checks) */
 
 struct stream;
 
@@ -267,6 +293,11 @@ struct error_snapshot {
 	char buf[VAR_ARRAY];                    /* copy of the beginning of the message for bufsize bytes */
 };
 
+/* Each proxy will have one occurence of this structure per thread group */
+struct proxy_per_tgroup {
+	struct queue queue;
+} THREAD_ALIGNED(64);
+
 struct proxy {
 	enum obj_type obj_type;                 /* object type == OBJ_TYPE_PROXY */
 	char flags;                             /* bit field PR_FL_* */
@@ -276,6 +307,7 @@ struct proxy {
 
 	int options;				/* PR_O_REDISP, PR_O_TRANSP, ... */
 	int options2;				/* PR_O2_* */
+	int options3;                           /* PR_O3_* */
 	unsigned int ck_opts;			/* PR_CK_* (cookie options) */
 	unsigned int fe_req_ana, be_req_ana;	/* bitmap of common request protocol analysers for the frontend and backend */
 	unsigned int fe_rsp_ana, be_rsp_ana;	/* bitmap of common response protocol analysers for the frontend and backend */
@@ -305,11 +337,15 @@ struct proxy {
 		unsigned int inspect_delay;     /* inspection delay */
 		struct list inspect_rules;      /* inspection rules */
 	} tcp_rep;
+#ifdef USE_QUIC
+	struct list quic_init_rules;		/* quic-initial rules */
+#endif
 	struct server *srv, defsrv;		/* known servers; default server configuration */
 	struct lbprm lbprm;			/* load-balancing parameters */
 	int srv_act, srv_bck;			/* # of servers eligible for LB (UP|!checked) AND (enabled+weight!=0) */
 	int served;				/* # of active sessions currently being served */
 	int  cookie_len;			/* strlen(cookie_name), computed only once */
+	struct server *ready_srv;		/* a server being ready to serve requests */
 	char *cookie_domain;			/* domain used to insert the cookie */
 	char *cookie_name;			/* name of the cookie to look for */
 	char *cookie_attrs;                     /* list of attributes to add to the cookie */
@@ -349,13 +385,10 @@ struct proxy {
 	__decl_thread(HA_RWLOCK_T lock);        /* may be taken under the server's lock */
 
 	char *id, *desc;			/* proxy id (name) and description */
-	struct queue queue;			/* queued requests (pendconns) */
+	struct proxy_per_tgroup *per_tgrp;	/* array of per-tgroup stuff such as queues */
+	unsigned int queueslength;		/* Sum of the length of each queue */
 	int totpend;				/* total number of pending connections on this instance (for stats) */
 	unsigned int feconn, beconn;		/* # of active frontend and backends streams */
-	struct freq_ctr fe_req_per_sec;		/* HTTP requests per second on the frontend */
-	struct freq_ctr fe_conn_per_sec;	/* received connections per second on the frontend */
-	struct freq_ctr fe_sess_per_sec;	/* accepted sessions per second on the frontend (after tcp rules) */
-	struct freq_ctr be_sess_per_sec;	/* sessions per second on the backend */
 	unsigned int fe_sps_lim;		/* limit on new sessions per second on the frontend */
 	unsigned int fullconn;			/* #conns on backend above which servers are used at full load */
 	unsigned int tot_fe_maxconn;		/* #maxconn of frontends linked to that backend, it is used to compute fullconn */
@@ -363,9 +396,7 @@ struct proxy {
 	int conn_retries;			/* maximum number of connect retries */
 	unsigned int retry_type;                /* Type of retry allowed */
 	int redispatch_after;			/* number of retries before redispatch */
-	unsigned down_trans;			/* up-down transitions */
 	unsigned down_time;			/* total time the proxy was down */
-	time_t last_change;			/* last time, when the state was changed */
 	int (*accept)(struct stream *s);       /* application layer's accept() */
 	struct conn_src conn_src;               /* connection source settings */
 	enum obj_type *default_target;		/* default target to use for accepted streams or NULL */
@@ -373,13 +404,13 @@ struct proxy {
 	struct proxy *next_stkt_ref;    /* Link to the list of proxies which refer to the same stick-table. */
 
 	struct list loggers;                    /* one per 'log' directive */
-	struct list logformat; 			/* log_format linked list */
-	struct list logformat_sd;		/* log_format linked list for the RFC5424 structured-data part */
-	struct list logformat_error;		/* log_format linked list used in case of connection error on the frontend */
+	struct lf_expr logformat; 	        /* log_format linked list */
+	struct lf_expr logformat_sd;	        /* log_format linked list for the RFC5424 structured-data part */
+	struct lf_expr logformat_error;	        /* log_format linked list used in case of connection error on the frontend */
 	struct buffer log_tag;                   /* override default syslog tag */
 	struct ist header_unique_id; 		/* unique-id header */
-	struct list format_unique_id;		/* unique-id format */
-	int to_log;				/* things to be logged (LW_*) */
+	struct lf_expr format_unique_id;        /* unique-id format */
+	int to_log;				/* things to be logged (LW_*), special value LW_LOGSTEPS == follow log-steps */
 	int nb_req_cap, nb_rsp_cap;		/* # of headers to be captured */
 	struct cap_hdr *req_cap;		/* chained list of request headers to be captured */
 	struct cap_hdr *rsp_cap;		/* chained list of response headers to be captured */
@@ -412,9 +443,10 @@ struct proxy {
 	/* used only during configuration parsing */
 	int no_options;				/* PR_O_REDISP, PR_O_TRANSP, ... */
 	int no_options2;			/* PR_O2_* */
+	int no_options3;                        /* PR_O3_* */
 
 	struct {
-		char *file;			/* file where the section appears */
+		const char *file;		/* file where the section appears */
 		struct eb32_node id;		/* place in the tree of used IDs */
 		int line;			/* line where the section appears */
 		struct eb_root used_listener_id;/* list of listener IDs in use */
@@ -424,20 +456,12 @@ struct proxy {
 		struct list listeners;		/* list of listeners belonging to this frontend */
 		struct list errors;             /* list of all custom error files */
 		struct arg_list args;           /* sample arg list that need to be resolved */
-		unsigned int refcount;          /* refcount on this proxy (only used for default proxy for now) */
 		struct ebpt_node by_name;       /* proxies are stored sorted by name here */
-		char *logformat_string;		/* log format string */
-		char *lfs_file;                 /* file name where the logformat string appears (strdup) */
-		int   lfs_line;                 /* file name where the logformat string appears */
-		int   uif_line;                 /* file name where the unique-id-format string appears */
-		char *uif_file;                 /* file name where the unique-id-format string appears (strdup) */
-		char *uniqueid_format_string;	/* unique-id format string */
-		char *logformat_sd_string;	/* log format string for the RFC5424 structured-data part */
-		char *lfsd_file;		/* file name where the structured-data logformat string for RFC5424 appears (strdup) */
-		int  lfsd_line;			/* file name where the structured-data logformat string for RFC5424 appears */
-		char *error_logformat_string;
-		char *elfs_file;
-		int elfs_line;
+		struct list lf_checks;          /* list of logformats found in the proxy section that needs to be checked during postparse */
+		struct eb_root log_steps;       /* tree of log origins where log should be generated during request handling */
+		const char *file_prev;          /* file of the previous instance found with the same name, or NULL */
+		int line_prev;                  /* line of the previous instance found with the same name, or 0 */
+		unsigned int refcount;          /* refcount on this proxy (only used for default proxy for now) */
 	} conf;					/* config information */
 	struct http_ext *http_ext;	        /* http ext options */
 	struct eb_root used_server_addr;        /* list of server addresses in use */
@@ -454,7 +478,7 @@ struct proxy {
 		char *myhostname;		/* Identity to use in HELO command sent to mailer */
 		int level;			/* Maximum syslog level of messages to send
 						 * email alerts for */
-		int set;			/* True if email_alert settings are present */
+		int flags;                      /* check mailers.h for available flags */
 		struct email_alertq *queues;	/* per-mailer alerts queues */
 	} email_alert;
 
@@ -467,6 +491,8 @@ struct proxy {
 						 */
 	struct list filter_configs;		/* list of the filters that are declared on this proxy */
 
+	struct guid_node guid;			/* GUID global tree node */
+
 	EXTRA_COUNTERS(extra_counters_fe);
 	EXTRA_COUNTERS(extra_counters_be);
 };
@@ -478,7 +504,7 @@ struct switching_rule {
 	union {
 		struct proxy *backend;		/* target backend */
 		char *name;			/* target backend name during config parsing */
-		struct list expr;		/* logformat expression to use for dynamic rules */
+		struct lf_expr expr;	        /* logformat expression to use for dynamic rules */
 	} be;
 	char *file;
 	int line;
@@ -492,7 +518,7 @@ struct server_rule {
 		struct server *ptr;		/* target server */
 		char *name;			/* target server name during config parsing */
 	} srv;
-	struct list expr;		/* logformat expression to use for dynamic rules */
+	struct lf_expr expr;		/* logformat expression to use for dynamic rules */
 	char *file;
 	int line;
 };
@@ -521,11 +547,13 @@ struct redirect_rule {
 	int type;
 	int rdr_len;
 	char *rdr_str;
-	struct list rdr_fmt;
+	struct lf_expr rdr_fmt;
 	int code;
 	unsigned int flags;
-	int cookie_len;
-	char *cookie_str;
+	union {
+		struct ist str;     /* the cookie is a string  */
+		struct lf_expr fmt; /* or a log-format string (possible for set-cookie only) */
+	} cookie;
 };
 
 /* some of the most common options which are also the easiest to handle */

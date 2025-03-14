@@ -312,8 +312,9 @@ _version() {
 
 
 HAPROXY_PROGRAM="${HAPROXY_PROGRAM:-${PWD}/haproxy}"
-HAPROXY_ARGS="${HAPROXY_ARGS--dM}"
+HAPROXY_ARGS="${HAPROXY_ARGS--dM -dI -dW}"
 VTEST_PROGRAM="${VTEST_PROGRAM:-vtest}"
+VTEST_TIMEOUT="${VTEST_TIMEOUT:-10}"
 TESTDIR="${TMPDIR:-/tmp}"
 REGTESTS=""
 LINEFEED="
@@ -344,16 +345,16 @@ if [ $preparefailed ]; then
 fi
 
 { read HAPROXY_VERSION; read TARGET; read FEATURES; read SERVICES; } << EOF
-$($HAPROXY_PROGRAM $HAPROXY_ARGS -vv | grep 'HA-\?Proxy version\|TARGET.*=\|^Feature\|^Available services' | sed 's/.* [:=] //')
+$($HAPROXY_PROGRAM $HAPROXY_ARGS -vv | grep -E 'HA-?Proxy version|TARGET.*=|^Feature|^Available services' | sed 's/.* [:=] //')
 EOF
 
 HAPROXY_VERSION=$(echo $HAPROXY_VERSION | cut -d " " -f 3)
 echo "Testing with haproxy version: $HAPROXY_VERSION"
 
-PROJECT_VERSION=$(${MAKE:-make} version 2>&1 | grep '^VERSION:\|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
+PROJECT_VERSION=$(${MAKE:-make} version 2>&1 | grep -E '^VERSION:|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
 if [ -z "${PROJECT_VERSION}${MAKE}" ]; then
         # try again with gmake, just in case
-        PROJECT_VERSION=$(gmake version 2>&1 | grep '^VERSION:\|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
+        PROJECT_VERSION=$(gmake version 2>&1 | grep -E '^VERSION:|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
 fi
 
 FEATURES_PATTERN=" $FEATURES "
@@ -396,7 +397,7 @@ if [ -n "$testlist" ]; then
   if [ -n "$jobcount" ]; then
     jobcount="-j $jobcount"
   fi
-  cmd="$VTEST_PROGRAM -b $((2<<20)) -k -t 10 $keep_logs $verbose $debug $jobcount $vtestparams $testlist"
+  cmd="$VTEST_PROGRAM -b $((2<<20)) -k -t ${VTEST_TIMEOUT} $keep_logs $verbose $debug $jobcount $vtestparams $testlist"
   eval $cmd
   _vtresult=$?
 else

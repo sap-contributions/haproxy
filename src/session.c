@@ -19,18 +19,49 @@
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/pool.h>
+#include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/session.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/tools.h>
+#include <haproxy/trace.h>
 #include <haproxy/vars.h>
 
 
 DECLARE_POOL(pool_head_session, "session", sizeof(struct session));
-DECLARE_POOL(pool_head_sess_srv_list, "session server list",
-		sizeof(struct sess_srv_list));
+DECLARE_POOL(pool_head_sess_priv_conns, "session priv conns list",
+             sizeof(struct sess_priv_conns));
 
 int conn_complete_session(struct connection *conn);
+
+static const struct trace_event sess_trace_events[] = {
+#define           SESS_EV_NEW       (1ULL <<  0)
+	{ .mask = SESS_EV_NEW,      .name = "sess_new",     .desc = "new session creation" },
+#define           SESS_EV_END       (1ULL <<  1)
+	{ .mask = SESS_EV_END,      .name = "sess_end",     .desc = "session termination" },
+#define           SESS_EV_ERR       (1ULL <<  1)
+	{ .mask = SESS_EV_ERR,      .name = "sess_err",     .desc = "session error" },
+	{ }
+};
+
+static const struct name_desc sess_trace_lockon_args[4] = {
+	/* arg1 */ { /* already used by the session */ },
+	/* arg2 */ { },
+	/* arg3 */ { },
+	/* arg4 */ { }
+};
+
+static struct trace_source trace_sess __read_mostly = {
+	.name = IST("session"),
+	.desc = "client session management",
+	.arg_def = TRC_ARG1_SESS,  // TRACE()'s first argument is always a session
+	.known_events = sess_trace_events,
+	.lockon_args = sess_trace_lockon_args,
+	.report_events = ~0,  // report everything by default
+};
+
+#define TRACE_SOURCE &trace_sess
+INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
 /* Create a a new session and assign it to frontend <fe>, listener <li>,
  * origin <origin>, set the current date and clear the stick counters pointers.
@@ -40,6 +71,8 @@ int conn_complete_session(struct connection *conn);
 struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type *origin)
 {
 	struct session *sess;
+
+	TRACE_ENTER(SESS_EV_NEW);
 
 	sess = pool_alloc(pool_head_session);
 	if (sess) {
@@ -61,53 +94,57 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 		sess->t_idle = -1;
 		_HA_ATOMIC_INC(&totalconn);
 		_HA_ATOMIC_INC(&jobs);
-		LIST_INIT(&sess->srv_list);
+		LIST_INIT(&sess->priv_conns);
 		sess->idle_conns = 0;
 		sess->flags = SESS_FL_NONE;
 		sess->src = NULL;
 		sess->dst = NULL;
+		TRACE_STATE("new session", SESS_EV_NEW, sess);
 	}
+	TRACE_LEAVE(SESS_EV_NEW);
 	return sess;
  out_fail_alloc:
 	pool_free(pool_head_session, sess);
+	TRACE_DEVEL("leaving in error", SESS_EV_NEW|SESS_EV_END|SESS_EV_ERR);
 	return NULL;
 }
 
 void session_free(struct session *sess)
 {
 	struct connection *conn, *conn_back;
-	struct sess_srv_list *srv_list, *srv_list_back;
+	struct sess_priv_conns *pconns, *pconns_back;
 
-	if (sess->listener)
+	TRACE_ENTER(SESS_EV_END);
+	TRACE_STATE("releasing session", SESS_EV_END, sess);
+
+	if (sess->flags & SESS_FL_RELEASE_LI) {
+		/* listener must be set for session used to account FE conns. */
+		BUG_ON(!sess->listener);
 		listener_release(sess->listener);
+	}
+
 	session_store_counters(sess);
 	pool_free(pool_head_stk_ctr, sess->stkctr);
 	vars_prune_per_sess(&sess->vars);
 	conn = objt_conn(sess->origin);
 	if (conn != NULL && conn->mux)
 		conn->mux->destroy(conn->ctx);
-	list_for_each_entry_safe(srv_list, srv_list_back, &sess->srv_list, srv_list) {
-		list_for_each_entry_safe(conn, conn_back, &srv_list->conn_list, session_list) {
-			LIST_DEL_INIT(&conn->session_list);
-			if (conn->mux) {
-				conn->owner = NULL;
-				conn->flags &= ~CO_FL_SESS_IDLE;
-				conn->mux->destroy(conn->ctx);
-			} else {
-				/* We have a connection, but not yet an associated mux.
-				 * So destroy it now.
-				 */
-				conn_stop_tracking(conn);
-				conn_full_close(conn);
-				conn_free(conn);
-			}
+	list_for_each_entry_safe(pconns, pconns_back, &sess->priv_conns, sess_el) {
+		list_for_each_entry_safe(conn, conn_back, &pconns->conn_list, sess_el) {
+			LIST_DEL_INIT(&conn->sess_el);
+			conn->owner = NULL;
+			conn->flags &= ~CO_FL_SESS_IDLE;
+			conn_release(conn);
 		}
-		pool_free(pool_head_sess_srv_list, srv_list);
+		MT_LIST_DELETE(&pconns->srv_el);
+		pool_free(pool_head_sess_priv_conns, pconns);
 	}
 	sockaddr_free(&sess->src);
 	sockaddr_free(&sess->dst);
 	pool_free(pool_head_session, sess);
 	_HA_ATOMIC_DEC(&jobs);
+
+	TRACE_LEAVE(SESS_EV_END);
 }
 
 /* callback used from the connection/mux layer to notify that a connection is
@@ -190,16 +227,23 @@ int session_accept_fd(struct connection *cli_conn)
 		}
 	}
 
-	sess = session_new(p, l, &cli_conn->obj_type);
-	if (!sess)
-		goto out_free_conn;
+	/* Reversed conns already have an assigned session, do not recreate it. */
+	if (!(cli_conn->flags & CO_FL_REVERSED)) {
+		sess = session_new(p, l, &cli_conn->obj_type);
+		if (!sess)
+			goto out_free_conn;
 
-	conn_set_owner(cli_conn, sess, NULL);
+		conn_set_owner(cli_conn, sess, NULL);
+	}
+	else {
+		sess = cli_conn->owner;
+	}
 
 	/* now evaluate the tcp-request layer4 rules. We only need a session
 	 * and no stream for these rules.
 	 */
-	if (!LIST_ISEMPTY(&p->tcp_req.l4_rules) && !tcp_exec_l4_rules(sess)) {
+	if (((sess->fe->defpx && !LIST_ISEMPTY(&sess->fe->defpx->tcp_req.l4_rules)) ||
+	     !LIST_ISEMPTY(&p->tcp_req.l4_rules)) && !tcp_exec_l4_rules(sess)) {
 		/* let's do a no-linger now to close with a single RST. */
 		if (!(cli_conn->flags & CO_FL_FDLESS))
 			setsockopt(cfd, SOL_SOCKET, SO_LINGER, (struct linger *) &nolinger, sizeof(struct linger));
@@ -293,12 +337,19 @@ int session_accept_fd(struct connection *cli_conn)
 		sess->task->process = session_expire_embryonic;
 		sess->task->expire  = tick_add_ifset(now_ms, timeout);
 		task_queue(sess->task);
+
+		/* Session is responsible to decrement listener conns counters. */
+		sess->flags |= SESS_FL_RELEASE_LI;
+
 		return 1;
 	}
 
 	/* OK let's complete stream initialization since there is no handshake */
-	if (conn_complete_session(cli_conn) >= 0)
+	if (conn_complete_session(cli_conn) >= 0) {
+		/* Session is responsible to decrement listener conns counters. */
+		sess->flags |= SESS_FL_RELEASE_LI;
 		return 1;
+	}
 
 	/* if we reach here we have deliberately decided not to keep this
 	 * session (e.g. tcp-request rule), so that's not an error we should
@@ -308,9 +359,9 @@ int session_accept_fd(struct connection *cli_conn)
 
 	/* error unrolling */
  out_free_sess:
-	 /* prevent call to listener_release during session_free. It will be
-	  * done below, for all errors. */
-	sess->listener = NULL;
+	/* SESS_FL_RELEASE_LI must not be set here as listener_release() is
+	 * called manually for all errors.
+	 */
 	session_free(sess);
 
  out_free_conn:
@@ -322,25 +373,18 @@ int session_accept_fd(struct connection *cli_conn)
 		     MSG_DONTWAIT|MSG_NOSIGNAL);
 	}
 
-	if (cli_conn->mux) {
-		/* Mux is already initialized for active reversed connection. */
-		cli_conn->mux->destroy(cli_conn->ctx);
-	}
-	else {
-		conn_stop_tracking(cli_conn);
-		conn_full_close(cli_conn);
-		conn_free(cli_conn);
-	}
+	/* Mux is already initialized for active reversed connection. */
+	conn_release(cli_conn);
 	listener_release(l);
 	return ret;
 }
 
 
-/* prepare the trash with a log prefix for session <sess>. It only works with
+/* prepare <out> buffer with a log prefix for session <sess>. It only works with
  * embryonic sessions based on a real connection. This function requires that
  * at sess->origin points to the incoming connection.
  */
-static void session_prepare_log_prefix(struct session *sess)
+static void session_prepare_log_prefix(struct session *sess, struct buffer *out)
 {
 	const struct sockaddr_storage *src;
 	struct tm tm;
@@ -351,37 +395,41 @@ static void session_prepare_log_prefix(struct session *sess)
 	src = sess_src(sess);
 	ret = (src ? addr_to_str(src, pn, sizeof(pn)) : 0);
 	if (ret <= 0)
-		chunk_printf(&trash, "unknown [");
-	else if (ret == AF_UNIX)
-		chunk_printf(&trash, "%s:%d [", pn, sess->listener->luid);
+		chunk_printf(out, "unknown [");
+	else if (real_family(ret) == AF_UNIX)
+		chunk_printf(out, "%s:%d [", pn, sess->listener->luid);
 	else
-		chunk_printf(&trash, "%s:%d [", pn, get_host_port(src));
+		chunk_printf(out, "%s:%d [", pn, get_host_port(src));
 
 	get_localtime(sess->accept_date.tv_sec, &tm);
-	end = date2str_log(trash.area + trash.data, &tm, &(sess->accept_date),
-		           trash.size - trash.data);
-	trash.data = end - trash.area;
+	end = date2str_log(out->area + out->data, &tm, &(sess->accept_date),
+		           out->size - out->data);
+	out->data = end - out->area;
 	if (sess->listener->name)
-		chunk_appendf(&trash, "] %s/%s", sess->fe->id, sess->listener->name);
+		chunk_appendf(out, "] %s/%s", sess->fe->id, sess->listener->name);
 	else
-		chunk_appendf(&trash, "] %s/%d", sess->fe->id, sess->listener->luid);
+		chunk_appendf(out, "] %s/%d", sess->fe->id, sess->listener->luid);
 }
 
 
-/* fill the trash buffer with the string to use for send_log during
+/* fill <out> buffer with the string to use for send_log during
  * session_kill_embryonic(). Add log prefix and error string.
+ *
+ * It expects that the session originates from a connection.
  *
  * The function is able to dump an SSL error string when CO_ER_SSL_HANDSHAKE
  * is met.
  */
-static void session_build_err_string(struct session *sess)
+void session_embryonic_build_legacy_err(struct session *sess, struct buffer *out)
 {
-	struct connection *conn = __objt_conn(sess->origin);
+	struct connection *conn = objt_conn(sess->origin);
 	const char *err_msg;
 	struct ssl_sock_ctx __maybe_unused *ssl_ctx;
 
+	BUG_ON(!conn);
+
 	err_msg	= conn_err_code_str(conn);
-	session_prepare_log_prefix(sess); /* use trash buffer */
+	session_prepare_log_prefix(sess, out);
 
 #ifdef USE_OPENSSL
 	ssl_ctx = conn_get_ssl_sock_ctx(conn);
@@ -389,19 +437,19 @@ static void session_build_err_string(struct session *sess)
 	/* when the SSL error code is present and during a SSL Handshake failure,
 	 * try to dump the error string from OpenSSL */
 	if (conn->err_code == CO_ER_SSL_HANDSHAKE && ssl_ctx && ssl_ctx->error_code != 0) {
-		chunk_appendf(&trash, ": SSL handshake failure (");
-		ERR_error_string_n(ssl_ctx->error_code, b_orig(&trash)+b_data(&trash), b_room(&trash));
-		trash.data = strlen(b_orig(&trash));
-		chunk_appendf(&trash, ")\n");
+		chunk_appendf(out, ": SSL handshake failure (");
+		ERR_error_string_n(ssl_ctx->error_code, b_orig(out)+b_data(out), b_room(out));
+		out->data = strlen(b_orig(out));
+		chunk_appendf(out, ")\n");
 	}
 
 	else
 #endif /* ! USE_OPENSSL */
 
 	if (err_msg)
-		chunk_appendf(&trash, ": %s\n", err_msg);
+		chunk_appendf(out, ": %s\n", err_msg);
 	else
-		chunk_appendf(&trash, ": unknown connection error (code=%d flags=%08x)\n",
+		chunk_appendf(out, ": unknown connection error (code=%d flags=%08x)\n",
 		              conn->err_code, conn->flags);
 
 	return;
@@ -416,13 +464,9 @@ static void session_build_err_string(struct session *sess)
  */
 static void session_kill_embryonic(struct session *sess, unsigned int state)
 {
-	int level = LOG_INFO;
 	struct connection *conn = __objt_conn(sess->origin);
 	struct task *task = sess->task;
 	unsigned int log = sess->fe->to_log;
-
-	if (sess->fe->options2 & PR_O2_LOGERRORS)
-		level = LOG_ERR;
 
 	if (log && (sess->fe->options & PR_O_NULLNOLOG)) {
 		/* with "option dontlognull", we don't log connections with no transfer */
@@ -443,14 +487,7 @@ static void session_kill_embryonic(struct session *sess, unsigned int state)
 				conn->err_code = CO_ER_SSL_TIMEOUT;
 		}
 
-		if(!LIST_ISEMPTY(&sess->fe->logformat_error)) {
-			/* Display a log line following the configured error-log-format. */
-			sess_log(sess);
-		}
-		else {
-			session_build_err_string(sess);
-			send_log(sess->fe, level, "%s", trash.area);
-		}
+		sess_log_embryonic(sess);
 	}
 
 	/* kill the connection now */
@@ -498,7 +535,8 @@ int conn_complete_session(struct connection *conn)
 		conn->flags |= CO_FL_XPRT_TRACKED;
 
 	/* we may have some tcp-request-session rules */
-	if (!LIST_ISEMPTY(&sess->fe->tcp_req.l5_rules) && !tcp_exec_l5_rules(sess))
+	if (((sess->fe->defpx && !LIST_ISEMPTY(&sess->fe->defpx->tcp_req.l5_rules)) ||
+	     !LIST_ISEMPTY(&sess->fe->tcp_req.l5_rules)) && !tcp_exec_l5_rules(sess))
 		goto fail;
 
 	session_count_new(sess);

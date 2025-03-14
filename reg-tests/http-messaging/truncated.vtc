@@ -1,5 +1,4 @@
 varnishtest "HTTP response size tests: H2->H1 (HTX and legacy mode)"
-#REQUIRE_VERSION=1.9
 
 feature ignore_unknown_macro
 
@@ -8,7 +7,9 @@ server s1 {
 	txresp \
 	  -status 200 \
 	  -nolen \
-	  -hdr "Transfer-encoding: chunked"
+	  -hdr "Transfer-encoding: chunked" \
+	  -hdr "Connection: close"
+
 	#  -bodylen 16300
 	#chunkedlen 16300
 	#delay 0.05
@@ -56,6 +57,7 @@ server s1 {
 	#delay 0.05
 	chunkedlen 815
 	delay 0.05
+	chunkedlen 0
 } -repeat 2 -start
 
 haproxy h1 -conf {

@@ -48,6 +48,7 @@ extern struct polled_mask *polled_mask;
 
 extern THREAD_LOCAL int *fd_updt;  // FD updates list
 extern THREAD_LOCAL int fd_nbupdt; // number of updates in the list
+extern THREAD_LOCAL int fd_highest;// highest FD known by the current thread
 
 extern int poller_wr_pipe[MAX_THREADS];
 
@@ -80,9 +81,6 @@ ssize_t fd_write_frag_line(int fd, size_t maxlen, const struct ist pfx[], size_t
 
 /* close all FDs starting from <start> */
 void my_closefrom(int start);
-
-struct rlimit;
-int raise_rlim_nofile(struct rlimit *old_limit, struct rlimit *new_limit);
 
 int compute_poll_timeout(int next);
 void fd_leaving_poll(int wait_time, int status);
@@ -366,6 +364,20 @@ static inline void fd_lock_tgid(int fd, uint desired_tgid)
 	}
 }
 
+/*
+ * Try to lock the tgid, keeping the current tgid value.
+ * Returns 1 on success, or 0 on failure.
+ */
+static inline int fd_lock_tgid_cur(int fd)
+{
+	uint old = _HA_ATOMIC_LOAD(&fdtab[fd].refc_tgid) & 0x7fff;
+
+	if (_HA_ATOMIC_CAS(&fdtab[fd].refc_tgid, &old, (old | 0x8000) + 0x10000))
+		return 1;
+	return 0;
+}
+
+
 /* Grab a reference to the FD's TGID, and return the tgid. Note that a TGID of
  * zero indicates the FD was closed, thus also fails (i.e. no need to drop it).
  * On non-zero (success), the caller must release it using fd_drop_tgid().
@@ -375,6 +387,10 @@ static inline uint fd_take_tgid(int fd)
 	uint old;
 
 	old = _HA_ATOMIC_FETCH_ADD(&fdtab[fd].refc_tgid, 0x10000) & 0xffff;
+	while (old & 0x8000) {
+                old = _HA_ATOMIC_LOAD(&fdtab[fd].refc_tgid) & 0xffff;
+                __ha_cpu_relax();
+	}
 	if (likely(old))
 		return old;
 	HA_ATOMIC_SUB(&fdtab[fd].refc_tgid, 0x10000);
@@ -400,6 +416,11 @@ static inline uint fd_grab_tgid(int fd, uint desired_tgid)
 	uint old;
 
 	old = _HA_ATOMIC_FETCH_ADD(&fdtab[fd].refc_tgid, 0x10000) & 0xffff;
+	/* If the tgid is locked, wait until it no longer is */
+	while (old & 0x8000) {
+		old = _HA_ATOMIC_LOAD(&fdtab[fd].refc_tgid) & 0xffff;
+		__ha_cpu_relax();
+	}
 	if (likely(old == desired_tgid))
 		return 1;
 	HA_ATOMIC_SUB(&fdtab[fd].refc_tgid, 0x10000);
@@ -425,6 +446,22 @@ static inline void fd_claim_tgid(int fd, uint desired_tgid)
 		__ha_cpu_relax();
 		old &= 0x7fff;   // keep only the tgid and drop the lock
 	}
+}
+
+/*
+ * Update the FD's TGID.
+ * This should be called with the lock held, and will drop the lock once
+ * the TGID is updated.
+ * The reference counter is however preserved.
+ */
+static inline void fd_update_tgid(int fd, uint desired_tgid)
+{
+	unsigned int orig_tgid = fdtab[fd].refc_tgid;
+	unsigned int new_tgid;
+	/* Remove the lock, and switch to the new tgid */
+	do {
+		new_tgid = (orig_tgid & 0xffff0000) | desired_tgid;
+	} while (!_HA_ATOMIC_CAS(&fdtab[fd].refc_tgid, &orig_tgid, new_tgid) && __ha_cpu_relax());
 }
 
 /* atomically read the running mask if the tgid matches, or returns zero if it
@@ -469,6 +506,19 @@ static inline void fd_insert(int fd, void *owner, void (*iocb)(int fd), int tgid
 	if ((global.tune.options & GTUNE_FD_ET) && iocb == sock_conn_iocb)
 		newstate |= FD_ET_POSSIBLE;
 
+	/* We must update fd_highest to reflect the highest known FD for this
+	 * thread. It's important to note that it's not necessarily the highest
+	 * FD the thread will see, it's the highest FD that was inserted by
+	 * this thread or by the main thread. The purpose is essentially to
+	 * let all threads know the highest known FD at boot, that will be
+	 * cloned into each thread, in order to limit the work range for init
+	 * functions such as fork_poller() and fd_reregister_all(). Keeping the
+	 * value thread-local substantially limits the cost, since after a few
+	 * thousand calls the value will just stop changing.
+	 */
+	if (unlikely(fd > fd_highest))
+		fd_highest = fd;
+
 	/* This must never happen and would definitely indicate a bug, in
 	 * addition to overwriting some unexpected memory areas.
 	 */
@@ -489,6 +539,10 @@ static inline void fd_insert(int fd, void *owner, void (*iocb)(int fd), int tgid
 	fdtab[fd].iocb = iocb;
 	fdtab[fd].state = newstate;
 	fdtab[fd].thread_mask = thread_mask;
+
+	/* just for debugging: how many times taken over since last fd_insert() */
+	fdtab[fd].nb_takeover = 0;
+
 	fd_drop_tgid(fd);
 
 #ifdef DEBUG_FD

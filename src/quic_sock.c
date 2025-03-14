@@ -15,9 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
 
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
@@ -28,7 +29,9 @@
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
+#include <haproxy/obj_type.h>
 #include <haproxy/pool.h>
+#include <haproxy/protocol-t.h>
 #include <haproxy/proto_quic.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/quic_cid.h>
@@ -283,6 +286,7 @@ static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner
 	}
 
 	/* All the members must be initialized! */
+	dgram->obj_type = OBJ_TYPE_DGRAM;
 	dgram->owner = owner;
 	dgram->buf = pos;
 	dgram->len = len;
@@ -291,6 +295,7 @@ static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner
 	dgram->saddr = *saddr;
 	dgram->daddr = *daddr;
 	dgram->qc = NULL;
+	dgram->flags = 0;
 
 	/* Attached datagram to its quic_receiver_buf and quic_dghdlrs. */
 	LIST_APPEND(dgrams, &dgram->recv_list);
@@ -337,8 +342,8 @@ static struct quic_dgram *quic_rxbuf_purge_dgrams(struct quic_receiver_buf *rbuf
 	return prev;
 }
 
-/* Receive data from datagram socket <fd>. Data are placed in <out> buffer of
- * length <len>.
+/* Receive a single message from datagram socket <fd>. Data are placed in <out>
+ * buffer of length <len>.
  *
  * Datagram addresses will be returned via the next arguments. <from> will be
  * the peer address and <to> the reception one. Note that <to> can only be
@@ -392,6 +397,11 @@ static ssize_t quic_recv(int fd, void *out, size_t len,
 
 	if (ret < 0)
 		goto end;
+
+	if (unlikely(port_is_restricted((struct sockaddr_storage *)from, HA_PROTO_QUIC))) {
+		ret = -1;
+		goto end;
+	}
 
 	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
 		switch (cmsg->cmsg_level) {
@@ -603,8 +613,11 @@ static void cmsg_set_saddr(struct msghdr *msg, struct cmsghdr **cmsg,
 	/* Set first msg_controllen to be able to use CMSG_* macros. */
 	msg->msg_controllen += CMSG_SPACE(sz);
 
+	/* seems necessary to please gcc-13 */
+	ASSUME_NONNULL(CMSG_FIRSTHDR(msg));
+
 	*cmsg = !(*cmsg) ? CMSG_FIRSTHDR(msg) : CMSG_NXTHDR(msg, *cmsg);
-	ALREADY_CHECKED(*cmsg);
+	ASSUME_NONNULL(*cmsg);
 	c = *cmsg;
 	c->cmsg_len = CMSG_LEN(sz);
 
@@ -646,8 +659,36 @@ static void cmsg_set_saddr(struct msghdr *msg, struct cmsghdr **cmsg,
 	}
 }
 
-/* Send a datagram stored into <buf> buffer with <sz> as size.
- * The caller must ensure there is at least <sz> bytes in this buffer.
+static void cmsg_set_gso(struct msghdr *msg, struct cmsghdr **cmsg,
+                         uint16_t gso_size)
+{
+#ifdef UDP_SEGMENT
+	struct cmsghdr *c;
+	size_t sz = sizeof(gso_size);
+
+	/* Set first msg_controllen to be able to use CMSG_* macros. */
+	msg->msg_controllen += CMSG_SPACE(sz);
+
+	/* seems necessary to please gcc-13 */
+	ASSUME_NONNULL(CMSG_FIRSTHDR(msg));
+
+	*cmsg = !(*cmsg) ? CMSG_FIRSTHDR(msg) : CMSG_NXTHDR(msg, *cmsg);
+	ASSUME_NONNULL(*cmsg);
+	c = *cmsg;
+	c->cmsg_len = CMSG_LEN(sz);
+
+	c->cmsg_level = SOL_UDP;
+	c->cmsg_type = UDP_SEGMENT;
+	c->cmsg_len = CMSG_LEN(sz);
+	*((uint16_t *)CMSG_DATA(c)) = gso_size;
+#endif
+}
+
+/* Send a datagram stored into <buf> buffer with <sz> as size. The caller must
+ * ensure there is at least <sz> bytes in this buffer.
+ *
+ * If <gso_size> is non null, it will be used as value for UDP_SEGMENT option.
+ * This allows to transmit multiple datagrams in a single syscall.
  *
  * Returns the total bytes sent over the socket. 0 is returned if a transient
  * error is encountered which allows send to be retry later. A negative value
@@ -658,7 +699,7 @@ static void cmsg_set_saddr(struct msghdr *msg, struct cmsghdr **cmsg,
  * done by removing the <qc> arg and replace it with address/port.
  */
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
-               int flags)
+               int flags, uint16_t gso_size)
 {
 	ssize_t ret;
 	struct msghdr msg;
@@ -667,14 +708,24 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 
 	union {
 #ifdef IP_PKTINFO
-		char buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+		char buf[CMSG_SPACE(sizeof(struct in_pktinfo)) + CMSG_SPACE(sizeof(gso_size))];
 #endif /* IP_PKTINFO */
 #ifdef IPV6_RECVPKTINFO
-		char buf6[CMSG_SPACE(sizeof(struct in6_pktinfo))];
+		char buf6[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(gso_size))];
 #endif /* IPV6_RECVPKTINFO */
-		char bufaddr[CMSG_SPACE(sizeof(struct in_addr))];
+		char bufaddr[CMSG_SPACE(sizeof(struct in_addr)) + CMSG_SPACE(sizeof(gso_size))];
 		struct cmsghdr align;
 	} ancillary_data;
+
+	/* man 3 cmsg
+	 *
+	 * When initializing a buffer that will contain a
+	 * series of cmsghdr structures (e.g., to be sent with
+	 * sendmsg(2)), that buffer should first be
+	 * zero-initialized to ensure the correct operation of
+	 * CMSG_NXTHDR().
+	 */
+	memset(&ancillary_data, 0, sizeof(ancillary_data));
 
 	vec.iov_base = b_peek(buf, b_head_ofs(buf));
 	vec.iov_len = sz;
@@ -711,6 +762,16 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 		cmsg_set_saddr(&msg, &cmsg, &qc->local_addr);
 	}
 
+	/* Set GSO parameter if datagram size is bigger than MTU. */
+	if (gso_size) {
+		/* GSO size must be less than total data to sent for multiple datagrams. */
+		BUG_ON_HOT(b_data(buf) <= gso_size);
+
+		if (!msg.msg_control)
+			msg.msg_control = ancillary_data.bufaddr;
+		cmsg_set_gso(&msg, &cmsg, gso_size);
+	}
+
 	do {
 		ret = sendmsg(qc_fd(qc), &msg, MSG_DONTWAIT|MSG_NOSIGNAL);
 	} while (ret < 0 && errno == EINTR);
@@ -737,7 +798,7 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 			qc->cntrs.sendto_err_unknown++;
 			TRACE_PRINTF(TRACE_LEVEL_USER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
 			             "UDP send failure errno=%d (%s)", errno, strerror(errno));
-			return -1;
+			return -errno;
 		}
 	}
 
@@ -772,7 +833,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 	max_sz = params->max_udp_payload_size;
 
 	do {
-		if (!b_alloc(&buf))
+		if (!b_alloc(&buf, DB_MUX_RX))
 			break; /* TODO subscribe for memory again available. */
 
 		b_reset(&buf);
@@ -797,6 +858,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 
 		b_add(&buf, ret);
 
+		new_dgram->obj_type = OBJ_TYPE_DGRAM;
 		new_dgram->buf = dgram_buf;
 		new_dgram->len = ret;
 		new_dgram->dcid_len = 0;
@@ -804,6 +866,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 		new_dgram->saddr = saddr;
 		new_dgram->daddr = daddr;
 		new_dgram->qc = NULL;  /* set later via quic_dgram_parse() */
+		new_dgram->flags = 0;
 
 		TRACE_DEVEL("read datagram", QUIC_EV_CONN_RCV, qc, new_dgram);
 
@@ -827,7 +890,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 			TRACE_STATE("datagram for other connection on quic-conn socket, requeue it", QUIC_EV_CONN_RCV, qc);
 
 			rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), rxbuf_el);
-			ALREADY_CHECKED(rxbuf);
+			ASSUME_NONNULL(rxbuf);
 			cspace = b_contig_space(&rxbuf->buf);
 
 			tmp_dgram = quic_rxbuf_purge_dgrams(rxbuf);
@@ -999,18 +1062,15 @@ void qc_want_recv(struct quic_conn *qc)
 struct quic_accept_queue *quic_accept_queues;
 
 /* Install <qc> on the queue ready to be accepted. The queue task is then woken
- * up. If <qc> accept is already scheduled or done, nothing is done.
+ * up.
  */
 void quic_accept_push_qc(struct quic_conn *qc)
 {
 	struct quic_accept_queue *queue = &quic_accept_queues[tid];
 	struct li_per_thread *lthr = &qc->li->per_thr[ti->ltid];
 
-	/* early return if accept is already in progress/done for this
-	 * connection
-	 */
-	if (qc->flags & QUIC_FL_CONN_ACCEPT_REGISTERED)
-		return;
+	/* A connection must only be accepted once per instance. */
+	BUG_ON(qc->flags & QUIC_FL_CONN_ACCEPT_REGISTERED);
 
 	BUG_ON(MT_LIST_INLIST(&qc->accept_list));
 	HA_ATOMIC_INC(&qc->li->rx.quic_curr_accept);
@@ -1038,15 +1098,19 @@ void quic_accept_push_qc(struct quic_conn *qc)
 struct task *quic_accept_run(struct task *t, void *ctx, unsigned int i)
 {
 	struct li_per_thread *lthr;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	struct quic_accept_queue *queue = &quic_accept_queues[tid];
 
-	mt_list_for_each_entry_safe(lthr, &queue->listeners, quic_accept.list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(lthr, &queue->listeners, quic_accept.list, back) {
 		listener_accept(lthr->li);
-		if (!MT_LIST_ISEMPTY(&lthr->quic_accept.conns))
+		if (!MT_LIST_ISEMPTY(&lthr->quic_accept.conns)) {
+			/* entry is left in queue */
 			tasklet_wakeup((struct tasklet*)t);
-		else
-			MT_LIST_DELETE_SAFE(elt1);
+		}
+		else {
+			mt_list_unlock_self(&lthr->quic_accept.list);
+			lthr = NULL; /* delete it */
+		}
 	}
 
 	return NULL;

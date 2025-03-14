@@ -26,9 +26,11 @@
 
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
+#include <haproxy/arg-t.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/resolvers-t.h>
+#include <haproxy/sample-t.h>
 #include <haproxy/server-t.h>
 #include <haproxy/task.h>
 #include <haproxy/thread-t.h>
@@ -39,17 +41,17 @@
 __decl_thread(extern HA_SPINLOCK_T idle_conn_srv_lock);
 extern struct idle_conns idle_conns[MAX_THREADS];
 extern struct task *idle_conn_task;
-extern struct list servers_list;
+extern struct mt_list servers_list;
 extern struct dict server_key_dict;
 
 int srv_downtime(const struct server *s);
-int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
 void srv_settings_init(struct server *srv);
 void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl);
 int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, const struct proxy *defproxy, int parse_flags);
 int srv_update_addr(struct server *s, void *ip, int ip_sin_family, struct server_inetaddr_updater updater);
-int server_parse_sni_expr(struct server *newsrv, struct proxy *px, char **err);
+struct sample_expr *_parse_srv_expr(char *expr, struct arg_list *args_px,
+                                    const char *file, int linenum, char **err);
 int server_set_inetaddr(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater, struct buffer *msg);
 int server_set_inetaddr_warn(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater);
 void server_get_inetaddr(struct server *s, struct server_inetaddr *inetaddr);
@@ -176,12 +178,12 @@ void srv_set_dyncookie(struct server *s);
 int srv_check_reuse_ws(struct server *srv);
 const struct mux_ops *srv_get_ws_proto(struct server *srv);
 
-/* increase the number of cumulated connections on the designated server */
+/* increase the number of cumulated streams on the designated server */
 static inline void srv_inc_sess_ctr(struct server *s)
 {
 	_HA_ATOMIC_INC(&s->counters.cum_sess);
 	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
-			     update_freq_ctr(&s->sess_per_sec, 1));
+	                     update_freq_ctr(&s->counters.sess_per_sec, 1));
 }
 
 /* set the time of last session on the designated server */

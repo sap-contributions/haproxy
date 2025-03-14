@@ -27,6 +27,7 @@
 #include <haproxy/htx-t.h>
 #include <haproxy/obj_type.h>
 #include <haproxy/stconn-t.h>
+#include <haproxy/xref.h>
 
 struct buffer;
 struct session;
@@ -38,6 +39,8 @@ struct check;
 
 struct sedesc *sedesc_new();
 void sedesc_free(struct sedesc *sedesc);
+
+void se_shutdown(struct sedesc *sedesc, enum se_shut_mode mode);
 
 struct stconn *sc_new_from_endp(struct sedesc *sedesc, struct session *sess, struct buffer *input);
 struct stconn *sc_new_from_strm(struct stream *strm, unsigned int flags);
@@ -130,6 +133,19 @@ static inline unsigned int se_have_ff_data(struct sedesc *se)
 static inline size_t se_ff_data(struct sedesc *se)
 {
 	return (se->iobuf.data + (se->iobuf.pipe ? se->iobuf.pipe->data : 0));
+}
+
+
+static inline struct sedesc *se_opposite(struct sedesc *se)
+{
+	struct xref *peer = xref_get_peer_and_lock(&se->xref);
+	struct sedesc *seo = NULL;;
+
+	if (peer) {
+		seo = container_of(peer, struct sedesc, xref);
+		xref_unlock(&se->xref, peer);
+	}
+	return seo;
 }
 
 /* stream connector version */
@@ -255,7 +271,7 @@ static inline void *__sc_mux_strm(const struct stconn *sc)
 {
 	return __sc_endp(sc);
 }
-static inline struct appctx *sc_mux_strm(const struct stconn *sc)
+static inline void *sc_mux_strm(const struct stconn *sc)
 {
 	if (sc_ep_test(sc, SE_FL_T_MUX))
 		return __sc_mux_strm(sc);
@@ -318,54 +334,6 @@ static inline const char *sc_get_data_name(const struct stconn *sc)
 	return sc->app_ops->name;
 }
 
-/* shut read */
-static inline void sc_conn_shutr(struct stconn *sc, enum co_shr_mode mode)
-{
-	const struct mux_ops *mux;
-
-	BUG_ON(!sc_conn(sc));
-
-	if (sc_ep_test(sc, SE_FL_SHR))
-		return;
-
-	/* clean data-layer shutdown */
-	mux = sc_mux_ops(sc);
-	if (mux && mux->shutr)
-		mux->shutr(sc, mode);
-	sc_ep_set(sc, (mode == CO_SHR_DRAIN) ? SE_FL_SHRD : SE_FL_SHRR);
-}
-
-/* shut write */
-static inline void sc_conn_shutw(struct stconn *sc, enum co_shw_mode mode)
-{
-	const struct mux_ops *mux;
-
-	BUG_ON(!sc_conn(sc));
-
-	if (sc_ep_test(sc, SE_FL_SHW))
-		return;
-
-	/* clean data-layer shutdown */
-	mux = sc_mux_ops(sc);
-	if (mux && mux->shutw)
-		mux->shutw(sc, mode);
-	sc_ep_set(sc, (mode == CO_SHW_NORMAL) ? SE_FL_SHWN : SE_FL_SHWS);
-}
-
-/* completely close a stream connector (but do not detach it) */
-static inline void sc_conn_shut(struct stconn *sc)
-{
-	sc_conn_shutw(sc, CO_SHW_SILENT);
-	sc_conn_shutr(sc, CO_SHR_RESET);
-}
-
-/* completely close a stream connector after draining possibly pending data (but do not detach it) */
-static inline void sc_conn_drain_and_shut(struct stconn *sc)
-{
-	sc_conn_shutw(sc, CO_SHW_SILENT);
-	sc_conn_shutr(sc, CO_SHR_DRAIN);
-}
-
 /* Returns non-zero if the stream connector's Rx path is blocked because of
  * lack of room in the input buffer. This usually happens after applets failed
  * to deliver data into the channel's buffer and reported it via sc_need_room().
@@ -423,12 +391,15 @@ static inline void se_need_remote_conn(struct sedesc *se)
 }
 
 /* The application layer tells the stream connector that it just got the input
- * buffer it was waiting for. A read activity is reported.
+ * buffer it was waiting for. A read activity is reported. The SC_FL_HAVE_BUFF
+ * flag is set and held until sc_used_buff() is called to indicate it was
+ * used.
  */
 static inline void sc_have_buff(struct stconn *sc)
 {
 	if (sc->flags & SC_FL_NEED_BUFF) {
 		sc->flags &= ~SC_FL_NEED_BUFF;
+		sc->flags |=  SC_FL_HAVE_BUFF;
 		sc_ep_report_read_activity(sc);
 	}
 }
@@ -441,6 +412,14 @@ static inline void sc_have_buff(struct stconn *sc)
 static inline void sc_need_buff(struct stconn *sc)
 {
 	sc->flags |= SC_FL_NEED_BUFF;
+}
+
+/* The stream connector indicates that it has successfully allocated the buffer
+ * it was previously waiting for so it drops the SC_FL_HAVE_BUFF bit.
+ */
+static inline void sc_used_buff(struct stconn *sc)
+{
+	sc->flags &= ~SC_FL_HAVE_BUFF;
 }
 
 /* Tell a stream connector some room was made in the input buffer and any
@@ -509,10 +488,10 @@ static inline size_t se_nego_ff(struct sedesc *se, struct buffer *input, size_t 
 	if (se_fl_test(se, SE_FL_T_MUX)) {
 		const struct mux_ops *mux = se->conn->mux;
 
-		se->iobuf.flags &= ~IOBUF_FL_FF_BLOCKED;
+		se->iobuf.flags &= ~(IOBUF_FL_FF_BLOCKED|IOBUF_FL_FF_WANT_ROOM);
 		if (mux->nego_fastfwd && mux->done_fastfwd) {
-			/* Disable zero-copy forwarding if EOS or an error was reported. */
-			if (se_fl_test(se, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING)) {
+			/* Disable zero-copy forwarding if an error was reported. */
+			if (se_fl_test(se, SE_FL_ERROR|SE_FL_ERR_PENDING)) {
 				se->iobuf.flags |= IOBUF_FL_NO_FF;
 				goto end;
 			}
@@ -572,7 +551,7 @@ static inline size_t se_done_ff(struct sedesc *se)
 				sc_ep_report_blocked_send(se->sc, 0);
 			if (se->iobuf.flags & IOBUF_FL_FF_BLOCKED) {
 				sc_ep_report_blocked_send(se->sc, 0);
-				
+
 				if (!(se->sc->wait_event.events & SUB_RETRY_SEND)) {
 					/* The SC must be subs for send to be notify when some
 					 * space is made
@@ -584,6 +563,26 @@ static inline size_t se_done_ff(struct sedesc *se)
 	}
 
 	return ret;
+}
+
+static inline void se_report_term_evt(struct sedesc *se, enum se_term_event_type type)
+{
+	enum term_event_loc loc = tevt_loc_se;
+
+	if (se->sc && se->sc->flags & SC_FL_ISBACK)
+		loc += 8;
+	se->term_evts_log = tevt_report_event(se->term_evts_log, loc, type);
+}
+
+static inline void sc_report_term_evt(struct stconn *sc, enum strm_term_event_type type)
+{
+	enum term_event_loc loc = tevt_loc_strm;
+
+	if (sc->flags & SC_FL_ISBACK)
+		loc += 8;
+	sc->term_evts_log = tevt_report_event(sc->term_evts_log, loc, type);
+	if (sc_strm(sc))
+		__sc_strm(sc)->term_evts_log = tevt_report_event(__sc_strm(sc)->term_evts_log, loc, type);
 }
 
 #endif /* _HAPROXY_STCONN_H */

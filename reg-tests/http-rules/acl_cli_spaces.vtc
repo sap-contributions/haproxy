@@ -1,3 +1,4 @@
+#EXCLUDE_TARGETS=osx
 varnishtest "haproxy ACL, CLI and mCLI spaces"
 feature ignore_unknown_macro
 
@@ -7,11 +8,9 @@ server s1 {
    txresp
 } -repeat 2 -start
 
-haproxy h1 -W -S -conf {
+haproxy h1 -Ws -S -conf {
   defaults
     mode http
-    log global
-    option httplog
     timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
@@ -35,6 +34,7 @@ client c1 -connect ${h1_fe1_sock} {
 } -run
 
 haproxy h1 -cli {
+  delay 0.1
   send "add acl ${testdir}/agents.acl Mon\\ User\\ Agent\\;"
   expect ~ .*
 
@@ -50,6 +50,7 @@ client c1 -connect ${h1_fe1_sock} {
 
 
 haproxy h1 -cli {
+  delay 0.1
   send "del acl ${testdir}/agents.acl Mon\\ User\\ Agent\\;"
   expect ~ .*
 
@@ -66,6 +67,7 @@ client c1 -connect ${h1_fe1_sock} {
 
 # Try it with the master CLI
 haproxy h1 -mcli {
+  delay 0.1
   send "@1 add acl ${testdir}/agents.acl Mon\\ User\\ Agent\\;;@1 show acl ${testdir}/agents.acl"
   expect ~ ".*Mon User Agent;.*"
 }

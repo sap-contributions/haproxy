@@ -40,7 +40,9 @@ struct connection;
 #define AF_CUST_EXISTING_FD  (AF_MAX + 1)
 #define AF_CUST_SOCKPAIR     (AF_MAX + 2)
 #define AF_CUST_RHTTP_SRV    (AF_MAX + 3)
-#define AF_CUST_MAX          (AF_MAX + 4)
+#define AF_CUST_ABNS         (AF_MAX + 4)
+#define AF_CUST_ABNSZ        (AF_MAX + 5)
+#define AF_CUST_MAX          (AF_MAX + 6)
 
 /*
  * Test in case AF_CUST_MAX overflows the sa_family_t (unsigned int)
@@ -70,12 +72,27 @@ enum proto_type {
 #define PROTO_F_REUSEPORT_TESTED                0x00000002 /* SO_REUSEPORT support was tested */
 
 /* protocol families define standard functions acting on a given address family
- * for a socket implementation, such as AF_INET/PF_INET for example.
+ * for a socket implementation, such as AF_INET/PF_INET for example. There is
+ * permanent confusion between domain and family. Here's how it works:
+ *   - the domain defines the format of addresses (e.g. sockaddr_in etc),
+ *     it is passed as the first argument to socket()
+ *   - the socket family is part of the address and is stored in receivers,
+ *     servers and everywhere there is an address. It's also a proto_fam
+ *     selector.
+ *   - the real family is the one passed to bind() and connect() to map
+ *     custom families to their real equivalent one.
+ *
+ * Domains are often PF_xxx though man 2 socket on Linux quotes 4.x BSD's man
+ * that says AF_* can be used everywhere. At least it tends to keep the code
+ * clearer about the intent. In HAProxy we're defining new address families
+ * with AF_CUST_* which appear in addresses, and they cannot be used for the
+ * domain, the socket() call must use sock_domain instead.
  */
 struct proto_fam {
 	char name[PROTO_NAME_LEN];                      /* family name, zero-terminated */
 	int sock_domain;				/* socket domain, as passed to socket()   */
 	sa_family_t sock_family;			/* socket family, for sockaddr */
+	sa_family_t real_family;			/* the socket family passed to syscalls */
 	ushort l3_addrlen;				/* layer3 address length, used by hashes */
 	socklen_t sock_addrlen;				/* socket address length, used by bind() */
 	/* 4-bytes hole here */
@@ -119,7 +136,18 @@ struct protocol {
 	void (*ignore_events)(struct connection *conn, int event_type);  /* unsubscribe from socket events */
 	int (*get_src)(struct connection *conn, struct sockaddr *, socklen_t); /* retrieve connection's source address; -1=fail */
 	int (*get_dst)(struct connection *conn, struct sockaddr *, socklen_t); /* retrieve connection's dest address; -1=fail */
-	int (*set_affinity)(struct connection *conn, int new_tid);
+
+	/* API for thread affinity notification from listener_accept()
+	 * [ tid selected ] -->
+	 *   <bind_tid_prep> --> [ acc queue push ] == OK --> <bind_tid_commit>
+	 *                                          == ERR -> <bind_tid_reset>
+	 */
+	/* prepare rebind connection on a new thread, may fail */
+	int (*bind_tid_prep)(struct connection *conn, int new_tid);
+	/* complete connection thread rebinding, no error possible */
+	void (*bind_tid_commit)(struct connection *conn);
+	/* cancel connection thread rebinding */
+	void (*bind_tid_reset)(struct connection *conn);
 
 	/* functions acting on the receiver */
 	int (*rx_suspend)(struct receiver *rx);         /* temporarily suspend this receiver for a soft restart */
@@ -131,11 +159,23 @@ struct protocol {
 
 	/* default I/O handler */
 	void (*default_iocb)(int fd);                   /* generic I/O handler (typically accept callback) */
+	int (*get_info)(struct connection *conn, long long int *info, int info_num);       /* Callback to get connection level statistical counters */
 
 	uint flags;                                     /* flags describing protocol support (PROTO_F_*) */
 	uint nb_receivers;                              /* number of receivers (under proto_lock) */
 	struct list receivers;				/* list of receivers using this protocol (under proto_lock) */
 	struct list list;				/* list of registered protocols (under proto_lock) */
+};
+
+/* Transport protocol identifiers which can be used as masked values. */
+enum ha_proto {
+	HA_PROTO_NONE = 0x00,
+
+	HA_PROTO_TCP  = 0x01,
+	HA_PROTO_UDP  = 0x02,
+	HA_PROTO_QUIC = 0x04,
+
+	HA_PROTO_ANY  = 0xff,
 };
 
 #endif /* _HAPROXY_PROTOCOL_T_H */

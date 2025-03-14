@@ -30,6 +30,7 @@
 
 #include <haproxy/cbuf-t.h>
 #include <haproxy/list.h>
+#include <haproxy/show_flags-t.h>
 
 #include <haproxy/openssl-compat.h>
 #include <haproxy/mux_quic-t.h>
@@ -96,6 +97,8 @@ typedef unsigned long long ull;
 #define QUIC_DFLT_REORDER_RATIO        50 /* in percent */
 /* Default limit of loss detection on a single frame. If exceeded, connection is closed. */
 #define QUIC_DFLT_MAX_FRAME_LOSS       10
+/* Default congestion window size. 480 kB, equivalent to the legacy value which was 30*bufsize */
+#define QUIC_DFLT_MAX_WINDOW_SIZE  491520
 
 /*
  *  0                   1                   2                   3
@@ -176,8 +179,15 @@ enum quic_pkt_type {
  */
 #define QUIC_CONN_MAX_PACKET  64
 
-#define QUIC_STATELESS_RESET_PACKET_HEADER_LEN 5
-#define QUIC_STATELESS_RESET_PACKET_MINLEN     (22 + QUIC_HAP_CID_LEN)
+/* RFC 9000 10.3. Stateless Reset
+ *
+ * To entities other than its intended recipient, a Stateless Reset will
+ * appear to be a packet with a short header. For the Stateless Reset to
+ * appear as a valid QUIC packet, the Unpredictable Bits field needs to
+ * include at least 38 bits of data (or 5 bytes, less the two fixed
+ * bits).
+ */
+#define QUIC_STATELESS_RESET_PACKET_MINLEN     (5 + QUIC_STATELESS_RESET_TOKEN_LEN)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -254,6 +264,8 @@ struct quic_conn_cntrs {
 	long long socket_full;           /* total number of EAGAIN errors on sendto() calls */
 	long long sendto_err;            /* total number of errors on sendto() calls, EAGAIN excepted */
 	long long sendto_err_unknown;    /* total number of errors on sendto() calls which are currently not supported */
+	long long sent_bytes;            /* total number of sent bytes, with or without GSO */
+	long long sent_bytes_gso;        /* total number of sent bytes using GSO */
 	long long sent_pkt;              /* total number of sent packets */
 	long long lost_pkt;              /* total number of lost packets */
 	long long conn_migration_done;   /* total number of connection migration handled */
@@ -263,35 +275,6 @@ struct quic_conn_cntrs {
 	long long streams_blocked_bidi;      /* total number of times STREAMS_BLOCKED_BIDI frame was received */
 	long long streams_blocked_uni;       /* total number of times STREAMS_BLOCKED_UNI frame was received */
 };
-
-/* Flags at connection level */
-#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
-#define QUIC_FL_CONN_SPIN_BIT                    (1U << 1) /* Spin bit set by remote peer */
-#define QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS    (1U << 2) /* HANDSHAKE_DONE must be sent */
-#define QUIC_FL_CONN_LISTENER                    (1U << 3)
-#define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
-#define QUIC_FL_CONN_TX_MUX_CONTEXT              (1U << 5) /* sending in progress from the MUX layer */
-#define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
-#define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
-#define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8) /* retransmission in progress for probing with already sent data */
-#define QUIC_FL_CONN_TLS_ALERT                   (1U << 9)
-#define QUIC_FL_CONN_AFFINITY_CHANGED            (1U << 10) /* qc_finalize_affinity_rebind() must be called to finalize affinity rebind */
-/* gap here */
-#define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
-#define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
-#define QUIC_FL_CONN_ACK_TIMER_FIRED             (1U << 13) /* idle timer triggered for acknowledgements */
-#define QUIC_FL_CONN_IO_TO_REQUEUE               (1U << 14) /* IO handler must be requeued on new thread after connection migration */
-#define QUIC_FL_CONN_IPKTNS_DCD                  (1U << 15) /* Initial packet number space discarded  */
-#define QUIC_FL_CONN_HPKTNS_DCD                  (1U << 16) /* Handshake packet number space discarded  */
-#define QUIC_FL_CONN_PEER_VALIDATED_ADDR         (1U << 17) /* Peer address is considered as validated for this connection. */
-#define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
-#define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
-#define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
-/* gap here */
-#define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
-#define QUIC_FL_CONN_CLOSING                     (1U << 29) /* closing state, entered on CONNECTION_CLOSE emission */
-#define QUIC_FL_CONN_DRAINING                    (1U << 30) /* draining state, entered on CONNECTION_CLOSE reception */
-#define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31) /* A CONNECTION_CLOSE must be sent */
 
 #define QUIC_CONN_COMMON                               \
     struct {                                           \
@@ -415,7 +398,6 @@ struct quic_conn {
 	struct mt_list accept_list; /* chaining element used for accept, only valid for frontend connections */
 
 	struct eb_root streams_by_id; /* qc_stream_desc tree */
-	int stream_buf_count; /* total count of allocated stream buffers for this connection */
 
 	/* MUX */
 	struct qcc *qcc;
@@ -443,4 +425,75 @@ struct quic_conn_closed {
 };
 
 #endif /* USE_QUIC */
+
+/* Flags at connection level */
+#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
+#define QUIC_FL_CONN_SPIN_BIT                    (1U << 1) /* Spin bit set by remote peer */
+#define QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS    (1U << 2) /* HANDSHAKE_DONE must be sent */
+#define QUIC_FL_CONN_LISTENER                    (1U << 3)
+#define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
+/* gap here */
+#define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
+#define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
+#define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8) /* retransmission in progress for probing with already sent data */
+#define QUIC_FL_CONN_TLS_ALERT                   (1U << 9)
+#define QUIC_FL_CONN_TID_REBIND                  (1U << 10) /* TID rebind in progress, requires qc_finalize_tid_rebind() call */
+#define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
+#define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
+#define QUIC_FL_CONN_ACK_TIMER_FIRED             (1U << 13) /* idle timer triggered for acknowledgements */
+#define QUIC_FL_CONN_IO_TO_REQUEUE               (1U << 14) /* IO handler must be requeued on new thread after connection migration */
+#define QUIC_FL_CONN_IPKTNS_DCD                  (1U << 15) /* Initial packet number space discarded  */
+#define QUIC_FL_CONN_HPKTNS_DCD                  (1U << 16) /* Handshake packet number space discarded  */
+#define QUIC_FL_CONN_PEER_VALIDATED_ADDR         (1U << 17) /* Peer address is considered as validated for this connection. */
+#define QUIC_FL_CONN_NO_TOKEN_RCVD               (1U << 18) /* Client dit not send any token */
+/* gap here */
+#define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
+#define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
+#define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
+/* gap here */
+#define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
+#define QUIC_FL_CONN_CLOSING                     (1U << 29) /* closing state, entered on CONNECTION_CLOSE emission */
+#define QUIC_FL_CONN_DRAINING                    (1U << 30) /* draining state, entered on CONNECTION_CLOSE reception */
+#define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31) /* A CONNECTION_CLOSE must be sent */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *qc_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED,
+	_(QUIC_FL_CONN_SPIN_BIT,
+	_(QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS,
+	_(QUIC_FL_CONN_LISTENER,
+	_(QUIC_FL_CONN_ACCEPT_REGISTERED,
+	_(QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ,
+	_(QUIC_FL_CONN_RETRANS_NEEDED,
+	_(QUIC_FL_CONN_RETRANS_OLD_DATA,
+	_(QUIC_FL_CONN_TLS_ALERT,
+	_(QUIC_FL_CONN_TID_REBIND,
+	_(QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED,
+	_(QUIC_FL_CONN_HANDSHAKE_SPEED_UP,
+	_(QUIC_FL_CONN_ACK_TIMER_FIRED,
+	_(QUIC_FL_CONN_IO_TO_REQUEUE,
+	_(QUIC_FL_CONN_IPKTNS_DCD,
+	_(QUIC_FL_CONN_HPKTNS_DCD,
+	_(QUIC_FL_CONN_PEER_VALIDATED_ADDR,
+	_(QUIC_FL_CONN_TO_KILL,
+	_(QUIC_FL_CONN_TX_TP_RECEIVED,
+	_(QUIC_FL_CONN_FINALIZED,
+	_(QUIC_FL_CONN_EXP_TIMER,
+	_(QUIC_FL_CONN_CLOSING,
+	_(QUIC_FL_CONN_DRAINING,
+	_(QUIC_FL_CONN_IMMEDIATE_CLOSE))))))))))))))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
 #endif /* _HAPROXY_QUIC_CONN_T_H */

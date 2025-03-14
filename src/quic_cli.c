@@ -12,7 +12,7 @@
 unsigned int qc_epoch = 0;
 
 enum quic_dump_format {
-	QUIC_DUMP_FMT_DEFAULT, /* value used if not explicitely specified. */
+	QUIC_DUMP_FMT_DEFAULT, /* value used if not explicitly specified. */
 
 	QUIC_DUMP_FMT_ONELINE,
 	QUIC_DUMP_FMT_CUST,
@@ -39,7 +39,7 @@ struct show_quic_ctx {
 
 #define QC_CLI_FL_SHOW_ALL 0x1 /* show closing/draining connections */
 
-/* Returns the output format for show quic. If specified explicitely use it as
+/* Returns the output format for show quic. If specified explicitly use it as
  * set. Else format depends if filtering on a single connection instance. If
  * true, full format is preferred else oneline.
  */
@@ -75,6 +75,21 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 		ctx->fields = QUIC_DUMP_FLD_MASK;
 		++argc;
 	}
+	else if (strcmp(args[argc], "help") == 0) {
+		chunk_printf(&trash,
+			     "Usage: show quic [help|<format>] [<filter>]\n"
+			     "Dumps information about QUIC connections. Available output formats:\n"
+			     "  oneline    dump a single, netstat-like line per connection (default)\n"
+			     "  full       dump all known information about each connection\n"
+			     "  <levels>*  only dump certain information, defined by a comma-delimited list\n"
+			     "             of levels among 'tp', 'sock', 'pktns', 'cc', or 'mux'\n"
+			     "  help       display this help\n"
+			     "Available output filters:\n"
+			     "  all        dump all connections (the default)\n"
+			     "  <id>       dump only the connection matching this identifier (0x...)\n"
+			     "Without any argument, all connections are dumped using the oneline format.\n");
+		return cli_err(appctx, trash.area);
+	}
 	else if (*args[argc]) {
 		struct ist istarg = ist(args[argc]);
 		struct ist field = istsplit(&istarg, ',');
@@ -101,7 +116,7 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 				 * field name has been specified.
 				 */
 				if (istarg.len || ctx->fields) {
-					cli_err(appctx, "Invalid field.\n");
+					cli_err(appctx, "Invalid field, use 'help' for more options.\n");
 					return 1;
 				}
 
@@ -140,7 +155,7 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 			ctx->flags |= QC_CLI_FL_SHOW_ALL;
 		}
 		else {
-			cli_err(appctx, "Invalid argument.\n");
+			cli_err(appctx, "Invalid argument, use 'help' for more options.\n");
 			return 1;
 		}
 
@@ -282,29 +297,38 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	if (ctx->fields & QUIC_DUMP_FLD_PKTNS) {
 		pktns = qc->ipktns;
 		if (pktns) {
-			chunk_appendf(&trash, "  [initl] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-			              pktns->rx.arngs.sz, pktns->tx.in_flight);
+			chunk_appendf(&trash, "  [initl] rx.ackrng=%-6zu tx.inflight=%-6zu(%llu%%)\n",
+			              pktns->rx.arngs.sz, pktns->tx.in_flight,
+			              (ull)pktns->tx.in_flight * 100 / qc->path->cwnd);
 		}
 
 		pktns = qc->hpktns;
 		if (pktns) {
-			chunk_appendf(&trash, "  [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-			              pktns->rx.arngs.sz, pktns->tx.in_flight);
+			chunk_appendf(&trash, "  [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu(%llu%%)\n",
+			              pktns->rx.arngs.sz, pktns->tx.in_flight,
+			              (ull)pktns->tx.in_flight * 100 / qc->path->cwnd);
 		}
 
 		pktns = qc->apktns;
 		if (pktns) {
-			chunk_appendf(&trash, "  [01rtt] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-			              pktns->rx.arngs.sz, pktns->tx.in_flight);
+			chunk_appendf(&trash, "  [01rtt] rx.ackrng=%-6zu tx.inflight=%-6zu(%llu%%)\n",
+			              pktns->rx.arngs.sz, pktns->tx.in_flight,
+			              (ull)pktns->tx.in_flight * 100 / qc->path->cwnd);
 		}
 	}
 
 	if (ctx->fields & QUIC_DUMP_FLD_CC) {
-		chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu"
-		                      " mcwnd=%-6llu sentpkts=%-6llu lostpkts=%-6llu reorderedpkts=%-6llu\n",
+		if (qc->path->cc.algo->state_cli)
+			qc->path->cc.algo->state_cli(&trash, qc->path);
+
+		chunk_appendf(&trash, "  srtt=%-4u  rttvar=%-4u rttmin=%-4u ptoc=%-4u\n"
+		                      "  cwnd=%-6llu            mcwnd=%-6llu\n"
+		                      "  sentbytes=%-12llu sentbytesgso=%-12llu sentpkts=%-6llu\n"
+		                      "  lostpkts=%-6llu        reorderedpkts=%-6llu\n",
 		              qc->path->loss.srtt, qc->path->loss.rtt_var,
 		              qc->path->loss.rtt_min, qc->path->loss.pto_count, (ullong)qc->path->cwnd,
-		              (ullong)qc->path->mcwnd, (ullong)qc->cntrs.sent_pkt, (ullong)qc->path->loss.nb_lost_pkt, (ullong)qc->path->loss.nb_reordered_pkt);
+		              (ullong)qc->path->mcwnd, (ullong)qc->cntrs.sent_bytes, (ullong)qc->cntrs.sent_bytes_gso,
+		              (ullong)qc->cntrs.sent_pkt, (ullong)qc->path->loss.nb_lost_pkt, (ullong)qc->path->loss.nb_reordered_pkt);
 	}
 
 	if (qc->cntrs.dropped_pkt) {
@@ -363,23 +387,12 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 static int cli_io_handler_dump_quic(struct appctx *appctx)
 {
 	struct show_quic_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
 	struct quic_conn *qc;
 
 	thread_isolate();
 
 	if (ctx->thr >= global.nbthread)
 		goto done;
-
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE)) {
-		/* If we're forced to shut down, we might have to remove our
-		 * reference to the last stream being dumped.
-		 */
-		if (!LIST_ISEMPTY(&ctx->bref.users))
-			LIST_DEL_INIT(&ctx->bref.users);
-		goto done;
-	}
 
 	chunk_reset(&trash);
 
@@ -491,7 +504,7 @@ static void cli_release_show_quic(struct appctx *appctx)
 }
 
 static struct cli_kw_list cli_kws = {{ }, {
-	{ { "show", "quic", NULL }, "show quic [<format>] [<filter>]         : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
+	{ { "show", "quic", NULL }, "show quic [help|<format>] [<filter>]    : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
 	{{},}
 }};
 

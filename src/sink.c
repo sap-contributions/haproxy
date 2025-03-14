@@ -46,13 +46,70 @@ struct proxy *sink_proxies_list;
 
 struct sink *cfg_sink;
 
-struct sink *sink_find(const char *name)
+static struct sink *_sink_find(const char *name)
 {
 	struct sink *sink;
 
 	list_for_each_entry(sink, &sink_list, sink_list)
 		if (strcmp(sink->name, name) == 0)
 			return sink;
+	return NULL;
+}
+
+/* returns sink if it really exists */
+struct sink *sink_find(const char *name)
+{
+	struct sink *sink;
+
+	sink = _sink_find(name);
+	if (sink && sink->type != SINK_TYPE_FORWARD_DECLARED)
+		return sink;
+	return NULL;
+}
+
+/* Similar to sink_find(), but intended to be used during config parsing:
+ * tries to resolve sink name, if it fails, creates the sink and marks
+ * it as forward-declared and hope that it will be defined later.
+ *
+ * The caller has to identify itself using <from>, <file> and <line> in
+ * order to report precise error messages in the event that the sink is
+ * never defined later (only the first misuse will be considered).
+ *
+ * It returns the sink on success and NULL on failure (memory error)
+ */
+struct sink *sink_find_early(const char *name, const char *from, const char *file, int line)
+{
+	struct sink *sink;
+
+	/* not expected to be used during runtime */
+	BUG_ON(!(global.mode & MODE_STARTING));
+
+	sink = _sink_find(name);
+	if (sink)
+		return sink;
+
+	/* not found, try to forward-declare it */
+	sink = calloc(1, sizeof(*sink));
+	if (!sink)
+		return NULL;
+
+	sink->name = strdup(name);
+	if (!sink->name)
+		goto err;
+
+	memprintf(&sink->desc, "parsing [%s:%d] : %s", file, line, from);
+	if (!sink->desc)
+		goto err;
+
+	sink->type = SINK_TYPE_FORWARD_DECLARED;
+	LIST_APPEND(&sink_list, &sink->sink_list);
+
+	return sink;
+
+ err:
+	ha_free(&sink->name);
+	ha_free(&sink->desc);
+	ha_free(&sink);
 	return NULL;
 }
 
@@ -64,12 +121,19 @@ struct sink *sink_find(const char *name)
 static struct sink *__sink_new(const char *name, const char *desc, int fmt)
 {
 	struct sink *sink;
+	uint8_t _new = 0;
 
-	sink = sink_find(name);
-	if (sink)
+	sink = _sink_find(name);
+	if (sink) {
+		if (sink->type == SINK_TYPE_FORWARD_DECLARED) {
+			ha_free(&sink->desc); // free previous desc
+			goto forward_declared;
+		}
 		goto end;
+	}
 
 	sink = calloc(1, sizeof(*sink));
+	_new = 1;
 	if (!sink)
 		goto end;
 
@@ -77,6 +141,7 @@ static struct sink *__sink_new(const char *name, const char *desc, int fmt)
 	if (!sink->name)
 		goto err;
 
+ forward_declared:
 	sink->desc = strdup(desc);
 	if (!sink->desc)
 		goto err;
@@ -87,8 +152,8 @@ static struct sink *__sink_new(const char *name, const char *desc, int fmt)
 	/* address will be filled by the caller if needed */
 	sink->ctx.fd = -1;
 	sink->ctx.dropped = 0;
-	HA_RWLOCK_INIT(&sink->ctx.lock);
-	LIST_APPEND(&sink_list, &sink->sink_list);
+	if (_new)
+		LIST_APPEND(&sink_list, &sink->sink_list);
  end:
 	return sink;
 
@@ -206,30 +271,79 @@ send:
  * here with the only difference that we override the log level. This is
  * possible since the announce message will be sent from the same context.
  *
- * In case of success, the amount of drops is reduced by as much. It's supposed
- * to be called under an exclusive lock on the sink to avoid multiple producers
- * doing the same. On success, >0 is returned, otherwise <=0 on failure.
+ * In case of success, the amount of drops is reduced by as much.
+ * The function ensures that a single thread will do that work at once, other
+ * ones will only report a failure if a thread is dumping, so that no thread
+ * waits. A pair od atomic OR and AND is performed around the code so the
+ * caller would be advised to only call this function AFTER having verified
+ * that sink->ctx.dropped is not zero in order to avoid a memory write. On
+ * success, >0 is returned, otherwise <=0 on failure, indicating that it could
+ * not eliminate the pending drop counter. It may loop up to 10 times trying
+ * to catch up with failing competing threads.
  */
 int sink_announce_dropped(struct sink *sink, struct log_header hdr)
 {
-	unsigned int dropped;
-	struct buffer msg;
+	static THREAD_LOCAL char msg_dropped1[] = "1 event dropped";
+	static THREAD_LOCAL char msg_dropped2[] = "0000000000 events dropped";
+	uint dropped, last_dropped;
 	struct ist msgvec[1];
-	char logbuf[64];
+	uint retries = 10;
+	int ret = 0;
 
-	while (unlikely((dropped = sink->ctx.dropped) > 0)) {
-		chunk_init(&msg, logbuf, sizeof(logbuf));
-		chunk_printf(&msg, "%u event%s dropped", dropped, dropped > 1 ? "s" : "");
-		msgvec[0] = ist2(msg.area, msg.data);
+	/* Explanation. ctx.dropped is made of:
+	 *     bit0     = 1 if dropped dump in progress
+	 *     bit1..31 = dropped counter
+	 * If non-zero there have been some drops. If not &1, it means
+	 * nobody's taking care of them and we'll have to, otherwise
+	 * another thread is already on them and we can just pass and
+	 * count another drop (hence add 2).
+	 */
+	dropped = HA_ATOMIC_FETCH_OR(&sink->ctx.dropped, 1);
+	if (dropped & 1) {
+		/* another thread was already on it */
+		goto leave;
+	}
 
+	last_dropped = 0;
+	dropped >>= 1;
+	while (1) {
+		while (unlikely(dropped > last_dropped) && retries-- > 0) {
+			/* try to aggregate multiple messages if other threads arrive while
+			 * we're producing the dropped message.
+			 */
+			uint msglen = sizeof(msg_dropped1);
+			const char *msg = msg_dropped1;
+
+			last_dropped = dropped;
+			if (dropped > 1) {
+				msg = ultoa_r(dropped, msg_dropped2, 11);
+				msg_dropped2[10] = ' ';
+				msglen = msg_dropped2 + sizeof(msg_dropped2) - msg;
+			}
+			msgvec[0] = ist2(msg, msglen);
+			dropped = HA_ATOMIC_LOAD(&sink->ctx.dropped) >> 1;
+		}
+
+		if (!dropped)
+			break;
+
+		last_dropped = 0;
 		hdr.level = LOG_NOTICE; /* override level but keep original log header data */
 
 		if (__sink_write(sink, hdr, 0, msgvec, 1) <= 0)
-			return 0;
+			goto done;
+
 		/* success! */
-		HA_ATOMIC_SUB(&sink->ctx.dropped, dropped);
+		HA_ATOMIC_SUB(&sink->ctx.dropped, dropped << 1);
 	}
-	return 1;
+
+	/* done! */
+	ret = 1;
+done:
+	/* unlock the counter */
+	HA_ATOMIC_AND(&sink->ctx.dropped, ~1);
+leave:
+	return ret;
 }
 
 /* parse the "show events" command, returns 1 if a message is returned, otherwise zero */
@@ -284,7 +398,7 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 /* Pre-configures a ring proxy to emit connections */
 void sink_setup_proxy(struct proxy *px)
 {
-	px->last_change = ns_to_sec(now_ns);
+	px->be_counters.last_change = ns_to_sec(now_ns);
 	px->cap = PR_CAP_BE;
 	px->maxconn = 0;
 	px->conn_retries = 1;
@@ -297,19 +411,15 @@ void sink_setup_proxy(struct proxy *px)
 	sink_proxies_list = px;
 }
 
-/*
- * IO Handler to handle message push to syslog tcp server.
- * It takes its context from appctx->svcctx.
- */
-static void sink_forward_io_handler(struct appctx *appctx)
+static void _sink_forward_io_handler(struct appctx *appctx,
+                                     ssize_t (*msg_handler)(void *ctx, struct ist v1, struct ist v2, size_t ofs, size_t len))
 {
 	struct stconn *sc = appctx_sc(appctx);
 	struct sink_forward_target *sft = appctx->svcctx;
 	struct sink *sink = sft->sink;
 	struct ring *ring = sink->ctx.ring;
-	struct buffer *buf = &ring->buf;
-	uint64_t msg_len;
-	size_t len, cnt, ofs, last_ofs;
+	size_t ofs, last_ofs;
+	size_t processed;
 	int ret = 0;
 
 	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
@@ -318,7 +428,7 @@ static void sink_forward_io_handler(struct appctx *appctx)
 
 	/* if stopping was requested, close immediately */
 	if (unlikely(stopping))
-		goto close;
+		goto soft_close;
 
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
@@ -331,82 +441,36 @@ static void sink_forward_io_handler(struct appctx *appctx)
 	}
 
 	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
-	if (appctx != sft->appctx) {
-		HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
-		goto close;
-	}
+	BUG_ON(appctx != sft->appctx);
 
-	HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
-	LIST_DEL_INIT(&appctx->wait_entry);
-	HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
+	MT_LIST_DELETE(&appctx->wait_entry);
 
-	HA_RWLOCK_RDLOCK(RING_LOCK, &ring->lock);
+	ret = ring_dispatch_messages(ring, appctx, &sft->ofs, &last_ofs, 0,
+	                             msg_handler, &processed);
+	sft->e_processed += processed;
 
-	/* explanation for the initialization below: it would be better to do
-	 * this in the parsing function but this would occasionally result in
-	 * dropped events because we'd take a reference on the oldest message
-	 * and keep it while being scheduled. Thus instead let's take it the
-	 * first time we enter here so that we have a chance to pass many
-	 * existing messages before grabbing a reference to a location. This
-	 * value cannot be produced after initialization.
+	/* if server's max-reuse is set (>= 0), destroy the applet once the
+	 * connection has been reused at least 'max-reuse' times, which means
+	 * it has processed at least 'max-reuse + 1' events (applet will
+	 * perform a new connection attempt)
 	 */
-	if (unlikely(sft->ofs == ~0)) {
-		sft->ofs = b_peek_ofs(buf, 0);
-		HA_ATOMIC_INC(b_orig(buf) + sft->ofs);
-	}
+	if (sft->srv->max_reuse >= 0) {
+		uint max_reuse = sft->srv->max_reuse + 1;
 
-	/* we were already there, adjust the offset to be relative to
-	 * the buffer's head and remove us from the counter.
-	 */
-	ofs = sft->ofs - b_head_ofs(buf);
-	if (sft->ofs < b_head_ofs(buf))
-		ofs += b_size(buf);
-	BUG_ON(ofs >= buf->size);
-	HA_ATOMIC_DEC(b_peek(buf, ofs));
+		if (max_reuse < sft->srv->max_reuse)
+			max_reuse = sft->srv->max_reuse; // overflow, cap to max value
 
-	/* in this loop, ofs always points to the counter byte that precedes
-	 * the message so that we can take our reference there if we have to
-	 * stop before the end (ret=0).
-	 */
-	ret = 1;
-	while (ofs + 1 < b_data(buf)) {
-		cnt = 1;
-		len = b_peek_varint(buf, ofs + cnt, &msg_len);
-		if (!len)
-			break;
-		cnt += len;
-		BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
-
-		if (unlikely(msg_len + 1 > b_size(&trash))) {
-			/* too large a message to ever fit, let's skip it */
-			ofs += cnt + msg_len;
-			continue;
+		if (sft->e_processed / max_reuse !=
+		    (sft->e_processed - processed) / max_reuse) {
+			HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
+			goto soft_close;
 		}
-
-		chunk_reset(&trash);
-		len = b_getblk(buf, trash.area, msg_len, ofs + cnt);
-		trash.data += len;
-		trash.area[trash.data++] = '\n';
-
-		if (applet_putchk(appctx, &trash) == -1) {
-			ret = 0;
-			break;
-		}
-		ofs += cnt + msg_len;
 	}
-
-	HA_ATOMIC_INC(b_peek(buf, ofs));
-	last_ofs = b_tail_ofs(buf);
-	sft->ofs = b_peek_ofs(buf, ofs);
-
-	HA_RWLOCK_RDUNLOCK(RING_LOCK, &ring->lock);
 
 	if (ret) {
 		/* let's be woken up once new data arrive */
-		HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
-		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
-		ofs = b_tail_ofs(buf);
-		HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
+		MT_LIST_APPEND(&ring->waiters, &appctx->wait_entry);
+		ofs = ring_tail(ring);
 		if (ofs != last_ofs) {
 			/* more data was added into the ring between the
 			 * unlock and the lock, and the writer might not
@@ -423,8 +487,25 @@ out:
 	co_skip(sc_oc(sc), sc_oc(sc)->output);
 	return;
 
-close:
+soft_close:
+	/* be careful: since the socket lacks the NOLINGER flag (on purpose)
+	 * soft_close will result in the port staying in TIME_WAIT state:
+	 * don't abuse from soft_close!
+	 */
 	se_fl_set(appctx->sedesc, SE_FL_EOS|SE_FL_EOI);
+	/* if required, hard_close could be achieve by using SE_FL_EOS|SE_FL_ERROR
+	 * flag combination: RST will be sent, TIME_WAIT will be avoided as if
+	 * we performed a normal close with NOLINGER flag set
+	 */
+}
+
+/*
+ * IO Handler to handle message push to syslog tcp server.
+ * It takes its context from appctx->svcctx.
+ */
+static inline void sink_forward_io_handler(struct appctx *appctx)
+{
+	_sink_forward_io_handler(appctx, applet_append_line);
 }
 
 /*
@@ -432,126 +513,9 @@ close:
  * using octet counting frames
  * It takes its context from appctx->svcctx.
  */
-static void sink_forward_oc_io_handler(struct appctx *appctx)
+static inline void sink_forward_oc_io_handler(struct appctx *appctx)
 {
-	struct stconn *sc = appctx_sc(appctx);
-	struct sink_forward_target *sft = appctx->svcctx;
-	struct sink *sink = sft->sink;
-	struct ring *ring = sink->ctx.ring;
-	struct buffer *buf = &ring->buf;
-	uint64_t msg_len;
-	size_t len, cnt, ofs;
-	int ret = 0;
-	char *p;
-
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW))))
-		goto out;
-
-	/* if stopping was requested, close immediately */
-	if (unlikely(stopping))
-		goto close;
-
-	/* if the connection is not established, inform the stream that we want
-	 * to be notified whenever the connection completes.
-	 */
-	if (sc_opposite(sc)->state < SC_ST_EST) {
-		applet_need_more_data(appctx);
-		se_need_remote_conn(appctx->sedesc);
-		applet_have_more_data(appctx);
-		goto out;
-	}
-
-	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
-	if (appctx != sft->appctx) {
-		HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
-		goto close;
-	}
-
-	HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
-	LIST_DEL_INIT(&appctx->wait_entry);
-	HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
-
-	HA_RWLOCK_RDLOCK(RING_LOCK, &ring->lock);
-
-	/* explanation for the initialization below: it would be better to do
-	 * this in the parsing function but this would occasionally result in
-	 * dropped events because we'd take a reference on the oldest message
-	 * and keep it while being scheduled. Thus instead let's take it the
-	 * first time we enter here so that we have a chance to pass many
-	 * existing messages before grabbing a reference to a location. This
-	 * value cannot be produced after initialization.
-	 */
-	if (unlikely(sft->ofs == ~0)) {
-		sft->ofs = b_peek_ofs(buf, 0);
-		HA_ATOMIC_INC(b_orig(buf) + sft->ofs);
-	}
-
-	/* we were already there, adjust the offset to be relative to
-	 * the buffer's head and remove us from the counter.
-	 */
-	ofs = sft->ofs - b_head_ofs(buf);
-	if (sft->ofs < b_head_ofs(buf))
-		ofs += b_size(buf);
-	BUG_ON(ofs >= buf->size);
-	HA_ATOMIC_DEC(b_peek(buf, ofs));
-
-	/* in this loop, ofs always points to the counter byte that precedes
-	 * the message so that we can take our reference there if we have to
-	 * stop before the end (ret=0).
-	 */
-	ret = 1;
-	while (ofs + 1 < b_data(buf)) {
-		cnt = 1;
-		len = b_peek_varint(buf, ofs + cnt, &msg_len);
-		if (!len)
-			break;
-		cnt += len;
-		BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
-
-		chunk_reset(&trash);
-		p = ulltoa(msg_len, trash.area, b_size(&trash));
-		if (p) {
-			trash.data = (p - trash.area) + 1;
-			*p = ' ';
-		}
-
-		if (!p || (trash.data + msg_len > b_size(&trash))) {
-			/* too large a message to ever fit, let's skip it */
-			ofs += cnt + msg_len;
-			continue;
-		}
-
-		trash.data += b_getblk(buf, p + 1, msg_len, ofs + cnt);
-
-		if (applet_putchk(appctx, &trash) == -1) {
-			ret = 0;
-			break;
-		}
-		ofs += cnt + msg_len;
-	}
-
-	HA_ATOMIC_INC(b_peek(buf, ofs));
-	sft->ofs = b_peek_ofs(buf, ofs);
-
-	HA_RWLOCK_RDUNLOCK(RING_LOCK, &ring->lock);
-
-	if (ret) {
-		/* let's be woken up once new data arrive */
-		HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
-		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
-		HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
-		applet_have_no_more_data(appctx);
-	}
-	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
-
-  out:
-	/* always drain data from server */
-	co_skip(sc_oc(sc), sc_oc(sc)->output);
-	return;
-
-close:
-	se_fl_set(appctx->sedesc, SE_FL_EOS|SE_FL_EOI);
-	goto out;
+	_sink_forward_io_handler(appctx, syslog_applet_append_event);
 }
 
 void __sink_forward_session_deinit(struct sink_forward_target *sft)
@@ -562,9 +526,7 @@ void __sink_forward_session_deinit(struct sink_forward_target *sft)
 	if (!sink)
 		return;
 
-	HA_RWLOCK_WRLOCK(RING_LOCK, &sink->ctx.ring->lock);
-	LIST_DEL_INIT(&sft->appctx->wait_entry);
-	HA_RWLOCK_WRUNLOCK(RING_LOCK, &sink->ctx.ring->lock);
+	MT_LIST_DELETE(&sft->appctx->wait_entry);
 
 	sft->appctx = NULL;
 	task_wakeup(sink->forward_task, TASK_WOKEN_MSG);
@@ -576,6 +538,13 @@ static int sink_forward_session_init(struct appctx *appctx)
 	struct stream *s;
 	struct sockaddr_storage *addr = NULL;
 
+	/* sft init is performed asynchronously so <sft> must be manipulated
+	 * under the lock
+	 */
+	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
+
+	BUG_ON(sft->appctx != appctx);
+
 	if (!sockaddr_alloc(&addr, &sft->srv->addr, sizeof(sft->srv->addr)))
 		goto out_error;
 	/* srv port should be learned from srv->svc_port not from srv->addr */
@@ -586,7 +555,7 @@ static int sink_forward_session_init(struct appctx *appctx)
 
 	s = appctx_strm(appctx);
 	s->scb->dst = addr;
-	s->scb->flags |= (SC_FL_RCV_ONCE|SC_FL_NOLINGER);
+	s->scb->flags |= (SC_FL_RCV_ONCE);
 
 	s->target = &sft->srv->obj_type;
 	s->flags = SF_ASSIGNED;
@@ -595,13 +564,15 @@ static int sink_forward_session_init(struct appctx *appctx)
 	s->uniq_id = 0;
 
 	applet_expect_no_data(appctx);
-	sft->appctx = appctx;
+
+	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 
 	return 0;
 
  out_free_addr:
 	sockaddr_free(&addr);
  out_error:
+	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 	return -1;
 }
 
@@ -613,8 +584,8 @@ static void sink_forward_session_release(struct appctx *appctx)
 		return;
 
 	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
-	if (sft->appctx == appctx)
-		__sink_forward_session_deinit(sft);
+	BUG_ON(sft->appctx != appctx);
+	__sink_forward_session_deinit(sft);
 	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 }
 
@@ -642,23 +613,51 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 {
 	struct appctx *appctx;
 	struct applet *applet = &sink_forward_applet;
+	uint best_tid, best_load;
+	int attempts, first;
 
 	if (sft->srv->log_proto == SRV_LOG_PROTO_OCTET_COUNTING)
 		applet = &sink_forward_oc_applet;
 
-	appctx = appctx_new_here(applet, NULL);
+	BUG_ON(!global.nbthread);
+	attempts = MIN(global.nbthread, 3);
+	first = 1;
+
+	/* to shut gcc warning */
+	best_tid = best_load = 0;
+
+	/* to help spread the load over multiple threads, try to find a
+	 * non-overloaded thread by picking a random thread and checking
+	 * its load. If we fail to find a non-overloaded thread after 3
+	 * attempts, let's pick the least overloaded one.
+	 */
+	while (attempts-- > 0) {
+		uint cur_tid;
+		uint cur_load;
+
+		cur_tid = statistical_prng_range(global.nbthread);
+		cur_load = HA_ATOMIC_LOAD(&ha_thread_ctx[cur_tid].rq_total);
+
+		if (first || cur_load < best_load) {
+			best_tid = cur_tid;
+			best_load = cur_load;
+		}
+		first = 0;
+
+		/* if we already found a non-overloaded thread, stop now */
+		if (HA_ATOMIC_LOAD(&ha_thread_ctx[best_tid].rq_total) < 3)
+			break;
+	}
+
+	appctx = appctx_new_on(applet, NULL, best_tid);
 	if (!appctx)
 		goto out_close;
 	appctx->svcctx = (void *)sft;
-
-	if (appctx_init(appctx) == -1)
-		goto out_free_appctx;
-
+	appctx_wakeup(appctx);
+	sft->last_conn = now_ms;
 	return appctx;
 
 	/* Error unrolling */
- out_free_appctx:
-	appctx_free_on_early_error(appctx);
  out_close:
 	return NULL;
 }
@@ -676,9 +675,24 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
 	if (!stopping) {
 		while (sft) {
 			HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
-			/* if appctx is NULL, start a new session */
-			if (!sft->appctx)
-				sft->appctx = sink_forward_session_create(sink, sft);
+			/* If appctx is NULL, start a new session and perform the appctx
+			 * assigment right away since the applet is not supposed to change
+			 * during the session lifetime. By doing the assignment now we
+			 * make sure to start the session exactly once.
+			 *
+			 * We enforce a tempo to ensure we don't perform more than 1 session
+			 * establishment attempt per second.
+			 */
+			if (!sft->appctx) {
+				uint tempo = sft->last_conn + MS_TO_TICKS(1000);
+
+				if (sft->last_conn == TICK_ETERNITY || tick_is_expired(tempo, now_ms))
+					sft->appctx = sink_forward_session_create(sink, sft);
+				else if (task->expire == TICK_ETERNITY)
+					task->expire = tempo;
+				else
+					task->expire = tick_first(task->expire, tempo);
+			}
 			HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 			sft = sft->next;
 		}
@@ -721,7 +735,7 @@ int sink_init_forward(struct sink *sink)
  */
 void sink_rotate_file_backed_ring(const char *name)
 {
-	struct ring ring;
+	struct ring_storage storage;
 	char *oldback;
 	int ret;
 	int fd;
@@ -731,16 +745,20 @@ void sink_rotate_file_backed_ring(const char *name)
 		return;
 
 	/* check for contents validity */
-	ret = read(fd, &ring, sizeof(ring));
+	ret = read(fd, &storage, sizeof(storage));
 	close(fd);
 
-	if (ret != sizeof(ring))
+	if (ret != sizeof(storage))
 		goto rotate;
+
+	/* check that it's the expected format before touching it */
+	if (storage.rsvd != sizeof(storage))
+		return;
 
 	/* contents are present, we want to keep them => rotate. Note that
 	 * an empty ring buffer has one byte (the marker).
 	 */
-	if (ring.buf.data > 1)
+	if (storage.head != 0 || storage.tail != 1)
 		goto rotate;
 
 	/* nothing to keep, let's scratch the file and preserve the backup */
@@ -772,15 +790,14 @@ static void sink_free(struct sink *sink)
 		return;
 	if (sink->type == SINK_TYPE_BUFFER) {
 		if (sink->store) {
-			size_t size = (sink->ctx.ring->buf.size + 4095UL) & -4096UL;
-			void *area = (sink->ctx.ring->buf.area - sizeof(*sink->ctx.ring));
+			size_t size = (ring_allocated_size(sink->ctx.ring) + 4095UL) & -4096UL;
+			void *area = ring_allocated_area(sink->ctx.ring);
 
 			msync(area, size, MS_SYNC);
 			munmap(area, size);
 			ha_free(&sink->store);
 		}
-		else
-			ring_free(sink->ctx.ring);
+		ring_free(sink->ctx.ring);
 	}
 	LIST_DEL_INIT(&sink->sink_list); // remove from parent list
 	task_destroy(sink->forward_task);
@@ -818,7 +835,7 @@ static struct sink *sink_new_ringbuf(const char *id, const char *description,
 	init_new_proxy(p);
 	sink_setup_proxy(p);
 	p->id = strdup(id);
-	p->conf.args.file = p->conf.file = strdup(file);
+	p->conf.args.file = p->conf.file = copy_file_name(file);
 	p->conf.args.line = p->conf.line = linenum;
 
 	sink = sink_new_buf(id, description, LOG_FORMAT_RAW, BUFSIZE);
@@ -907,6 +924,12 @@ static int sink_finalize(struct sink *sink)
 			ha_alert("error when trying to initialize sink buffer forwarding.\n");
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
+		if (!sink->store) {
+			/* virtual memory backed sink */
+			vma_set_name(ring_allocated_area(sink->ctx.ring),
+			             ring_allocated_size(sink->ctx.ring),
+			             "ring", sink->name);
+		}
 	}
 	return err_code;
 }
@@ -965,9 +988,14 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 			goto err;
 		}
 
-		size = atol(args[1]);
-		if (!size) {
+		if (parse_size_err(args[1], &size) != NULL || !size) {
 			ha_alert("parsing [%s:%d] : invalid size '%s' for new sink buffer.\n", file, linenum, args[1]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		if (size > RING_TAIL_LOCK) {
+			ha_alert("parsing [%s:%d] : too large size '%llu' for new sink buffer, the limit on this platform is %llu bytes.\n", file, linenum, (ullong)size, (ullong)RING_TAIL_LOCK);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
@@ -978,16 +1006,16 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 			goto err;
 		}
 
-		if (size < cfg_sink->ctx.ring->buf.size) {
-			ha_warning("parsing [%s:%d] : ignoring new size '%llu' that is smaller than current size '%llu' for ring '%s'.\n",
-				   file, linenum, (ullong)size, (ullong)cfg_sink->ctx.ring->buf.size, cfg_sink->name);
+		if (size < ring_data(cfg_sink->ctx.ring)) {
+			ha_warning("parsing [%s:%d] : ignoring new size '%llu' that is smaller than contents '%llu' for ring '%s'.\n",
+				   file, linenum, (ullong)size, (ullong)ring_data(cfg_sink->ctx.ring), cfg_sink->name);
 			err_code |= ERR_WARN;
 			goto err;
 		}
 
 		if (!ring_resize(cfg_sink->ctx.ring, size)) {
 			ha_alert("parsing [%s:%d] : fail to set sink buffer size '%llu' for ring '%s'.\n", file, linenum,
-				 (ullong)cfg_sink->ctx.ring->buf.size, cfg_sink->name);
+				 (ullong)ring_size(cfg_sink->ctx.ring), cfg_sink->name);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
@@ -1027,7 +1055,7 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 			goto err;
 		}
 
-		size = (cfg_sink->ctx.ring->buf.size + 4095UL) & -4096UL;
+		size = (ring_size(cfg_sink->ctx.ring) + 4095UL) & -4096UL;
 		if (ftruncate(fd, size) != 0) {
 			close(fd);
 			ha_alert("parsing [%s:%d] : could not adjust size of backing-file for ring '%s': %s.\n", file, linenum, cfg_sink->name, strerror(errno));
@@ -1049,7 +1077,7 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 
 		/* never fails */
 		ring_free(cfg_sink->ctx.ring);
-		cfg_sink->ctx.ring = ring_make_from_area(area, size);
+		cfg_sink->ctx.ring = ring_make_from_area(area, size, 1);
 	}
 	else if (strcmp(args[0],"server") == 0) {
 		if (!cfg_sink || (cfg_sink->type != SINK_TYPE_BUFFER)) {
@@ -1269,17 +1297,28 @@ struct sink *sink_new_from_srv(struct server *srv, const char *from)
 {
 	struct sink *sink = NULL;
 	int bufsize = (srv->log_bufsize) ? srv->log_bufsize : BUFSIZE;
+	char *sink_name = NULL;
 
 	/* prepare description for the sink */
 	chunk_reset(&trash);
 	chunk_printf(&trash, "created from %s declared into '%s' at line %d", from, srv->conf.file, srv->conf.line);
 
+	memprintf(&sink_name, "%s/%s", srv->proxy->id, srv->id);
+	if (!sink_name) {
+		ha_alert("memory error while creating ring buffer for server '%s/%s'.\n", srv->proxy->id, srv->id);
+		goto error;
+	}
+
 	/* directly create a sink of BUF type, and use UNSPEC log format to
 	 * inherit from caller fmt in sink_write()
+	 *
+	 * sink_name must be unique to prevent existing sink from being re-used
 	 */
-	sink = sink_new_buf(srv->id, trash.area, LOG_FORMAT_UNSPEC, bufsize);
+	sink = sink_new_buf(sink_name, trash.area, LOG_FORMAT_UNSPEC, bufsize);
+	ha_free(&sink_name); // no longer needed
+
 	if (!sink) {
-		ha_alert("unable to create a new sink buffer for server '%s'.\n", srv->id);
+		ha_alert("unable to create a new sink buffer for server '%s/%s'.\n", srv->proxy->id, srv->id);
 		goto error;
 	}
 
@@ -1378,6 +1417,23 @@ static void sink_init()
 	sink_new_buf("buf0",  "in-memory ring buffer", LOG_FORMAT_TIMED, 1048576);
 }
 
+static int sink_postcheck()
+{
+	struct sink *sink;
+
+	list_for_each_entry(sink, &sink_list, sink_list) {
+		if (sink->type == SINK_TYPE_FORWARD_DECLARED) {
+			/* sink wasn't upgraded to actual sink despite being
+			 * forward-declared: it is an error (the sink doesn't
+			 * really exist)
+			 */
+			ha_alert("%s: sink '%s' doesn't exist.\n", sink->desc, sink->name);
+			return ERR_ALERT | ERR_FATAL;
+		}
+	}
+	return ERR_NONE;
+}
+
 static void sink_deinit()
 {
 	struct sink *sink, *sb;
@@ -1387,6 +1443,7 @@ static void sink_deinit()
 }
 
 INITCALL0(STG_REGISTER, sink_init);
+REGISTER_POST_CHECK(sink_postcheck);
 REGISTER_POST_DEINIT(sink_deinit);
 
 static struct cli_kw_list cli_kws = {{ },{

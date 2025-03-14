@@ -67,6 +67,37 @@ def determine_latest_aws_lc(ssl):
     latest_tag = max(valid_tags, key=aws_lc_version_string_to_num)
     return "AWS_LC_VERSION={}".format(latest_tag[1:])
 
+def aws_lc_fips_version_string_to_num(version_string):
+    return tuple(map(int, version_string[12:].split('.')))
+
+def aws_lc_fips_version_valid(version_string):
+    return re.match('^AWS-LC-FIPS-[0-9]+(\.[0-9]+)*$', version_string)
+
+@functools.lru_cache(5)
+def determine_latest_aws_lc_fips(ssl):
+    # the AWS-LC-FIPS tags are at the end of the list, so let's get a lot
+    tags = get_all_github_tags("https://api.github.com/repos/aws/aws-lc/tags?per_page=200")
+    if not tags:
+        return "AWS_LC_FIPS_VERSION=failed_to_detect"
+    valid_tags = list(filter(aws_lc_fips_version_valid, tags))
+    latest_tag = max(valid_tags, key=aws_lc_fips_version_string_to_num)
+    return "AWS_LC_FIPS_VERSION={}".format(latest_tag[12:])
+
+def wolfssl_version_string_to_num(version_string):
+    return tuple(map(int, version_string[1:].removesuffix('-stable').split('.')))
+
+def wolfssl_version_valid(version_string):
+    return re.match('^v[0-9]+(\.[0-9]+)*-stable$', version_string)
+
+@functools.lru_cache(5)
+def determine_latest_wolfssl(ssl):
+    tags = get_all_github_tags("https://api.github.com/repos/wolfssl/wolfssl/tags")
+    if not tags:
+        return "WOLFSSL_VERSION=failed_to_detect"
+    valid_tags = list(filter(wolfssl_version_valid, tags))
+    latest_tag = max(valid_tags, key=wolfssl_version_string_to_num)
+    return "WOLFSSL_VERSION={}".format(latest_tag[1:].removesuffix('-stable'))
+
 @functools.lru_cache(5)
 def determine_latest_libressl(ssl):
     try:
@@ -96,7 +127,7 @@ def main(ref_name):
     if "haproxy-" in ref_name:
         os = "ubuntu-22.04" # stable branch
     else:
-        os = "ubuntu-latest" # development branch
+        os = "ubuntu-24.04" # development branch
 
     TARGET = "linux-glibc"
     for CC in ["gcc", "clang"]:
@@ -117,16 +148,16 @@ def main(ref_name):
                 "TARGET": TARGET,
                 "CC": CC,
                 "FLAGS": [
+                    'DEBUG="-DDEBUG_LIST"',
                     "USE_ZLIB=1",
                     "USE_OT=1",
                     "OT_INC=${HOME}/opt-ot/include",
                     "OT_LIB=${HOME}/opt-ot/lib",
                     "OT_RUNPATH=1",
-                    "USE_PCRE=1",
-                    "USE_PCRE_JIT=1",
+                    "USE_PCRE2=1",
+                    "USE_PCRE2_JIT=1",
                     "USE_LUA=1",
                     "USE_OPENSSL=1",
-                    "USE_SYSTEMD=1",
                     "USE_WURFL=1",
                     "WURFL_INC=addons/wurfl/dummy",
                     "WURFL_LIB=addons/wurfl/dummy",
@@ -149,19 +180,17 @@ def main(ref_name):
                 "CC": CC,
                 "FLAGS": [
                     "USE_OBSOLETE_LINKER=1",
-                    'DEBUG_CFLAGS="-g -fsanitize=address"',
-                    'LDFLAGS="-fsanitize=address"',
-                    'CPU_CFLAGS.generic="-O1"', 
+                    'ARCH_FLAGS="-g -fsanitize=address"',
+                    'OPT_CFLAGS="-O1"',
                     "USE_ZLIB=1",
                     "USE_OT=1",
                     "OT_INC=${HOME}/opt-ot/include",
                     "OT_LIB=${HOME}/opt-ot/lib",
                     "OT_RUNPATH=1",
-                    "USE_PCRE=1",
-                    "USE_PCRE_JIT=1",
+                    "USE_PCRE2=1",
+                    "USE_PCRE2_JIT=1",
                     "USE_LUA=1",
                     "USE_OPENSSL=1",
-                    "USE_SYSTEMD=1",
                     "USE_WURFL=1",
                     "WURFL_INC=addons/wurfl/dummy",
                     "WURFL_LIB=addons/wurfl/dummy",
@@ -190,8 +219,8 @@ def main(ref_name):
             "OPENSSL_VERSION=1.0.2u",
             "OPENSSL_VERSION=1.1.1s",
             "QUICTLS=yes",
-            "WOLFSSL_VERSION=5.6.6",
-            "AWS_LC_VERSION=1.16.0",
+            "WOLFSSL_VERSION=5.7.0",
+            "AWS_LC_VERSION=1.39.0",
             # "BORINGSSL=yes",
         ]
 
@@ -231,9 +260,9 @@ def main(ref_name):
     # macOS
 
     if "haproxy-" in ref_name:
-        os = "macos-12"     # stable branch
+        os = "macos-13"     # stable branch
     else:
-        os = "macos-latest" # development branch
+        os = "macos-15"     # development branch
 
     TARGET = "osx"
     for CC in ["clang"]:

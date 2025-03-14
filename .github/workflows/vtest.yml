@@ -42,13 +42,18 @@ jobs:
       # Configure a short TMPDIR to prevent failures due to long unix socket
       # paths.
       TMPDIR: /tmp
-      # Force ASAN output into asan.log to make the output more readable.
-      ASAN_OPTIONS: log_path=asan.log
       OT_CPP_VERSION: 1.6.0
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 100
+
+    - name: Setup coredumps
+      if: ${{ startsWith(matrix.os, 'ubuntu-') }}
+      run: |
+        sudo sysctl -w fs.suid_dumpable=1
+        sudo sysctl kernel.core_pattern=/tmp/core.%h.%e.%t
+
 #
 # Github Action cache key cannot contain comma, so we calculate it based on job name
 #
@@ -75,13 +80,14 @@ jobs:
     - name: Install apt dependencies
       if: ${{ startsWith(matrix.os, 'ubuntu-') }}
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          liblua5.3-dev \
-          libpcre2-dev \
-          libsystemd-dev \
-          ninja-build \
-          socat
+        sudo apt-get update -o Acquire::Languages=none -o Acquire::Translation=none
+        sudo apt-get --no-install-recommends -y install \
+          ${{ contains(matrix.FLAGS, 'USE_LUA=1')     && 'liblua5.4-dev'  || '' }} \
+          ${{ contains(matrix.FLAGS, 'USE_PCRE2=1')   && 'libpcre2-dev'   || '' }} \
+          ${{ contains(matrix.ssl,   'BORINGSSL=yes') && 'ninja-build'    || '' }} \
+          socat \
+          gdb \
+          jose
     - name: Install brew dependencies
       if: ${{ startsWith(matrix.os, 'macos-') }}
       run: |
@@ -112,7 +118,7 @@ jobs:
           ERR=1 \
           TARGET=${{ matrix.TARGET }} \
           CC=${{ matrix.CC }} \
-          DEBUG="-DDEBUG_STRICT -DDEBUG_MEMORY_POOLS -DDEBUG_POOL_INTEGRITY" \
+          DEBUG="-DDEBUG_POOL_INTEGRITY -DDEBUG_UNIT" \
           ${{ join(matrix.FLAGS, ' ') }} \
           ADDLIB="-Wl,-rpath,/usr/local/lib/ -Wl,-rpath,$HOME/opt/lib/"
         sudo make install
@@ -139,24 +145,42 @@ jobs:
         # This is required for macOS which does not actually allow to increase
         # the '-n' soft limit to the hard limit, thus failing to run.
         ulimit -n 65536
+        ulimit -c unlimited
         make reg-tests VTEST_PROGRAM=../vtest/vtest REGTESTS_TYPES=default,bug,devel
-    - name: Config syntax check memleak smoke testing
-      if: ${{ contains(matrix.name, 'ASAN') }}
-      run: |
-        ./haproxy -f .github/h2spec.config -c
     - name: Show VTest results
       if: ${{ failure() && steps.vtest.outcome == 'failure' }}
       run: |
-        for folder in ${TMPDIR}/haregtests-*/vtc.*; do
+        for folder in ${TMPDIR:-/tmp}/haregtests-*/vtc.*; do
           printf "::group::"
           cat $folder/INFO
           cat $folder/LOG
           echo "::endgroup::"
         done
-        shopt -s nullglob
-        for asan in asan.log*; do
-          echo "::group::$asan"
-          cat $asan
+        exit 1
+    - name: Run Unit tests
+      id: unittests
+      run: |
+        make unit-tests
+    - name: Show Unit-Tests results
+      if: ${{ failure() && steps.unittests.outcome == 'failure' }}
+      run: |
+        for result in ${TMPDIR:-/tmp}/ha-unittests-*/results/res.*; do
+          printf "::group::"
+          cat $result
           echo "::endgroup::"
         done
         exit 1
+    - name: Show coredumps
+      if: ${{ failure() && steps.vtest.outcome == 'failure' }}
+      run: |
+        failed=false
+        shopt -s nullglob
+        for file in /tmp/core.*; do
+          failed=true
+          printf "::group::"
+          gdb -ex 'thread apply all bt full' ./haproxy $file
+          echo "::endgroup::"
+        done
+        if [ "$failed" = true ]; then
+          exit 1;
+        fi

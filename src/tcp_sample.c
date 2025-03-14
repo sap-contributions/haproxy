@@ -10,11 +10,6 @@
  *
  */
 
-/* this is to have tcp_info defined on systems using musl
- * library, such as Alpine Linux.
- */
-#define _GNU_SOURCE
-
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -293,6 +288,7 @@ static int val_fc_time_value(struct arg *args, char **err)
  * case, the argument is ignored and a warning is emitted. Returns 0 on error
  * and non-zero if OK.
  */
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 static int var_fc_counter(struct arg *args, char **err)
 {
 	if (args[0].type != ARGT_STOP) {
@@ -304,6 +300,7 @@ static int var_fc_counter(struct arg *args, char **err)
 
 	return 1;
 }
+#endif
 
 /* Returns some tcp_info data if it's available. "dir" must be set to 0 if
  * the client connection is required, otherwise it is set to 1. "val" represents
@@ -314,61 +311,21 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
                                int dir, int val)
 {
 	struct connection *conn;
-	struct tcp_info info;
-	socklen_t optlen;
 
 	/* strm can be null. */
 	if (!smp->strm)
 		return 0;
 
+	smp->data.type = SMP_T_SINT;
 	/* get the object associated with the stream connector.The
 	 * object can be other thing than a connection. For example,
-	 * it be a appctx.
+	 * it could be an appctx.
 	 */
 	conn = (dir == 0 ? sc_conn(smp->strm->scf) : sc_conn(smp->strm->scb));
-	if (!conn)
+	if (!conn || !conn->ctrl->get_info ||
+	    !conn->ctrl->get_info(conn, &smp->data.u.sint, val))
 		return 0;
 
-	/* The fd may not be available for the tcp_info struct, and the
-	  syscal can fail. */
-	optlen = sizeof(info);
-	if ((conn->flags & CO_FL_FDLESS) ||
-	    getsockopt(conn->handle.fd, IPPROTO_TCP, TCP_INFO, &info, &optlen) == -1)
-		return 0;
-
-	/* extract the value. */
-	smp->data.type = SMP_T_SINT;
-	switch (val) {
-#if defined(__APPLE__)
-	case 0:  smp->data.u.sint = info.tcpi_rttcur;         break;
-	case 1:  smp->data.u.sint = info.tcpi_rttvar;         break;
-	case 2:  smp->data.u.sint = info.tcpi_tfo_syn_data_acked; break;
-	case 4:  smp->data.u.sint = info.tcpi_tfo_syn_loss;   break;
-	case 5:  smp->data.u.sint = info.tcpi_rto;            break;
-#else
-	/* all other platforms supporting TCP_INFO have these ones */
-	case 0:  smp->data.u.sint = info.tcpi_rtt;            break;
-	case 1:  smp->data.u.sint = info.tcpi_rttvar;         break;
-# if defined(__linux__)
-	/* these ones are common to all Linux versions */
-	case 2:  smp->data.u.sint = info.tcpi_unacked;        break;
-	case 3:  smp->data.u.sint = info.tcpi_sacked;         break;
-	case 4:  smp->data.u.sint = info.tcpi_lost;           break;
-	case 5:  smp->data.u.sint = info.tcpi_retrans;        break;
-	case 6:  smp->data.u.sint = info.tcpi_fackets;        break;
-	case 7:  smp->data.u.sint = info.tcpi_reordering;     break;
-# elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
-	/* the ones are found on FreeBSD, NetBSD and OpenBSD featuring TCP_INFO */
-	case 2:  smp->data.u.sint = info.__tcpi_unacked;      break;
-	case 3:  smp->data.u.sint = info.__tcpi_sacked;       break;
-	case 4:  smp->data.u.sint = info.__tcpi_lost;         break;
-	case 5:  smp->data.u.sint = info.__tcpi_retrans;      break;
-	case 6:  smp->data.u.sint = info.__tcpi_fackets;      break;
-	case 7:  smp->data.u.sint = info.__tcpi_reordering;   break;
-# endif
-#endif // apple
-	default: return 0;
-	}
 
 	return 1;
 }
@@ -542,17 +499,25 @@ smp_fetch_accept_date(const struct arg *args, struct sample *smp, const char *kw
 	struct strm_logs *logs;
 	struct timeval tv;
 
-	if (!smp->strm)
+	if (smp->strm) {
+		logs = &smp->strm->logs;
+
+		if (kw[0] == 'r') {  /* request_date */
+			tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
+		} else {             /* accept_date */
+			tv.tv_sec = logs->accept_date.tv_sec;
+			tv.tv_usec = logs->accept_date.tv_usec;
+		}
+	/* case of error-log-format */
+	} else if (smp->sess) {
+		if (kw[0] == 'r') {  /* request_date */
+			tv_ms_add(&tv, &smp->sess->accept_date, smp->sess->t_idle >= 0 ? smp->sess->t_idle + smp->sess->t_handshake : 0);
+		} else {             /* accept_date */
+			tv.tv_sec = smp->sess->accept_date.tv_sec;
+			tv.tv_usec = smp->sess->accept_date.tv_usec;
+		}
+	} else
 		return 0;
-
-	logs = &smp->strm->logs;
-
-	if (kw[0] == 'r') {  /* request_date */
-		tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
-	} else {             /* accept_date */
-		tv.tv_sec = logs->accept_date.tv_sec;
-		tv.tv_usec = logs->accept_date.tv_usec;
-	}
 
 	smp->data.u.sint = tv.tv_sec;
 

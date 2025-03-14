@@ -15,8 +15,11 @@
 #include <haproxy/ncbuf-t.h>
 #include <haproxy/quic_fctl-t.h>
 #include <haproxy/quic_frame-t.h>
+#include <haproxy/quic_pacing-t.h>
 #include <haproxy/quic_stream-t.h>
 #include <haproxy/stconn-t.h>
+#include <haproxy/task-t.h>
+#include <haproxy/time-t.h>
 
 /* Stream types */
 enum qcs_type {
@@ -29,18 +32,19 @@ enum qcs_type {
 	QCS_MAX_TYPES
 };
 
-#define QC_CF_ERRL      0x00000001 /* fatal error detected locally, connection should be closed soon */
-#define QC_CF_ERRL_DONE 0x00000002 /* local error properly handled, connection can be released */
-/* unused 0x00000004 */
-#define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
-#define QC_CF_APP_SHUT  0x00000010 /* Application layer shutdown done. */
-#define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */
+enum qcc_app_st {
+	QCC_APP_ST_NULL,
+	QCC_APP_ST_INIT,
+	QCC_APP_ST_SHUT,
+} __attribute__((packed));
 
 struct qcc {
 	struct connection *conn;
 	uint64_t nb_sc; /* number of attached stream connectors */
 	uint64_t nb_hreq; /* number of in-progress http requests */
 	uint32_t flags; /* QC_CF_* */
+	enum qcc_app_st app_st; /* application layer state */
+	int glitches;   /* total number of glitches on this connection */
 
 	/* flow-control fields set by us enforced on our side. */
 	struct {
@@ -72,6 +76,10 @@ struct qcc {
 
 	struct {
 		struct quic_fctl fc; /* stream flow control applied on sending */
+		uint64_t buf_in_flight; /* sum of currently allocated Tx buffer sizes */
+		struct list frms; /* list of STREAM frames ready for sent */
+		struct quic_pacer pacer; /* engine used to pace emission */
+		int paced_sent_ctr; /* counter for when emission is interrupted due to pacing */
 	} tx;
 
 	uint64_t largest_bidi_r; /* largest remote bidi stream ID opened. */
@@ -81,12 +89,14 @@ struct qcc {
 
 	struct eb_root streams_by_id; /* all active streams by their ID */
 
-	struct list send_retry_list; /* list of qcs eligible to send retry */
+	struct list recv_list; /* list of qcs for which demux can be resumed */
 	struct list send_list; /* list of qcs ready to send (STREAM, STOP_SENDING or RESET_STREAM emission) */
 	struct list fctl_list; /* list of sending qcs blocked on conn flow control */
 	struct list buf_wait_list; /* list of qcs blocked on stream desc buf */
+	struct list purg_list; /* list of qcs which can be purged */
 
 	struct wait_event wait_event;  /* To be used if we're waiting for I/Os */
+	struct task *pacing_task; /* task used to wait when emission is interrupted due to pacing */
 
 	struct proxy *proxy;
 
@@ -101,23 +111,6 @@ struct qcc {
 	const struct qcc_app_ops *app_ops;
 	void *ctx; /* Application layer context */
 };
-
-#define QC_SF_NONE              0x00000000
-#define QC_SF_SIZE_KNOWN        0x00000001  /* last frame received for this stream */
-#define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
-#define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
-#define QC_SF_DETACH            0x00000008  /* sc is detached but there is remaining data to send */
-/* unused 0x00000010 */
-#define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
-#define QC_SF_READ_ABORTED      0x00000040  /* Rx closed using STOP_SENDING*/
-#define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */
-#define QC_SF_HREQ_RECV         0x00000100  /* a full HTTP request has been received */
-#define QC_SF_TO_STOP_SENDING   0x00000200  /* a STOP_SENDING must be sent */
-#define QC_SF_UNKNOWN_PL_LENGTH 0x00000400  /* HTX EOM may be missing from the stream layer */
-#define QC_SF_RECV_RESET        0x00000800  /* a RESET_STREAM was received */
-
-/* Maximum size of stream Rx buffer. */
-#define QC_S_RX_BUF_SZ   (global.tune.bufsize - NCB_RESERVED_SZ)
 
 /* QUIC stream states
  *
@@ -141,6 +134,15 @@ enum qcs_state {
 	QC_SS_CLO,      /* closed */
 } __attribute__((packed));
 
+/* STREAM receive buffer. Can handle out-of-order storage.
+ * Can be used as a tree node to allocate multiple entries ordered by offsets.
+ */
+struct qc_stream_rxbuf {
+	struct eb64_node off_node; /* base offset of current buffer, node for QCS rx.bufs */
+	struct ncbuf ncb;          /* data storage with support for out of order offset */
+	uint64_t off_end;          /* first offset directly outside of current buffer */
+};
+
 struct qcs {
 	struct qcc *qcc;
 	struct sedesc *sd;
@@ -149,9 +151,9 @@ struct qcs {
 	void *ctx;           /* app-ops context */
 
 	struct {
-		uint64_t offset; /* absolute current base offset of ncbuf */
+		uint64_t offset; /* read offset */
 		uint64_t offset_max; /* maximum absolute offset received */
-		struct ncbuf ncbuf; /* receive buffer - can handle out-of-order offset frames */
+		struct eb_root bufs; /* receive buffers tree ordered by offset */
 		struct buffer app_buf; /* receive buffer used by stconn layer */
 		uint64_t msd; /* current max-stream-data limit to enforce */
 		uint64_t msd_init; /* initial max-stream-data */
@@ -164,7 +166,7 @@ struct qcs {
 	uint64_t id;
 	struct qc_stream_desc *stream;
 
-	struct list el; /* element of qcc.send_retry_list */
+	struct list el_recv; /* element of qcc.recv_list */
 	struct list el_send; /* element of qcc.send_list */
 	struct list el_opening; /* element of qcc.opening_list */
 	struct list el_fctl; /* element of qcc.fctl_list */
@@ -176,6 +178,12 @@ struct qcs {
 	uint64_t err; /* error code to transmit via RESET_STREAM */
 
 	int start; /* base timestamp for http-request timeout */
+
+	struct {
+		struct tot_time base; /* total QCS lifetime */
+		struct tot_time buf;  /* stream to QCS send blocked on buffer */
+		struct tot_time fctl; /* stream to QCS send blocked on flow-control */
+	} timer;
 };
 
 /* Used as qcc_app_ops.close callback argument. */
@@ -216,8 +224,81 @@ struct qcc_app_ops {
 
 	/* Increment app counters on CONNECTION_CLOSE_APP reception. */
 	void (*inc_err_cnt)(void *ctx, int err_code);
+	/* Set QCC error code as suspicious activity has been detected. */
+	void (*report_susp)(void *ctx);
 };
 
 #endif /* USE_QUIC */
+
+#define QC_CF_ERRL      0x00000001 /* fatal error detected locally, connection should be closed soon */
+#define QC_CF_ERRL_DONE 0x00000002 /* local error properly handled, connection can be released */
+/* unused 0x00000004 */
+#define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
+/* unused 0x00000010 */
+#define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */
+#define QC_CF_WAIT_HS   0x00000040 /* MUX init before QUIC handshake completed (0-RTT) */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *qcc_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(QC_CF_ERRL,
+	_(QC_CF_ERRL_DONE,
+	_(QC_CF_CONN_FULL,
+	_(QC_CF_ERR_CONN,
+	_(QC_CF_WAIT_HS)))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
+#define QC_SF_NONE              0x00000000
+#define QC_SF_SIZE_KNOWN        0x00000001  /* last frame received for this stream */
+#define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
+#define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
+#define QC_SF_DETACH            0x00000008  /* sc is detached but there is remaining data to send */
+#define QC_SF_TXBUB_OOB         0x00000010  /* stream reserved for metadata out-of-band transmission; txbuf allocation is unrestricted */
+#define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
+#define QC_SF_READ_ABORTED      0x00000040  /* Rx closed using STOP_SENDING*/
+#define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */
+#define QC_SF_HREQ_RECV         0x00000100  /* a full HTTP request has been received */
+#define QC_SF_TO_STOP_SENDING   0x00000200  /* a STOP_SENDING must be sent */
+#define QC_SF_UNKNOWN_PL_LENGTH 0x00000400  /* HTX EOM may be missing from the stream layer */
+#define QC_SF_RECV_RESET        0x00000800  /* a RESET_STREAM was received */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *qcs_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(QC_SF_SIZE_KNOWN,
+	_(QC_SF_FIN_STREAM,
+	_(QC_SF_BLK_MROOM,
+	_(QC_SF_DETACH,
+	_(QC_SF_TXBUB_OOB,
+	_(QC_SF_DEM_FULL,
+	_(QC_SF_READ_ABORTED,
+	_(QC_SF_TO_RESET,
+	_(QC_SF_HREQ_RECV,
+	_(QC_SF_TO_STOP_SENDING,
+	_(QC_SF_UNKNOWN_PL_LENGTH,
+	_(QC_SF_RECV_RESET))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
 
 #endif /* _HAPROXY_MUX_QUIC_T_H */

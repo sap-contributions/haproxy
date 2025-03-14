@@ -22,6 +22,8 @@
 #ifndef _HAPROXY_DEFAULTS_H
 #define _HAPROXY_DEFAULTS_H
 
+#include <haproxy/compat.h>
+
 /* MAX_THREADS defines the highest limit for the global nbthread value. It
  * defaults to the number of bits in a long integer when threads are enabled
  * but may be lowered to save resources on embedded systems.
@@ -69,18 +71,13 @@
 #define BUFSIZE	        16384
 #endif
 
-/* certain buffers may only be allocated for responses in order to avoid
- * deadlocks caused by request queuing. 2 buffers is the absolute minimum
- * acceptable to ensure that a request gaining access to a server can get
- * a response buffer even if it doesn't completely flush the request buffer.
- * The worst case is an applet making use of a request buffer that cannot
- * completely be sent while the server starts to respond, and all unreserved
- * buffers are allocated by request buffers from pending connections in the
- * queue waiting for this one to flush. Both buffers reserved buffers may
- * thus be used at the same time.
- */
+#ifndef BUFSIZE_SMALL
+#define BUFSIZE_SMALL   1024
+#endif
+
+// number of per-thread emergency buffers for low-memory conditions
 #ifndef RESERVED_BUFS
-#define RESERVED_BUFS   2
+#define RESERVED_BUFS   4
 #endif
 
 // reserved buffer space for header rewriting
@@ -112,6 +109,11 @@
 #ifndef LINESIZE
 #define LINESIZE	2048
 #endif
+
+// maximum size of a configuration file that could be loaded in memory via
+// /dev/sdtin. This is needed to prevent from loading extremely large files
+// via standard input.
+#define MAX_CFG_SIZE	10485760
 
 // max # args on a configuration line
 #define MAX_LINE_ARGS   64
@@ -190,6 +192,15 @@
 // value will cause lots of calls, and too high a value may cause high latency.
 #ifndef MAX_POLL_EVENTS
 #define MAX_POLL_EVENTS 200
+#endif
+
+// the max number of rules evaluated in one call to rule handling function.
+// If the function is able to yield, a forced yield will be enforced when
+// reaching this value, else the evaluation will continue. Lowering this
+// value may help to fight against thread contention with cpu-intensive
+// rulesets
+#ifndef MAX_RULES_AT_ONCE
+#define MAX_RULES_AT_ONCE 50
 #endif
 
 /* eternity when exprimed in timeval */
@@ -302,11 +313,27 @@
 #define DEFAULT_MAXCONN 100
 #endif
 
-/* Define a maxconn which will be used in the master process once it re-exec to
- * the MODE_MWORKER_WAIT and won't change when SYSTEM_MAXCONN is set.
+/* Default file descriptor limit.
  *
- * 100 must be enough for the master since it only does communication between
- * the master and the workers, and the master CLI.
+ * DEFAULT_MAXFD explicitly reduces the hard RLIMIT_NOFILE, which is used by the
+ * process as the base value to calculate the default global.maxsock, if
+ * global.maxconn, global.rlimit_memmax are not defined. This is useful in the
+ * case, when hard nofile limit has been bumped to fs.nr_open (kernel max),
+ * which is extremely large on many modern distros. So, we will also finish with
+ * an extremely large default global.maxsock. The only way to override
+ * DEFAULT_MAXFD, if defined, is to set fd_hard_limit in the config global
+ * section. If DEFAULT_MAXFD is not set, a reasonable maximum of 1048576 will be
+ * used as the default value, which almost guarantees that a process will
+ * correctly start in any situation and will be not killed then by watchdog,
+ * when it will loop over the allocated fdtab.
+*/
+#ifndef DEFAULT_MAXFD
+#define DEFAULT_MAXFD 1048576
+#endif
+
+/* Define a maxconn which will be used in the master process and won't change
+ * when SYSTEM_MAXCONN is set. 100 must be enough for the master since it only
+ * does communication between the master and the workers, and the master CLI.
  */
 #ifndef MASTER_MAXCONN
 #define MASTER_MAXCONN 100
@@ -478,6 +505,10 @@
 
 #define CONFIG_HAP_POOL_BUCKETS (1UL << (CONFIG_HAP_POOL_BUCKETS_BITS))
 
+#ifndef CONFIG_HAP_TBL_BUCKETS
+# define CONFIG_HAP_TBL_BUCKETS CONFIG_HAP_POOL_BUCKETS
+#endif
+
 /* Number of samples used to compute the times reported in stats. A power of
  * two is highly recommended, and this value multiplied by the largest response
  * time must not overflow and unsigned int. See freq_ctr.h for more information.
@@ -528,6 +559,47 @@
 # else
 #  define CACHE_TREE_NUM 1
 # endif
+#endif
+
+/* number of ring wait queues depending on the number
+ * of threads.
+ */
+#ifndef RING_WAIT_QUEUES
+# if defined(USE_THREAD) && MAX_THREADS >= 32
+#  define RING_WAIT_QUEUES   16
+# elif defined(USE_THREAD)
+#  define RING_WAIT_QUEUES ((MAX_THREADS + 1) / 2)
+# else
+#  define RING_WAIT_QUEUES 1
+# endif
+#endif
+
+/* it has been found that 6 queues was optimal on various archs at various
+ * thread counts, so let's use that by default.
+ */
+#ifndef RING_DFLT_QUEUES
+# define RING_DFLT_QUEUES   6
+#endif
+
+/* Elements used by memory profiling. This determines the number of buckets to
+ * store stats.
+ */
+#ifndef MEMPROF_HASH_BITS
+# define MEMPROF_HASH_BITS 10
+#endif
+#define MEMPROF_HASH_BUCKETS (1U << MEMPROF_HASH_BITS)
+
+/* Let's make DEBUG_STRICT default to 1 to get rid of it in the makefile */
+#ifndef DEBUG_STRICT
+# define DEBUG_STRICT 1
+#endif
+
+#if !defined(DEBUG_MEMORY_POOLS)
+# define DEBUG_MEMORY_POOLS 1
+#endif
+
+#ifndef MAX_SELF_USE_QUEUE
+#define MAX_SELF_USE_QUEUE 9
 #endif
 
 #endif /* _HAPROXY_DEFAULTS_H */

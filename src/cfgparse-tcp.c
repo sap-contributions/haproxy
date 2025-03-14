@@ -144,6 +144,10 @@ static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, stru
 
 	ha_free(&conf->settings.interface);
 	conf->settings.interface = strdup(args[cur_arg + 1]);
+	if (!conf->settings.interface) {
+		memprintf(err, "'%s %s' : out of memory", args[cur_arg], args[cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 	return 0;
 }
 #endif
@@ -169,6 +173,7 @@ static int bind_parse_namespace(char **args, int cur_arg, struct proxy *px, stru
 		ha_alert("Cannot open namespace '%s'.\n", args[cur_arg + 1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
+
 	return 0;
 }
 #endif

@@ -177,7 +177,7 @@ static forceinline char *hsl_show_flags(char *buf, size_t len, const char *delim
 #define HTX_FL_PARSING_ERROR     0x00000001 /* Set when a parsing error occurred */
 #define HTX_FL_PROCESSING_ERROR  0x00000002 /* Set when a processing error occurred */
 #define HTX_FL_FRAGMENTED        0x00000004 /* Set when the HTX buffer is fragmented */
-/* 0x00000008 unused */
+#define HTX_FL_ALTERED_PAYLOAD   0x00000008 /* The payload is altered, the extra value must not be trusted */
 #define HTX_FL_EOM               0x00000010 /* Set when end-of-message is reached from the HTTP point of view
 					     * (at worst, on the EOM block is missing)
 					     */
@@ -225,7 +225,9 @@ struct htx_ret {
 	struct htx_blk *blk; /* An HTX block */
 };
 
-/* HTX start-line */
+/* HTX start-line. This is almost always aligned except in rare cases where
+ * parts of the URI are rewritten, hence the packed attribute.
+ */
 struct htx_sl {
 	unsigned int flags; /* HTX_SL_F_* */
 	union {
@@ -237,11 +239,16 @@ struct htx_sl {
 		} res;
 	} info;
 
-	/* XXX 2 bytes unused */
+	/* XXX 2 bytes unused, must be present to keep the rest aligned
+	 * (check with "pahole -C htx_sl" that len[] is aligned in case
+	 * of doubt).
+	 */
+	char __pad_1;
+	char __pad_2;
 
 	unsigned int len[3]; /* length of different parts of the start-line */
 	char         l[VAR_ARRAY];
-};
+} __attribute__((packed));
 
 /* Internal representation of an HTTP message */
 struct htx {

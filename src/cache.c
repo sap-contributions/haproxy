@@ -232,8 +232,8 @@ DECLARE_STATIC_POOL(pool_head_cache_st, "cache_st", sizeof(struct cache_st));
 
 static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tree, struct cache_entry *new_entry);
 static void delete_entry(struct cache_entry *del_entry);
-static void release_entry_locked(struct cache_tree *cache, struct cache_entry *entry);
-static void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry);
+static inline void release_entry_locked(struct cache_tree *cache, struct cache_entry *entry);
+static inline void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry);
 
 /*
  * Find a cache_entry in the <cache>'s tree that has the hash <hash>.
@@ -820,7 +820,7 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 		goto no_cache;
 	}
 
-	((struct cache_entry *)st->first_block->data)->body_size += data_len;
+	ASSUME_NONNULL((struct cache_entry *)st->first_block->data)->body_size += data_len;
 	ret = shctx_row_data_append(shctx, st->first_block,
 				    (unsigned char *)b_head(&trash), b_data(&trash));
 	if (ret < 0)
@@ -1137,7 +1137,7 @@ static int http_check_vary_header(struct htx *htx, unsigned int *vary_signature)
  * "vary" on the accept-encoding value.
  * Returns 0 if we found a known encoding in the response, -1 otherwise.
  */
-static int set_secondary_key_encoding(struct htx *htx, char *secondary_key)
+static int set_secondary_key_encoding(struct htx *htx, unsigned int vary_signature, char *secondary_key)
 {
 	unsigned int resp_encoding_bitmap = 0;
 	const struct vary_hashing_information *info = vary_information;
@@ -1146,6 +1146,11 @@ static int set_secondary_key_encoding(struct htx *htx, char *secondary_key)
 	unsigned int hash_info_count = sizeof(vary_information)/sizeof(*vary_information);
 	unsigned int encoding_value;
 	struct http_hdr_ctx ctx = { .blk = NULL };
+
+	/* We must not set the accept encoding part of the secondary signature
+	 * if the response does not vary on 'Accept Encoding'. */
+	if (!(vary_signature & VARY_ACCEPT_ENCODING))
+		return 0;
 
 	/* Look for the accept-encoding part of the secondary_key. */
 	while (count < hash_info_count && info->value != VARY_ACCEPT_ENCODING) {
@@ -1191,7 +1196,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	struct cache *cache = cconf->c.cache;
 	struct shared_context *shctx = shctx_ptr(cache);
 	struct cache_st *cache_ctx = NULL;
-	struct cache_entry *object, *old;
+	struct cache_entry *object = NULL, *old;
 	unsigned int key = read_u32(txn->cache_hash);
 	struct htx *htx;
 	struct http_hdr_ctx ctx;
@@ -1408,7 +1413,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 * We will not cache a response that has an unknown encoding (not
 	 * explicitly supported in parse_encoding_value function). */
 	if (cache->vary_processing_enabled && vary_signature)
-		if (set_secondary_key_encoding(htx, object->secondary_key))
+		if (set_secondary_key_encoding(htx, vary_signature, object->secondary_key))
 		    goto out;
 
 	if (!shctx_row_reserve_hot(shctx, first, trash.data)) {
@@ -1777,14 +1782,24 @@ static void http_cache_io_handler(struct appctx *appctx)
 	unsigned int len;
 	size_t ret;
 
-	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL))
+	if (applet_fl_test(appctx, APPCTX_FL_INBLK_ALLOC|APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL))
 		goto exit;
 
 	if (applet_fl_test(appctx, APPCTX_FL_FASTFWD) && se_fl_test(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD))
 		goto exit;
 
+	if (appctx->st0 == HTX_CACHE_INIT) {
+		if (!appctx_get_buf(appctx, &appctx->inbuf) || htx_is_empty(htxbuf(&appctx->inbuf)))
+			goto wait_request;
+
+		ctx->next = block_ptr(cache_ptr);
+		ctx->offset = sizeof(*cache_ptr);
+		ctx->sent = 0;
+		ctx->rem_data = 0;
+		appctx->st0 = HTX_CACHE_HEADER;
+	}
+
 	if (!appctx_get_buf(appctx, &appctx->outbuf)) {
-		appctx->flags |= APPCTX_FL_OUTBLK_ALLOC;
 		goto exit;
 	}
 
@@ -1797,16 +1812,12 @@ static void http_cache_io_handler(struct appctx *appctx)
 	len = first->len - sizeof(*cache_ptr) - ctx->sent;
 	res_htx = htx_from_buf(&appctx->outbuf);
 
-	if (appctx->st0 == HTX_CACHE_INIT) {
-		ctx->next = block_ptr(cache_ptr);
-		ctx->offset = sizeof(*cache_ptr);
-		ctx->sent = 0;
-		ctx->rem_data = 0;
-		appctx->st0 = HTX_CACHE_HEADER;
-	}
-
 	if (appctx->st0 == HTX_CACHE_HEADER) {
 		struct ist meth;
+
+		if (unlikely(applet_fl_test(appctx, APPCTX_FL_INBLK_ALLOC))) {
+			goto exit;
+		}
 
 		/* Headers must be dump at once. Otherwise it is an error */
 		ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_EOH);
@@ -1842,7 +1853,7 @@ static void http_cache_io_handler(struct appctx *appctx)
 		if (len) {
 			ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_UNUSED);
 			if (ret < len) {
-				appctx->flags |= APPCTX_FL_OUTBLK_FULL;
+				applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 				goto out;
 			}
 		}
@@ -1873,6 +1884,11 @@ static void http_cache_io_handler(struct appctx *appctx)
 	b_reset(&appctx->inbuf);
 	applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
 	appctx->sedesc->iobuf.flags &= ~IOBUF_FL_FF_BLOCKED;
+	return;
+
+  wait_request:
+	/* Wait for the request before starting to deliver the response */
+	applet_need_more_data(appctx);
 	return;
 
   error:
@@ -2466,7 +2482,7 @@ int post_check_cache()
 	list_for_each_entry_safe(cache_config, back, &caches_config, list) {
 
 		ret_shctx = shctx_init(&shctx, cache_config->maxblocks, CACHE_BLOCKSIZE,
-		                       cache_config->maxobjsz, sizeof(struct cache));
+		                       cache_config->maxobjsz, sizeof(struct cache), cache_config->id);
 
 		if (ret_shctx <= 0) {
 			if (ret_shctx == SHCTX_E_INIT_LOCK)

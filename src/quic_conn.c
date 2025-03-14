@@ -47,6 +47,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/quic_ack.h>
 #include <haproxy/quic_cc.h>
+#include <haproxy/quic_cid.h>
 #include <haproxy/quic_cli-t.h>
 #include <haproxy/quic_frame.h>
 #include <haproxy/quic_enc.h>
@@ -56,6 +57,7 @@
 #include <haproxy/quic_sock.h>
 #include <haproxy/quic_stats.h>
 #include <haproxy/quic_stream.h>
+#include <haproxy/quic_token.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/quic_trace.h>
 #include <haproxy/quic_tx.h>
@@ -161,7 +163,9 @@ void qc_kill_conn(struct quic_conn *qc)
 	TRACE_PROTO("killing the connection", QUIC_EV_CONN_KILL, qc);
 	qc->flags |= QUIC_FL_CONN_TO_KILL;
 	qc->flags &= ~QUIC_FL_CONN_RETRANS_NEEDED;
-	task_wakeup(qc->idle_timer_task, TASK_WOKEN_OTHER);
+
+	if (!(qc->flags & QUIC_FL_CONN_EXP_TIMER))
+		task_wakeup(qc->idle_timer_task, TASK_WOKEN_OTHER);
 
 	qc_notify_err(qc);
 
@@ -355,7 +359,7 @@ int qc_h3_request_reject(struct quic_conn *qc, uint64_t id)
 	int ret = 0;
 	struct quic_frame *ss, *rs;
 	struct quic_enc_level *qel = qc->ael;
-	const uint64_t app_error_code = H3_REQUEST_REJECTED;
+	const uint64_t app_error_code = H3_ERR_REQUEST_REJECTED;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSHPKT, qc);
 
@@ -458,7 +462,7 @@ int quic_stateless_reset_token_cpy(unsigned char *pos, size_t len,
  */
 int quic_build_post_handshake_frames(struct quic_conn *qc)
 {
-	int ret = 0, max;
+	int ret = 0, max = 0;
 	struct quic_enc_level *qel;
 	struct quic_frame *frm, *frmbak;
 	struct list frm_list = LIST_HEAD_INIT(frm_list);
@@ -469,12 +473,32 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 	qel = qc->ael;
 	/* Only servers must send a HANDSHAKE_DONE frame. */
 	if (qc_is_listener(qc)) {
+		size_t new_token_frm_len;
+
 		frm = qc_frm_alloc(QUIC_FT_HANDSHAKE_DONE);
 		if (!frm) {
 			TRACE_ERROR("frame allocation error", QUIC_EV_CONN_IO_CB, qc);
 			goto leave;
 		}
 
+		LIST_APPEND(&frm_list, &frm->list);
+
+		frm = qc_frm_alloc(QUIC_FT_NEW_TOKEN);
+		if (!frm) {
+			TRACE_ERROR("frame allocation error", QUIC_EV_CONN_IO_CB, qc);
+			goto err;
+		}
+
+		new_token_frm_len =
+			quic_generate_token(frm->new_token.data,
+			                    sizeof(frm->new_token.data), &qc->peer_addr);
+		if (!new_token_frm_len) {
+			TRACE_ERROR("token generation failed", QUIC_EV_CONN_IO_CB, qc);
+			goto err;
+		}
+
+		BUG_ON(new_token_frm_len != sizeof(frm->new_token.data));
+		frm->new_token.len = new_token_frm_len;
 		LIST_APPEND(&frm_list, &frm->list);
 	}
 
@@ -505,7 +529,7 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 		/* TODO To prevent CID tree locking, all CIDs created here
 		 * could be allocated at the same time as the first one.
 		 */
-		quic_cid_insert(conn_id);
+		_quic_cid_insert(conn_id);
 
 		quic_connection_id_to_frm_cpy(frm, conn_id);
 		LIST_APPEND(&frm_list, &frm->list);
@@ -544,16 +568,13 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 	goto leave;
 }
 
-
 /* QUIC connection packet handler task (post handshake) */
 struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state)
 {
+	struct list send_list = LIST_HEAD_INIT(send_list);
 	struct quic_conn *qc = context;
-	struct quic_enc_level *qel;
 
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
-
-	qel = qc->ael;
 	TRACE_STATE("connection handshake state", QUIC_EV_CONN_IO_CB, qc, &qc->state);
 
 	if (qc_test_fd(qc))
@@ -593,8 +614,11 @@ struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int sta
 	}
 
 	/* XXX TODO: how to limit the list frames to send */
-	if (!qc_send_app_pkts(qc, &qel->pktns->tx.frms)) {
-		TRACE_DEVEL("qc_send_app_pkts() failed", QUIC_EV_CONN_IO_CB, qc);
+	if (qel_need_sending(qc->ael, qc))
+		qel_register_send(&send_list, qc->ael, &qc->ael->pktns->tx.frms);
+
+	if (!qc_send(qc, 0, &send_list, 0)) {
+		TRACE_DEVEL("qc_send() failed", QUIC_EV_CONN_IO_CB, qc);
 		goto out;
 	}
 
@@ -651,7 +675,7 @@ static struct task *quic_conn_closed_io_cb(struct task *t, void *context, unsign
 
 	buf = b_make(cc_qc->cc_buf_area + headlen,
 	             QUIC_MAX_CC_BUFSIZE - headlen, 0, cc_qc->cc_dgram_len);
-	if (qc_snd_buf(qc, &buf, buf.data, 0) < 0) {
+	if (qc_snd_buf(qc, &buf, buf.data, 0, 0) < 0) {
 		TRACE_ERROR("sendto fatal error", QUIC_EV_CONN_IO_CB, qc);
 		quic_release_cc_conn(cc_qc);
 		cc_qc = NULL;
@@ -741,9 +765,9 @@ static struct quic_conn_closed *qc_new_cc_conn(struct quic_conn *qc)
 /* QUIC connection packet handler task. */
 struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 {
-	int ret;
 	struct quic_conn *qc = context;
-	struct buffer *buf = NULL;
+	struct list send_list = LIST_HEAD_INIT(send_list);
+	struct quic_enc_level *qel;
 	int st;
 	struct tasklet *tl = (struct tasklet *)t;
 
@@ -752,9 +776,15 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	st = qc->state;
 	TRACE_PROTO("connection state", QUIC_EV_CONN_IO_CB, qc, &st);
 
+	/* TASK_HEAVY is set when received CRYPTO data have to be handled. */
 	if (HA_ATOMIC_LOAD(&tl->state) & TASK_HEAVY) {
-		HA_ATOMIC_AND(&tl->state, ~TASK_HEAVY);
 		qc_ssl_provide_all_quic_data(qc, qc->xprt_ctx);
+		HA_ATOMIC_AND(&tl->state, ~TASK_HEAVY);
+	}
+
+	if (qc->flags & QUIC_FL_CONN_TO_KILL) {
+		TRACE_DEVEL("connection to be killed", QUIC_EV_CONN_PHPKTS, qc);
+		goto out;
 	}
 
 	/* Retranmissions */
@@ -771,13 +801,13 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	if (!qc_treat_rx_pkts(qc))
 		goto out;
 
+	/* TASK_HEAVY is set when received CRYPTO data have to be handled. These data
+	 * must be acknowledged asap and replied to with others CRYPTO data. In this
+	 * case, it is more optimal to delay the ACK to send it with the CRYPTO data
+	 * from the same datagram.
+	 */
 	if (HA_ATOMIC_LOAD(&tl->state) & TASK_HEAVY) {
 		tasklet_wakeup(tl);
-		goto out;
-	}
-
-	if (qc->flags & QUIC_FL_CONN_TO_KILL) {
-		TRACE_DEVEL("connection to be killed", QUIC_EV_CONN_PHPKTS, qc);
 		goto out;
 	}
 
@@ -795,35 +825,63 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 			qc_el_rx_pkts_del(qc->hel);
 			qc_release_pktns_frms(qc, qc->hel->pktns);
 		}
+
+		/* Note: if no token for address validation was received
+		 * for a 0RTT connection, some 0RTT packet could still be
+		 * waiting for HP removal AFTER the successful handshake completion.
+		 * Indeed a successful handshake completion implicitely valids
+		 * the peer address. In this case, one wants to process
+		 * these ORTT packets AFTER the succesful handshake completion.
+		 *
+		 * On the contrary, when a token for address validation was received,
+		 * release 0RTT packets still waiting for HP removal. These
+		 * packets are considered unneeded after handshake completion.
+		 * They will be freed later from Rx buf via quic_rx_pkts_del().
+		 */
+		if (qc->eel && !LIST_ISEMPTY(&qc->eel->rx.pqpkts) &&
+		    !(qc->flags & QUIC_FL_CONN_NO_TOKEN_RCVD)) {
+			struct quic_rx_packet *pqpkt, *pkttmp;
+			list_for_each_entry_safe(pqpkt, pkttmp, &qc->eel->rx.pqpkts, list) {
+				LIST_DEL_INIT(&pqpkt->list);
+				quic_rx_packet_refdec(pqpkt);
+			}
+
+			/* RFC 9001 4.9.3. Discarding 0-RTT Keys
+			 * Additionally, a server MAY discard 0-RTT keys as soon as it receives
+			 * a 1-RTT packet. However, due to packet reordering, a 0-RTT packet
+			 * could arrive after a 1-RTT packet. Servers MAY temporarily retain 0-
+			 * RTT keys to allow decrypting reordered packets without requiring
+			 * their contents to be retransmitted with 1-RTT keys. After receiving a
+			 * 1-RTT packet, servers MUST discard 0-RTT keys within a short time;
+			 * the RECOMMENDED time period is three times the Probe Timeout (PTO,
+			 * see [QUIC-RECOVERY]). A server MAY discard 0-RTT keys earlier if it
+			 * determines that it has received all 0-RTT packets, which can be done
+			 * by keeping track of missing packet numbers.
+			 *
+			 * TODO implement discarding of 0-RTT keys
+			 */
+		}
+
+		/* Wake up connection layer if on wait-for-handshake. */
+		if (qc->subs && qc->subs->events & SUB_RETRY_RECV) {
+			TRACE_STATE("notify upper layer (recv)", QUIC_EV_CONN_IO_CB, qc);
+			tasklet_wakeup(qc->subs->tasklet);
+			qc->subs->events &= ~SUB_RETRY_RECV;
+			if (!qc->subs->events)
+				qc->subs = NULL;
+		}
 	}
 
-	buf = qc_get_txb(qc);
-	if (!buf)
-		goto out;
-
-	if (b_data(buf) && !qc_purge_txbuf(qc, buf))
-		goto out;
-
-	/* Currently buf cannot be non-empty at this stage. Even if a previous
-	 * sendto() has failed it is emptied to simulate packet emission and
-	 * rely on QUIC lost detection to try to emit it.
-	 */
-	BUG_ON_HOT(b_data(buf));
-	b_reset(buf);
-
-	ret = qc_prep_hpkts(qc, buf, NULL);
-	if (ret == -1) {
-		qc_txb_release(qc);
-		goto out;
+	/* Insert each QEL into sending list if needed. */
+	list_for_each_entry(qel, &qc->qel_list, list) {
+		if (qel_need_sending(qel, qc))
+			qel_register_send(&send_list, qel, &qel->pktns->tx.frms);
 	}
 
-	if (ret && !qc_send_ppkts(buf, qc->xprt_ctx)) {
-		if (qc->flags & QUIC_FL_CONN_TO_KILL)
-			qc_txb_release(qc);
+	if (!qc_send(qc, 0, &send_list, 0)) {
+		TRACE_DEVEL("qc_send() failed", QUIC_EV_CONN_IO_CB, qc);
 		goto out;
 	}
-
-	qc_txb_release(qc);
 
  out:
 	/* Release the Handshake encryption level and packet number space if
@@ -848,7 +906,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		qc = NULL;
 	}
 
-	TRACE_PROTO("ssl error", QUIC_EV_CONN_IO_CB, qc, &st);
+	TRACE_PROTO("ssl status", QUIC_EV_CONN_IO_CB, qc, &st);
 	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc);
 	return t;
 }
@@ -874,7 +932,7 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 	if (tick_isset(pktns->tx.loss_time)) {
 		struct list lost_pkts = LIST_HEAD_INIT(lost_pkts);
 
-		qc_packet_loss_lookup(pktns, qc, &lost_pkts);
+		qc_packet_loss_lookup(pktns, qc, &lost_pkts, NULL);
 		if (!LIST_ISEMPTY(&lost_pkts))
 		    tasklet_wakeup(qc->wait_event.tasklet);
 		if (qc_release_lost_pkts(qc, pktns, &lost_pkts, now_ms))
@@ -950,11 +1008,15 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
  * for QUIC servers (or haproxy listeners).
  * <dcid> is the destination connection ID, <scid> is the source connection ID.
  * This latter <scid> CID as the same value on the wire as the one for <conn_id>
- * which is the first CID of this connection but a different internal representation used to build
+ * which is the first CID of this connection but a different internal
+ * representation used to build
  * NEW_CONNECTION_ID frames. This is the responsibility of the caller to insert
  * <conn_id> in the CIDs tree for this connection (qc->cids).
- * <token> is the token found to be used for this connection with <token_len> as
- * length. Endpoints addresses are specified via <local_addr> and <peer_addr>.
+ * <token> is a boolean denoting if a token was received for this connection
+ * from an Initial packet.
+ * <token_odcid> is the original destination connection ID which was embedded
+ * into the Retry token sent to the client before instantiated this connection.
+ * Endpoints addresses are specified via <local_addr> and <peer_addr>.
  * Returns the connection if succeeded, NULL if not.
  */
 struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
@@ -1061,6 +1123,9 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		qc->prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe,
 		                                      &quic_stats_module);
 		qc->flags = QUIC_FL_CONN_LISTENER;
+		/* Mark this connection as having not received any token when 0-RTT is enabled. */
+		if (l->bind_conf->ssl_conf.early_data && !token)
+			qc->flags |= QUIC_FL_CONN_NO_TOKEN_RCVD;
 		qc->state = QUIC_HS_ST_SERVER_INITIAL;
 		/* Copy the client original DCID. */
 		qc->odcid = *dcid;
@@ -1083,7 +1148,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	/* If connection is instantiated due to an INITIAL packet with an
 	 * already checked token, consider the peer address as validated.
 	 */
-	if (token_odcid->len) {
+	if (token) {
 		TRACE_STATE("validate peer address due to initial token",
 		            QUIC_EV_CONN_INIT, qc);
 		qc->flags |= QUIC_FL_CONN_PEER_VALIDATED_ADDR;
@@ -1162,7 +1227,6 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	quic_cc_path_init(qc->path, ipv4, server ? l->bind_conf->max_cwnd : 0,
 	                  cc_algo ? cc_algo : default_quic_cc_algo, qc);
 
-	qc->stream_buf_count = 0;
 	memcpy(&qc->local_addr, local_addr, sizeof(qc->local_addr));
 	memcpy(&qc->peer_addr, peer_addr, sizeof qc->peer_addr);
 
@@ -1183,6 +1247,11 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	}
 	qc->wait_event.tasklet->process = quic_conn_io_cb;
 	qc->wait_event.tasklet->context = qc;
+	/* Enable TASK_F_WANTS_TIME task flag for congestion control algorithms with
+	 * delivery rate estimation only.
+	 */
+	if (qc->path->cc.algo->get_drs)
+		qc->wait_event.tasklet->state |= TASK_F_WANTS_TIME;
 	qc->wait_event.events = 0;
 	qc->subs = NULL;
 
@@ -1333,6 +1402,9 @@ void quic_conn_release(struct quic_conn *qc)
 	if (!qc)
 		goto leave;
 
+	/* Must not delete a quic_conn if thread affinity rebind in progress. */
+	BUG_ON(qc->flags & QUIC_FL_CONN_TID_REBIND);
+
 	/* We must not free the quic-conn if the MUX is still allocated. */
 	BUG_ON(qc->mux_state == QC_MUX_READY);
 
@@ -1379,7 +1451,7 @@ void quic_conn_release(struct quic_conn *qc)
 		/* all streams attached to the quic-conn are released, so
 		 * qc_stream_desc_free will liberate the stream instance.
 		 */
-		BUG_ON(!stream->release);
+		BUG_ON(!(stream->flags & QC_SD_FL_RELEASE));
 		qc_stream_desc_free(stream, 1);
 	}
 
@@ -1668,11 +1740,6 @@ const struct quic_version *qc_supported_version(uint32_t version)
  */
 int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len)
 {
-	const uchar idx = _quic_cid_tree_idx(dcid);
-	struct quic_connection_id *conn_id;
-	struct ebmb_node *node = NULL;
-	struct quic_cid_tree *tree = &quic_cid_trees[idx];
-
 	/* Test against our default CID or client ODCID. */
 	if ((qc->scid.len == dcid_len &&
 	     memcmp(qc->scid.data, dcid, dcid_len) == 0) ||
@@ -1688,17 +1755,7 @@ int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len)
 	 *
 	 * TODO set it to our default CID to avoid this operation next time.
 	 */
-	HA_RWLOCK_RDLOCK(QC_CID_LOCK, &tree->lock);
-	node = ebmb_lookup(&tree->root, dcid, dcid_len);
-	HA_RWLOCK_RDUNLOCK(QC_CID_LOCK, &tree->lock);
-
-	if (node) {
-		conn_id = ebmb_entry(node, struct quic_connection_id, node);
-		if (qc == conn_id->qc)
-			return 1;
-	}
-
-	return 0;
+	return quic_cmp_cid_conn(dcid, dcid_len, qc);
 }
 
 /* Wake-up upper layer for sending if all conditions are met :
@@ -1711,6 +1768,11 @@ int qc_notify_send(struct quic_conn *qc)
 {
 	const struct quic_pktns *pktns = qc->apktns;
 
+	TRACE_STATE("notify upper layer (send)", QUIC_EV_CONN_IO_CB, qc);
+
+	/* Wake up MUX for new emission unless there is no congestion room or
+	 * connection FD is not ready.
+	 */
 	if (qc->subs && qc->subs->events & SUB_RETRY_SEND) {
 		/* RFC 9002 7.5. Probe Timeout
 		 *
@@ -1726,6 +1788,12 @@ int qc_notify_send(struct quic_conn *qc)
 			return 1;
 		}
 	}
+
+	/* Wake up streams layer waiting for buffer. Useful after congestion
+	 * window increase.
+	 */
+	if (qc->mux_state == QC_MUX_READY && (qc->qcc->flags & QC_CF_CONN_FULL))
+		qcc_notify_buf(qc->qcc, 0);
 
 	return 0;
 }
@@ -1753,23 +1821,18 @@ void qc_notify_err(struct quic_conn *qc)
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
 }
 
-/* Move a <qc> QUIC connection and its resources from the current thread to the
- * new one <new_tid> optionally in association with <new_li> (since it may need
- * to change when migrating to a thread from a different group, otherwise leave
- * it NULL). After this call, the connection cannot be dereferenced anymore on
- * the current thread.
+/* Prepare <qc> QUIC connection rebinding to a new thread <new_tid>. Stop and
+ * release associated tasks and tasklet and allocate new ones binded to the new
+ * thread.
  *
  * Returns 0 on success else non-zero.
  */
-int qc_set_tid_affinity(struct quic_conn *qc, uint new_tid, struct listener *new_li)
+int qc_bind_tid_prep(struct quic_conn *qc, uint new_tid)
 {
 	struct task *t1 = NULL, *t2 = NULL;
 	struct tasklet *t3 = NULL;
 
-	struct quic_connection_id *conn_id;
-	struct eb64_node *node;
-
-	TRACE_ENTER(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
 
 	/* Pre-allocate all required resources. This ensures we do not left a
 	 * connection with only some of its field rebinded.
@@ -1806,35 +1869,14 @@ int qc_set_tid_affinity(struct quic_conn *qc, uint new_tid, struct listener *new
 	qc->wait_event.tasklet->context = qc;
 	qc->wait_event.events = 0;
 
-	/* Rebind the connection FD. */
-	if (qc_test_fd(qc)) {
-		/* Reading is reactivated by the new thread. */
-		fd_migrate_on(qc->fd, new_tid);
-	}
-
 	/* Remove conn from per-thread list instance. It will be hidden from
-	 * "show quic" until rebinding is completed.
+	 * "show quic" until qc_finalize_tid_rebind().
 	 */
 	qc_detach_th_ctx_list(qc, 0);
 
-	node = eb64_first(qc->cids);
-	BUG_ON(!node || eb64_next(node)); /* One and only one CID must be present before affinity rebind. */
-	conn_id = eb64_entry(node, struct quic_connection_id, seq_num);
+	qc->flags |= QUIC_FL_CONN_TID_REBIND;
 
-	/* At this point no connection was accounted for yet on this
-	 * listener so it's OK to just swap the pointer.
-	 */
-	if (new_li && new_li != qc->li)
-		qc->li = new_li;
-
-	/* Rebinding is considered done when CID points to the new thread. No
-	 * access should be done to quic-conn instance after it.
-	 */
-	qc->flags |= QUIC_FL_CONN_AFFINITY_CHANGED;
-	HA_ATOMIC_STORE(&conn_id->tid, new_tid);
-	qc = NULL;
-
-	TRACE_LEAVE(QUIC_EV_CONN_SET_AFFINITY, NULL);
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, qc);
 	return 0;
 
  err:
@@ -1842,18 +1884,89 @@ int qc_set_tid_affinity(struct quic_conn *qc, uint new_tid, struct listener *new
 	task_destroy(t2);
 	tasklet_free(t3);
 
-	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_BIND_TID, qc);
 	return 1;
 }
 
-/* Must be called after qc_set_tid_affinity() on the new thread. */
-void qc_finalize_affinity_rebind(struct quic_conn *qc)
+/* Complete <qc> rebinding to an already selected new thread and associate it
+ * to <new_li> if necessary as required when migrating to a new thread group.
+ *
+ * After this function, <qc> instance must only be accessed via its newly
+ * associated thread. qc_finalize_tid_rebind() must be called to
+ * reactivate quic_conn elements.
+ */
+void qc_bind_tid_commit(struct quic_conn *qc, struct listener *new_li)
 {
-	TRACE_ENTER(QUIC_EV_CONN_SET_AFFINITY, qc);
+	const uint new_tid = qc->wait_event.tasklet->tid;
+	struct quic_connection_id *conn_id;
+	struct eb64_node *node;
+
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
+
+	/* Must only be called after qc_bind_tid_prep(). */
+	BUG_ON(!(qc->flags & QUIC_FL_CONN_TID_REBIND));
+
+	/* At this point no connection was accounted for yet on this
+	 * listener so it's OK to just swap the pointer.
+	 */
+	if (new_li && new_li != qc->li)
+		qc->li = new_li;
+
+	/* Rebind the connection FD. */
+	if (qc_test_fd(qc)) {
+		/* Reading is reactivated by the new thread. */
+		fd_migrate_on(qc->fd, new_tid);
+	}
+
+	node = eb64_first(qc->cids);
+	/* One and only one CID must be present before affinity rebind.
+	 *
+	 * This could be triggered fairly easily if tasklet is scheduled just
+	 * before thread migration for post-handshake state to generate new
+	 * CIDs. In this case, QUIC_FL_CONN_IO_TO_REQUEUE should be used
+	 * instead of tasklet_wakeup().
+	 */
+	BUG_ON(!node || eb64_next(node));
+	conn_id = eb64_entry(node, struct quic_connection_id, seq_num);
+
+	/* Rebinding is considered done when CID points to the new
+	 * thread. quic-conn instance cannot be derefence after it.
+	 */
+	HA_ATOMIC_STORE(&conn_id->tid, new_tid);
+	qc = NULL;
+
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, NULL);
+}
+
+/* Interrupt <qc> thread migration and stick to the current tid.
+ * qc_finalize_tid_rebind() must be called to reactivate quic_conn elements.
+ */
+void qc_bind_tid_reset(struct quic_conn *qc)
+{
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
+
+	/* Must only be called after qc_bind_tid_prep(). */
+	BUG_ON(!(qc->flags & QUIC_FL_CONN_TID_REBIND));
+
+	/* Reset tasks affinity to the current thread. quic_conn will remain
+	 * inactive until qc_finalize_tid_rebind().
+	 */
+	task_set_thread(qc->idle_timer_task, tid);
+	if (qc->timer_task)
+		task_set_thread(qc->timer_task, tid);
+	tasklet_set_tid(qc->wait_event.tasklet, tid);
+
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, qc);
+}
+
+/* Must be called after TID rebind commit or reset on the new thread. */
+void qc_finalize_tid_rebind(struct quic_conn *qc)
+{
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
 
 	/* This function must not be called twice after an affinity rebind. */
-	BUG_ON(!(qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED));
-	qc->flags &= ~QUIC_FL_CONN_AFFINITY_CHANGED;
+	BUG_ON(!(qc->flags & QUIC_FL_CONN_TID_REBIND));
+	qc->flags &= ~QUIC_FL_CONN_TID_REBIND;
 
 	/* If quic_conn is closing it is unnecessary to migrate it as it will
 	 * be soon released. Besides, special care must be taken for CLOSING
@@ -1882,7 +1995,7 @@ void qc_finalize_affinity_rebind(struct quic_conn *qc)
 		qc->flags &= ~QUIC_FL_CONN_IO_TO_REQUEUE;
 	}
 
-	TRACE_LEAVE(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, qc);
 }
 
 /*

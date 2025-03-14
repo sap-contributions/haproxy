@@ -24,6 +24,7 @@
 
 #include <limits.h>
 #include <unistd.h>
+#include <fcntl.h>
 /* This is needed on Linux for Netfilter includes */
 #include <sys/param.h>
 #include <sys/types.h>
@@ -94,11 +95,19 @@ typedef struct { } empty_t;
 #endif
 
 #ifndef MIN
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MIN(a, b) ({				\
+	typeof(a) _a = (a);			\
+	typeof(a) _b = (b);			\
+	((_a < _b) ? _a : _b);			\
+})
 #endif
 
 #ifndef MAX
-#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define MAX(a, b) ({				\
+	typeof(a) _a = (a);			\
+	typeof(a) _b = (b);			\
+	((_a > _b) ? _a : _b);			\
+})
 #endif
 
 /* this is for libc5 for example */
@@ -232,7 +241,11 @@ typedef struct { } empty_t;
  * than ours.
  */
 #ifdef USE_BACKTRACE
-#if defined(__aarch64__)
+#if defined(__linux__) && !defined(__GNU_LIBRARY__)
+/* On Linux, backtrace() is only available in glibc. Others will need the
+ * in-house implementation.
+ */
+#elif defined(__aarch64__)
 /* on aarch64 at least from gcc-4.7.4 to 7.4.1 we only get a single entry, which
  * is pointless. Ours works though it misses the faulty function itself,
  * probably due to an alternate stack for the signal handler which does not
@@ -301,6 +314,22 @@ typedef struct { } empty_t;
  */
 #if !defined(CLOCK_MONOTONIC_COARSE) && defined(CLOCK_MONOTONIC_FAST)
 #define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC_FAST
+#endif
+
+/* On Solaris, `queue` is a reserved name, so we redefine it here for now.
+ */
+#if defined(sun)
+#define queue _queue
+#endif
+
+/* Define a flag indicating if MPTCP is available */
+#ifdef __linux__
+#define HA_HAVE_MPTCP 1
+#endif
+
+/* only Linux defines IPPROTO_MPTCP */
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
 #endif
 
 #endif /* _HAPROXY_COMPAT_H */

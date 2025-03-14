@@ -98,6 +98,7 @@ enum h1m_state {
 #define H1_MF_UPG_WEBSOCKET     0x00008000 // Set for a Websocket upgrade handshake
 #define H1_MF_TE_CHUNKED        0x00010000 // T-E "chunked"
 #define H1_MF_TE_OTHER          0x00020000 // T-E other than supported ones found (only "chunked" is supported for now)
+#define H1_MF_UPG_H2C           0x00040000 // "h2c" or "h2" used as upgrade token
 
 /* Mask to use to reset H1M flags when we restart headers parsing.
  *
@@ -130,6 +131,7 @@ struct h1m {
 	uint64_t curr_len;          // content-length or last chunk length
 	uint64_t body_len;          // total known size of the body length
 	uint32_t next;              // next byte to parse, relative to buffer's head
+	unsigned int err_code;      // the HTTP status code corresponding to the error, if it can be specified (0: unset)
 	int err_pos;                // position in the byte stream of the first error (H1 or H2)
 	int err_state;              // state where the first error was met (H1 or H2)
 };
@@ -149,6 +151,8 @@ union h1_sl {                          /* useful start line pointers, relative t
 		uint16_t status;       /* status code */
 	} st;                          /* status line : field, length */
 };
+
+extern int h1_do_not_close_on_insecure_t_e;
 
 int h1_headers_to_hdr_list(char *start, const char *stop,
                            struct http_hdr *hdr, unsigned int hdr_num,
@@ -355,6 +359,7 @@ static inline struct h1m *h1m_init_req(struct h1m *h1m)
 	h1m->flags = H1_MF_NONE;
 	h1m->curr_len = 0;
 	h1m->body_len = 0;
+	h1m->err_code = 0;
 	h1m->err_pos = -2;
 	h1m->err_state = 0;
 	return h1m;
@@ -368,6 +373,7 @@ static inline struct h1m *h1m_init_res(struct h1m *h1m)
 	h1m->flags = H1_MF_RESP;
 	h1m->curr_len = 0;
 	h1m->body_len = 0;
+	h1m->err_code = 0;
 	h1m->err_pos = -2;
 	h1m->err_state = 0;
 	return h1m;

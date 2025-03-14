@@ -23,12 +23,11 @@ static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 	/* hq-interop parser does not support buffer wrapping. */
 	BUG_ON(b_data(b) != b_contig_data(b, 0));
 
-	/* hq-interop parser is only done once full message is received. */
-	if (!fin)
+	if (!b_data(b) && fin && quic_stream_is_bidi(qcs->id)) {
+		if (qcs_http_handle_standalone_fin(qcs))
+			return -1;
 		return 0;
-
-	b_alloc(&htx_buf);
-	htx = htx_from_buf(&htx_buf);
+	}
 
 	/* skip method */
 	while (data && HTTP_IS_TOKEN(*ptr)) {
@@ -38,13 +37,13 @@ static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 
 	if (!data || !HTTP_IS_SPHT(*ptr)) {
 		fprintf(stderr, "truncated stream\n");
-		return -1;
+		return 0;
 	}
 
 	ptr++;
 	if (!--data) {
 		fprintf(stderr, "truncated stream\n");
-		return -1;
+		return 0;
 	}
 
 	if (HTTP_IS_LWS(*ptr)) {
@@ -61,14 +60,19 @@ static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 
 	if (!data) {
 		fprintf(stderr, "truncated stream\n");
-		return -1;
+		return 0;
 	}
 
 	path.len = ptr - path.ptr;
 
+	b_alloc(&htx_buf, DB_MUX_RX);
+	htx = htx_from_buf(&htx_buf);
+
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, 0, ist("GET"), path, ist("HTTP/1.0"));
-	if (!sl)
+	if (!sl) {
+		b_free(&htx_buf);
 		return -1;
+	}
 
 	sl->flags |= HTX_SL_F_BODYLESS;
 	sl->info.req.meth = find_http_meth("GET", 3);
@@ -77,8 +81,10 @@ static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 	htx->flags |= HTX_FL_EOM;
 	htx_to_buf(htx, &htx_buf);
 
-	if (!qcs_attach_sc(qcs, &htx_buf, fin))
+	if (qcs_attach_sc(qcs, &htx_buf, fin)) {
+		b_free(&htx_buf);
 		return -1;
+	}
 
 	b_free(&htx_buf);
 
@@ -110,7 +116,7 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 
 		switch (btype) {
 		case HTX_BLK_DATA:
-			res = qcc_get_stream_txbuf(qcs, &err);
+			res = qcc_get_stream_txbuf(qcs, &err, 0);
 			if (!res) {
 				if (err)
 					ABORT_NOW();
@@ -185,7 +191,7 @@ static size_t hq_interop_nego_ff(struct qcs *qcs, size_t count)
 	struct buffer *res;
 
  start:
-	res = qcc_get_stream_txbuf(qcs, &err);
+	res = qcc_get_stream_txbuf(qcs, &err, 0);
 	if (!res) {
 		if (err)
 			ABORT_NOW();
@@ -214,14 +220,8 @@ static size_t hq_interop_nego_ff(struct qcs *qcs, size_t count)
 
 static size_t hq_interop_done_ff(struct qcs *qcs)
 {
-	const size_t ret = qcs->sd->iobuf.data;
-
-	/* No header required for HTTP/0.9, simply mark ff as done. */
-	qcs->sd->iobuf.buf = NULL;
-	qcs->sd->iobuf.offset = 0;
-	qcs->sd->iobuf.data = 0;
-
-	return ret;
+	/* No header required for HTTP/0.9. */
+	return qcs->sd->iobuf.data;
 }
 
 static int hq_interop_attach(struct qcs *qcs, void *conn_ctx)

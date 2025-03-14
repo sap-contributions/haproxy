@@ -55,6 +55,17 @@ struct ckch_data {
 	struct buffer *ocsp_response;
 	X509 *ocsp_issuer;
 	OCSP_CERTID *ocsp_cid;
+	struct issuer_chain *extra_chain; /* chain from 'issuers-chain-path' */
+};
+
+/* configuration for the ckch_store */
+struct ckch_conf {
+	int used;
+	char *crt;
+	char *key;
+	char *ocsp;
+	char *issuer;
+	char *sctl;
 	int ocsp_update_mode;
 };
 
@@ -71,6 +82,7 @@ struct ckch_store {
 	struct ckch_data *data;
 	struct list ckch_inst; /* list of ckch_inst which uses this ckch_node */
 	struct list crtlist_entry; /* list of entries which use this store */
+	struct ckch_conf conf;
 	struct ebmb_node node;
 	char path[VAR_ARRAY];
 };
@@ -150,12 +162,40 @@ enum {
 	CERT_TYPE_MAX,
 };
 
+/*
+ * When crt-store options are set from a crt-list, the crt-store options must be explicit everywhere.
+ * When crt-store options are set from a crt-store, the crt-store options can be empty, or the exact same
+ */
+enum {
+	CKCH_CONF_SET_EMPTY    = 0,     /* config is empty */
+	CKCH_CONF_SET_CRTLIST  = 1,     /* config is set from a crt-list */
+	CKCH_CONF_SET_CRTSTORE = 2,     /* config is defined in a crt-store */
+};
+
 struct cert_exts {
 	const char *ext;
 	int type;
 	int (*load)(const char *path, char *payload, struct ckch_data *data, char **err);
 	/* add a parsing callback */
 };
+
+/* argument types */
+enum parse_type_t {
+	PARSE_TYPE_NONE = 0,
+	PARSE_TYPE_INT,
+	PARSE_TYPE_STR,         /* string which is strdup() */
+	PARSE_TYPE_ONOFF,       /* "on" or "off" keyword */
+};
+
+struct ckch_conf_kws {
+	const char *name;
+	ssize_t offset;
+	enum parse_type_t type;
+	int (*func)(void *value, char *buf, struct ckch_data *d, int cli, char **err);
+	char **base; /* ptr to the base path */
+};
+
+extern struct ckch_conf_kws ckch_conf_kws[];
 
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_CKCH_T_H */
