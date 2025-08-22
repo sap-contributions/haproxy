@@ -21,7 +21,6 @@
 #include <haproxy/freq_ctr.h>
 #include <haproxy/listener.h>
 #include <haproxy/sc_strm.h>
-#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 
 /* CLI context for the "show profiling" command */
@@ -1290,7 +1289,7 @@ static int cli_parse_show_profiling(char **args, char *payload, struct appctx *a
 static int cli_io_handler_show_tasks(struct appctx *appctx)
 {
 	struct sched_activity tmp_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64)));
-	struct buffer *name_buffer = get_trash_chunk();
+	struct buffer *name_buffer;
 	struct sched_activity *entry;
 	const struct tasklet *tl;
 	const struct task *t;
@@ -1299,6 +1298,8 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	uint64_t tot_calls;
 	int thr, queue;
 	int i, max;
+
+	name_buffer = get_trash_chunk();
 
 	/* It's not possible to scan queues in small chunks and yield in the
 	 * middle of the dump and come back again. So what we're doing instead
