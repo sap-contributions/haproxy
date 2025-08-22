@@ -12,17 +12,20 @@
 
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
+#include <haproxy/arg.h>
 #include <haproxy/connection.h>
 #include <haproxy/check.h>
+#include <haproxy/filters.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/pipe.h>
 #include <haproxy/pool.h>
+#include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/stconn.h>
 #include <haproxy/xref.h>
 
-DECLARE_POOL(pool_head_connstream, "stconn", sizeof(struct stconn));
-DECLARE_POOL(pool_head_sedesc, "sedesc", sizeof(struct sedesc));
+DECLARE_TYPED_POOL(pool_head_connstream, "stconn", struct stconn);
+DECLARE_TYPED_POOL(pool_head_sedesc, "sedesc", struct sedesc);
 
 /* functions used by default on a detached stream connector */
 static void sc_app_abort(struct stconn *sc);
@@ -97,6 +100,14 @@ void sedesc_init(struct sedesc *sedesc)
 	sedesc->fsb = TICK_ETERNITY;
 	sedesc->xref.peer = NULL;
 	se_fl_setall(sedesc, SE_FL_NONE);
+	sedesc->term_evts_log = 0;
+	sedesc->abort_info.info = 0;
+	sedesc->abort_info.code = 0;
+
+	sedesc->iobuf.pipe = NULL;
+	sedesc->iobuf.buf = NULL;
+	sedesc->iobuf.offset = sedesc->iobuf.data = 0;
+	sedesc->iobuf.flags = IOBUF_FL_NONE;
 }
 
 /* Tries to alloc an endpoint and initialize it. Returns NULL on failure. */
@@ -117,7 +128,60 @@ struct sedesc *sedesc_new()
  */
 void sedesc_free(struct sedesc *sedesc)
 {
-	pool_free(pool_head_sedesc, sedesc);
+	if (sedesc) {
+		if (sedesc->iobuf.pipe)
+			put_pipe(sedesc->iobuf.pipe);
+		pool_free(pool_head_sedesc, sedesc);
+	}
+}
+
+/* Performs a shutdown on the endpoint. This function deals with connection and
+ * applet endpoints. It is responsible to set SE flags corresponding to the
+ * given shut modes and to call right shutdown functions of the endpoint. It is
+ * called from the .abort and .shut app_ops callback functions at the SC level.
+ */
+void se_shutdown(struct sedesc *sedesc, enum se_shut_mode mode)
+{
+	struct sedesc *sdo;
+	struct se_abort_info *reason = NULL;
+	unsigned int flags = 0;
+
+	if ((mode & (SE_SHW_SILENT|SE_SHW_NORMAL)) && !se_fl_test(sedesc, SE_FL_SHW)) {
+		se_report_term_evt(sedesc, se_tevt_type_shutw);
+		flags |= (mode & SE_SHW_NORMAL) ? SE_FL_SHWN : SE_FL_SHWS;
+	}
+	if ((mode & (SE_SHR_RESET|SE_SHR_DRAIN)) && !se_fl_test(sedesc, SE_FL_SHR))
+		flags |= (mode & SE_SHR_DRAIN) ? SE_FL_SHRD : SE_FL_SHRR;
+
+	if (se_fl_test(sedesc, SE_FL_T_MUX)) {
+		const struct mux_ops *mux = (sedesc->conn ? sedesc->conn->mux : NULL);
+
+		if (flags) {
+			if (mux && mux->shut) {
+				sdo = se_opposite(sedesc);
+				if (sdo)
+					reason = &sdo->abort_info;
+				mux->shut(sedesc->sc, mode, reason);
+			}
+			se_fl_set(sedesc, flags);
+		}
+	}
+	else if (se_fl_test(sedesc, SE_FL_T_APPLET)) {
+		struct appctx *appctx = sedesc->se;
+
+		if (flags) {
+			if (appctx->applet->shut) {
+				sdo = se_opposite(sedesc);
+				if (sdo)
+					reason = &sdo->abort_info;
+				appctx->applet->shut(appctx, mode, reason);
+			}
+			se_fl_set(sedesc, flags);
+		}
+
+		if (se_fl_test(sedesc, SE_FL_SHR) && se_fl_test(sedesc, SE_FL_SHW))
+			appctx_shut(appctx);
+	}
 }
 
 /* Tries to allocate a new stconn and initialize its main fields. On
@@ -145,6 +209,8 @@ static struct stconn *sc_new(struct sedesc *sedesc)
 	sc->dst = NULL;
 	sc->wait_event.tasklet = NULL;
 	sc->wait_event.events = 0;
+
+	sc->term_evts_log = 0;
 
 	/* If there is no endpoint, allocate a new one now */
 	if (!sedesc) {
@@ -302,15 +368,17 @@ int sc_attach_mux(struct stconn *sc, void *sd, void *ctx)
  * removed. This function is called by a stream when a backend applet is
  * registered.
  */
-static void sc_attach_applet(struct stconn *sc, void *sd)
+static int sc_attach_applet(struct stconn *sc, struct appctx *appctx)
 {
-	sc->sedesc->se = sd;
+	sc->sedesc->se = appctx;
 	sc_ep_set(sc, SE_FL_T_APPLET);
 	sc_ep_clr(sc, SE_FL_DETACHED);
 	if (sc_strm(sc)) {
 		sc->app_ops = &sc_app_applet_ops;
 		xref_create(&sc->sedesc->xref, &sc_opposite(sc)->sedesc->xref);
 	}
+
+	return 0;
 }
 
 /* Attaches a stconn to a app layer and sets the relevant
@@ -392,7 +460,7 @@ static void sc_detach_endp(struct stconn **scp)
 		sc_ep_set(sc, SE_FL_ORPHAN);
 		sc->sedesc->sc = NULL;
 		sc->sedesc = NULL;
-		appctx_shut(appctx);
+		se_shutdown(appctx->sedesc, SE_SHR_RESET|SE_SHW_NORMAL);
 		appctx_free(appctx);
 	}
 
@@ -496,7 +564,10 @@ struct appctx *sc_applet_create(struct stconn *sc, struct applet *app)
 	appctx = appctx_new_here(app, sc->sedesc);
 	if (!appctx)
 		return NULL;
-	sc_attach_applet(sc, appctx);
+	if (sc_attach_applet(sc, appctx) == -1) {
+		appctx_free_on_early_error(appctx);
+		return NULL;
+	}
 	appctx->t->nice = __sc_strm(sc)->task->nice;
 	applet_need_more_data(appctx);
 	appctx_wakeup(appctx);
@@ -512,15 +583,11 @@ struct appctx *sc_applet_create(struct stconn *sc, struct applet *app)
  */
 static inline int sc_cond_forward_shut(struct stconn *sc)
 {
-	/* Foward the shutdown if an write error occurred on the input channel */
-	if (sc_ic(sc)->flags & CF_WRITE_TIMEOUT)
-		return 1;
-
 	/* The close must not be forwarded */
 	if (!(sc->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) || !(sc->flags & SC_FL_NOHALF))
 		return 0;
 
-	if (!channel_is_empty(sc_ic(sc))) {
+	if ((co_data(sc_ic(sc)) || sc_ep_have_ff_data(sc_opposite(sc))) && !(sc_ic(sc)->flags & CF_WRITE_TIMEOUT)) {
 		/* the shutdown cannot be forwarded now because
 		 * we should flush outgoing data first. But instruct the output
 		 * channel it should be done ASAP.
@@ -533,6 +600,15 @@ static inline int sc_cond_forward_shut(struct stconn *sc)
 	return 1;
 }
 
+
+static inline int sc_is_fastfwd_supported(struct stconn *sc)
+{
+	return (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD) &&
+		!(sc->flags & SC_FL_NO_FASTFWD) &&
+		sc_ep_test(sc, SE_FL_MAY_FASTFWD_PROD) &&
+		sc_ep_test(sc_opposite(sc), SE_FL_MAY_FASTFWD_CONS) &&
+		sc_ic(sc)->to_forward);
+}
 /*
  * This function performs a shutdown-read on a detached stream connector in a
  * connected or init state (it does nothing for other states). It either shuts
@@ -549,7 +625,6 @@ static void sc_app_abort(struct stconn *sc)
 
 	sc->flags |= SC_FL_ABRT_DONE;
 	ic->flags |= CF_READ_EVENT;
-	sc_ep_report_read_activity(sc);
 
 	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
@@ -599,20 +674,23 @@ static void sc_app_shut(struct stconn *sc)
 		    !(ic->flags & CF_DONT_READ))
 			return;
 
-		__fallthrough;
+		sc->state = SC_ST_DIS;
+		break;
 	case SC_ST_CON:
 	case SC_ST_CER:
 	case SC_ST_QUE:
 	case SC_ST_TAR:
 		/* Note that none of these states may happen with applets */
 		sc->state = SC_ST_DIS;
-		__fallthrough;
+		break;
 	default:
-		sc->flags &= ~SC_FL_NOLINGER;
-		sc->flags |= SC_FL_ABRT_DONE;
-		if (sc->flags & SC_FL_ISBACK)
-			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		break;
 	}
+
+	sc->flags &= ~SC_FL_NOLINGER;
+	sc->flags |= SC_FL_ABRT_DONE;
+	if (sc->flags & SC_FL_ISBACK)
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 
 	/* note that if the task exists, it must unregister itself once it runs */
 	if (!(sc->flags & SC_FL_DONT_WAKE))
@@ -622,9 +700,7 @@ static void sc_app_shut(struct stconn *sc)
 /* default chk_rcv function for scheduled tasks */
 static void sc_app_chk_rcv(struct stconn *sc)
 {
-	struct channel *ic = sc_ic(sc);
-
-	if (ic->pipe) {
+	if (sc_ep_have_ff_data(sc_opposite(sc))) {
 		/* stop reading */
 		sc_need_room(sc, -1);
 	}
@@ -644,7 +720,7 @@ static void sc_app_chk_snd(struct stconn *sc)
 		return;
 
 	if (!sc_ep_test(sc, SE_FL_WAIT_DATA) ||  /* not waiting for data */
-	    channel_is_empty(oc))                  /* called with nothing to send ! */
+	    (!co_data(oc) && !sc_ep_have_ff_data(sc)))  /* called with nothing to send ! */
 		return;
 
 	/* Otherwise there are remaining data to be sent in the buffer,
@@ -680,7 +756,7 @@ static void sc_app_abort_conn(struct stconn *sc)
 		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE) {
-		sc_conn_shut(sc);
+		se_shutdown(sc->sedesc, SE_SHR_RESET|SE_SHW_SILENT);
 		sc->state = SC_ST_DIS;
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
@@ -710,55 +786,47 @@ static void sc_app_shut_conn(struct stconn *sc)
 	sc->flags |= SC_FL_SHUT_DONE;
 	oc->flags |= CF_WRITE_EVENT;
 	sc_set_hcto(sc);
+	sc_report_term_evt(sc, strm_tevt_type_shutw);
 
 	switch (sc->state) {
 	case SC_ST_RDY:
 	case SC_ST_EST:
+
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
 		 * unread data in the socket input buffer, or when nolinger is set.
 		 * However, if SC_FL_NOLINGER is explicitly set, we know there is
 		 * no risk so we close both sides immediately.
 		 */
-		if (sc->flags & SC_FL_NOLINGER) {
-			/* unclean data-layer shutdown, typically an aborted request
-			 * or a forwarded shutdown from a client to a server due to
-			 * option abortonclose. No need for the TLS layer to try to
-			 * emit a shutdown message.
-			 */
-			sc_conn_shutw(sc, CO_SHW_SILENT);
-		}
-		else {
-			/* clean data-layer shutdown. This only happens on the
-			 * frontend side, or on the backend side when forwarding
-			 * a client close in TCP mode or in HTTP TUNNEL mode
-			 * while option abortonclose is set. We want the TLS
-			 * layer to try to signal it to the peer before we close.
-			 */
-			sc_conn_shutw(sc, CO_SHW_NORMAL);
-
-			if (!(sc->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) && !(ic->flags & CF_DONT_READ))
-				return;
+		if (!(sc->flags & (SC_FL_NOLINGER|SC_FL_EOS|SC_FL_ABRT_DONE)) && !(ic->flags & CF_DONT_READ)) {
+			se_shutdown(sc->sedesc, SE_SHW_NORMAL);
+			return;
 		}
 
-		__fallthrough;
+		se_shutdown(sc->sedesc, SE_SHR_RESET|((sc->flags & SC_FL_NOLINGER) ? SE_SHW_SILENT : SE_SHW_NORMAL));
+		sc->state = SC_ST_DIS;
+		break;
+
 	case SC_ST_CON:
 		/* we may have to close a pending connection, and mark the
 		 * response buffer as abort
 		 */
-		sc_conn_shut(sc);
-		__fallthrough;
+		se_shutdown(sc->sedesc, SE_SHR_RESET|SE_SHW_SILENT);
+		sc->state = SC_ST_DIS;
+		break;
 	case SC_ST_CER:
 	case SC_ST_QUE:
 	case SC_ST_TAR:
 		sc->state = SC_ST_DIS;
-		__fallthrough;
+		break;
 	default:
-		sc->flags &= ~SC_FL_NOLINGER;
-		sc->flags |= SC_FL_ABRT_DONE;
-		if (sc->flags & SC_FL_ISBACK)
-			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		break;
 	}
+
+	sc->flags &= ~SC_FL_NOLINGER;
+	sc->flags |= SC_FL_ABRT_DONE;
+	if (sc->flags & SC_FL_ISBACK)
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 }
 
 /* This function is used for inter-stream connector calls. It is called by the
@@ -792,14 +860,14 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 		     (sc->flags & SC_FL_SHUT_DONE)))
 		return;
 
-	if (unlikely(channel_is_empty(oc)))  /* called with nothing to send ! */
+	if (unlikely(!co_data(oc) && !sc_ep_have_ff_data(sc)))  /* called with nothing to send ! */
 		return;
 
-	if (!oc->pipe &&                          /* spliced data wants to be forwarded ASAP */
+	if (!sc_ep_have_ff_data(sc) &&              /* data wants to be fast-forwarded ASAP */
 	    !sc_ep_test(sc, SE_FL_WAIT_DATA))       /* not waiting for data */
 		return;
 
-	if (!(sc->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(sc_oc(sc)))
+	if (!(sc->wait_event.events & SUB_RETRY_SEND))
 		sc_conn_send(sc);
 
 	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING) || sc_is_conn_error(sc)) {
@@ -811,7 +879,7 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 	/* OK, so now we know that some data might have been sent, and that we may
 	 * have to poll first. We have to do that too if the buffer is not empty.
 	 */
-	if (channel_is_empty(oc)) {
+	if (!co_data(oc) && !sc_ep_have_ff_data(sc)) {
 		/* the connection is established but we can't write. Either the
 		 * buffer is empty, or we just refrain from sending because the
 		 * ->o limit was reached. Maybe we just wrote the last
@@ -840,7 +908,7 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 	if (likely((sc->flags & SC_FL_SHUT_DONE) ||
 		   ((oc->flags & CF_WRITE_EVENT) && sc->state < SC_ST_EST) ||
 		   ((oc->flags & CF_WAKE_WRITE) &&
-		    ((channel_is_empty(oc) && !oc->to_forward) ||
+		    ((!co_data(oc) && !oc->to_forward) ||
 		     !sc_state_in(sc->state, SC_SB_EST))))) {
 	out_wakeup:
 		if (!(sc->flags & SC_FL_DONT_WAKE))
@@ -873,7 +941,7 @@ static void sc_app_abort_applet(struct stconn *sc)
 		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE) {
-		appctx_shut(__sc_appctx(sc));
+		se_shutdown(sc->sedesc, SE_SHR_RESET|SE_SHW_NORMAL);
 		sc->state = SC_ST_DIS;
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
@@ -902,6 +970,7 @@ static void sc_app_shut_applet(struct stconn *sc)
 	sc->flags |= SC_FL_SHUT_DONE;
 	oc->flags |= CF_WRITE_EVENT;
 	sc_set_hcto(sc);
+	sc_report_term_evt(sc, strm_tevt_type_shutw);
 
 	/* on shutw we always wake the applet up */
 	appctx_wakeup(__sc_appctx(sc));
@@ -909,6 +978,7 @@ static void sc_app_shut_applet(struct stconn *sc)
 	switch (sc->state) {
 	case SC_ST_RDY:
 	case SC_ST_EST:
+
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
 		 * unread data in the socket input buffer, or when nolinger is set.
@@ -916,34 +986,39 @@ static void sc_app_shut_applet(struct stconn *sc)
 		 * no risk so we close both sides immediately.
 		 */
 		if (!(sc->flags & (SC_FL_ERROR|SC_FL_NOLINGER|SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-		    !(ic->flags & CF_DONT_READ))
+		    !(ic->flags & CF_DONT_READ)) {
+			se_shutdown(sc->sedesc, SE_SHW_NORMAL);
 			return;
+		}
 
-		__fallthrough;
+		se_shutdown(sc->sedesc, SE_SHR_RESET|SE_SHW_NORMAL);
+		sc->state = SC_ST_DIS;
+		break;
+
 	case SC_ST_CON:
 	case SC_ST_CER:
 	case SC_ST_QUE:
 	case SC_ST_TAR:
 		/* Note that none of these states may happen with applets */
-		appctx_shut(__sc_appctx(sc));
+		se_shutdown(sc->sedesc, SE_SHR_RESET|SE_SHW_NORMAL);
 		sc->state = SC_ST_DIS;
-		__fallthrough;
+		break;
 	default:
-		sc->flags &= ~SC_FL_NOLINGER;
-		sc->flags |= SC_FL_ABRT_DONE;
-		if (sc->flags & SC_FL_ISBACK)
-			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		break;
 	}
+
+	sc->flags &= ~SC_FL_NOLINGER;
+	sc->flags |= SC_FL_ABRT_DONE;
+	if (sc->flags & SC_FL_ISBACK)
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 }
 
 /* chk_rcv function for applets */
 static void sc_app_chk_rcv_applet(struct stconn *sc)
 {
-	struct channel *ic = sc_ic(sc);
-
 	BUG_ON(!sc_appctx(sc));
 
-	if (!ic->pipe) {
+	if (!sc_ep_have_ff_data(sc_opposite(sc))) {
 		/* (re)start reading */
 		appctx_wakeup(__sc_appctx(sc));
 	}
@@ -959,13 +1034,11 @@ static void sc_app_chk_snd_applet(struct stconn *sc)
 	if (unlikely(sc->state != SC_ST_EST || (sc->flags & SC_FL_SHUT_DONE)))
 		return;
 
-	/* we only wake the applet up if it was waiting for some data  and is ready to consume it
-	 * or if there is a pending shutdown
-	 */
-	if (!sc_ep_test(sc, SE_FL_WAIT_DATA|SE_FL_WONT_CONSUME) && !(sc->flags & SC_FL_SHUT_WANTED))
+	/* we only wake the applet up if it was waiting for some data  and is ready to consume it */
+	if (!sc_ep_test(sc, SE_FL_WAIT_DATA|SE_FL_WONT_CONSUME))
 		return;
 
-	if (!channel_is_empty(oc)) {
+	if (co_data(oc) || sc_ep_have_ff_data(sc)) {
 		/* (re)start sending */
 		appctx_wakeup(__sc_appctx(sc));
 	}
@@ -1021,7 +1094,7 @@ void sc_update_tx(struct stconn *sc)
 		return;
 
 	/* Write not closed, update FD status and timeout for writes */
-	if (channel_is_empty(oc)) {
+	if (!co_data(oc)) {
 		/* stop writing */
 		if (!sc_ep_test(sc, SE_FL_WAIT_DATA)) {
 			if ((sc->flags & SC_FL_SHUT_WANTED) == 0)
@@ -1042,9 +1115,10 @@ void sc_update_tx(struct stconn *sc)
  * It may update SE_FL_WAIT_DATA and/or SC_FL_NEED_ROOM, that the callers are
  * encouraged to watch to take appropriate action.
  * It should not be called from within the stream itself, sc_update()
- * is designed for this.
+ * is designed for this. Please do not statify this function, it's often
+ * present in backtraces, it's useful to recognize it.
  */
-static void sc_notify(struct stconn *sc)
+void sc_notify(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
 	struct channel *oc = sc_oc(sc);
@@ -1052,7 +1126,7 @@ static void sc_notify(struct stconn *sc)
 	struct task *task = sc_strm_task(sc);
 
 	/* process consumer side */
-	if (channel_is_empty(oc)) {
+	if (!co_data(oc) && !sc_ep_have_ff_data(sc)) {
 		struct connection *conn = sc_conn(sc);
 
 		if (((sc->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) == SC_FL_SHUT_WANTED) &&
@@ -1085,20 +1159,15 @@ static void sc_notify(struct stconn *sc)
 	 * alone because an HTTP parser might need more data to complete the
 	 * parsing.
 	 */
-	if (!channel_is_empty(ic) &&
-	    sc_ep_test(sco, SE_FL_WAIT_DATA) &&
-	    (!(sc->flags & SC_FL_SND_EXP_MORE) || c_full(ic) || ci_data(ic) == 0 || ic->pipe)) {
+	if (sc_ep_have_ff_data(sc_opposite(sc)) ||
+	    (co_data(ic) && sc_ep_test(sco, SE_FL_WAIT_DATA) &&
+	     (!HAS_DATA_FILTERS(__sc_strm(sc), ic) || channel_input_data(ic) == 0) &&
+	     (!(sc->flags & SC_FL_SND_EXP_MORE) || channel_full(ic, co_data(ic)) || channel_input_data(ic) == 0))) {
 		int new_len, last_len;
 
-		last_len = co_data(ic);
-		if (ic->pipe)
-			last_len += ic->pipe->data;
-
+		last_len = co_data(ic) + sc_ep_ff_data(sco);
 		sc_chk_snd(sco);
-
-		new_len = co_data(ic);
-		if (ic->pipe)
-			new_len += ic->pipe->data;
+		new_len = co_data(ic) + sc_ep_ff_data(sco);
 
 		/* check if the consumer has freed some space either in the
 		 * buffer or in the pipe.
@@ -1133,21 +1202,22 @@ static void sc_notify(struct stconn *sc)
 		(!(oc->flags & CF_AUTO_CLOSE) &&
 		 !(sc->flags & (SC_FL_SHUT_WANTED|SC_FL_SHUT_DONE)))) &&
 	       (sco->state != SC_ST_EST ||
-		(channel_is_empty(oc) && !oc->to_forward)))))) {
+		(!co_data(oc) && !oc->to_forward)))))) {
 		task_wakeup(task, TASK_WOKEN_IO);
 	}
 	else {
-		/* Update expiration date for the task and requeue it */
-		task->expire = (tick_is_expired(task->expire, now_ms) ? 0 : task->expire);
-		task->expire = tick_first(task->expire, sc_ep_rcv_ex(sc));
-		task->expire = tick_first(task->expire, sc_ep_snd_ex(sc));
-		task->expire = tick_first(task->expire, sc_ep_rcv_ex(sco));
-		task->expire = tick_first(task->expire, sc_ep_snd_ex(sco));
-		task->expire = tick_first(task->expire, ic->analyse_exp);
-		task->expire = tick_first(task->expire, oc->analyse_exp);
-		task->expire = tick_first(task->expire, __sc_strm(sc)->conn_exp);
+		/* Update expiration date for the task and requeue it if not already expired.
+		 * Only I/O timeouts are evaluated. The stream is responsible of others.
+		 */
+		if (!tick_is_expired(task->expire, now_ms)) {
+			task->expire = tick_first(task->expire, sc_ep_rcv_ex(sc));
+			task->expire = tick_first(task->expire, sc_ep_snd_ex(sc));
+			task->expire = tick_first(task->expire, sc_ep_rcv_ex(sco));
+			task->expire = tick_first(task->expire, sc_ep_snd_ex(sco));
 
-		task_queue(task);
+			BUG_ON(tick_is_expired(task->expire, now_ms));
+			task_queue(task);
+		}
 	}
 
 	if (ic->flags & CF_READ_EVENT)
@@ -1170,8 +1240,8 @@ static void sc_conn_eos(struct stconn *sc)
 	sc->flags |= SC_FL_EOS;
 	ic->flags |= CF_READ_EVENT;
 	sc_ep_report_read_activity(sc);
-
-	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
+	sc_report_term_evt(sc, (sc->flags & SC_FL_EOI ? strm_tevt_type_eos: strm_tevt_type_truncated_eos));
+	if (sc->state != SC_ST_EST)
 		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE)
@@ -1180,7 +1250,6 @@ static void sc_conn_eos(struct stconn *sc)
 	if (sc_cond_forward_shut(sc)) {
 		/* we want to immediately forward this close to the write side */
 		/* force flag on ssl to keep stream in cache */
-		sc_conn_shutw(sc, CO_SHW_SILENT);
 		goto do_close;
 	}
 
@@ -1189,7 +1258,7 @@ static void sc_conn_eos(struct stconn *sc)
 
  do_close:
 	/* OK we completely close the socket here just as if we went through sc_shut[rw]() */
-	sc_conn_shut(sc);
+	se_shutdown(sc->sedesc, SE_SHR_RESET|SE_SHW_SILENT);
 
 	sc->flags &= ~SC_FL_SHUT_WANTED;
 	sc->flags |= SC_FL_SHUT_DONE;
@@ -1203,9 +1272,10 @@ static void sc_conn_eos(struct stconn *sc)
 /*
  * This is the callback which is called by the connection layer to receive data
  * into the buffer from the connection. It iterates over the mux layer's
- * rcv_buf function.
+ * rcv_buf function. Please do not statify this function, it's often present in
+ * backtraces, it's useful to recognize it.
  */
-static int sc_conn_recv(struct stconn *sc)
+int sc_conn_recv(struct stconn *sc)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct channel *ic = sc_ic(sc);
@@ -1247,49 +1317,35 @@ static int sc_conn_recv(struct stconn *sc)
 	/* prepare to detect if the mux needs more room */
 	sc_ep_clr(sc, SE_FL_WANT_ROOM);
 
-	if ((ic->flags & (CF_STREAMER | CF_STREAMER_FAST)) && !co_data(ic) &&
-	    global.tune.idle_timer &&
-	    (unsigned short)(now_ms - ic->last_read) >= global.tune.idle_timer) {
-		/* The buffer was empty and nothing was transferred for more
-		 * than one second. This was caused by a pause and not by
-		 * congestion. Reset any streaming mode to reduce latency.
-		 */
-		ic->xfer_small = 0;
-		ic->xfer_large = 0;
-		ic->flags &= ~(CF_STREAMER | CF_STREAMER_FAST);
-	}
+	channel_check_idletimer(ic);
 
-	/* First, let's see if we may splice data across the channel without
-	 * using a buffer.
+#if defined(USE_LINUX_SPLICE)
+	/* Detect if the splicing is possible depending on the stream policy */
+	if ((global.tune.options & GTUNE_USE_SPLICE) &&
+	    (ic->to_forward >= MIN_SPLICE_FORWARD) &&
+	    ((!(sc->flags & SC_FL_ISBACK) && ((strm_fe(__sc_strm(sc))->options2|__sc_strm(sc)->be->options2) & PR_O2_SPLIC_REQ)) ||
+	     ((sc->flags & SC_FL_ISBACK) && ((strm_fe(__sc_strm(sc))->options2|__sc_strm(sc)->be->options2) & PR_O2_SPLIC_RTR)) ||
+	     ((ic->flags & CF_STREAMER_FAST) && ((strm_sess(__sc_strm(sc))->fe->options2|__sc_strm(sc)->be->options2) & PR_O2_SPLIC_AUT))))
+		flags |= CO_RFL_MAY_SPLICE;
+#endif
+
+	/* First, let's see if we may fast-forward data from a side to the other
+	 * one without using the channel buffer.
 	 */
-	if (sc_ep_test(sc, SE_FL_MAY_SPLICE) &&
-	    (ic->pipe || ic->to_forward >= MIN_SPLICE_FORWARD) &&
-	    ic->flags & CF_KERN_SPLICING) {
-		if (c_data(ic)) {
+	if (sc_is_fastfwd_supported(sc)) {
+		if (channel_data(ic)) {
 			/* We're embarrassed, there are already data pending in
 			 * the buffer and we don't want to have them at two
 			 * locations at a time. Let's indicate we need some
 			 * place and ask the consumer to hurry.
 			 */
 			flags |= CO_RFL_BUF_FLUSH;
-			goto abort_splice;
+			goto abort_fastfwd;
 		}
-
-		if (unlikely(ic->pipe == NULL)) {
-			if (pipes_used >= global.maxpipes || !(ic->pipe = get_pipe())) {
-				ic->flags &= ~CF_KERN_SPLICING;
-				goto abort_splice;
-			}
-		}
-
-		ret = conn->mux->rcv_pipe(sc, ic->pipe, ic->to_forward);
-		if (ret < 0) {
-			/* splice not supported on this end, let's disable it */
-			ic->flags &= ~CF_KERN_SPLICING;
-			goto abort_splice;
-		}
-
-		if (ret > 0) {
+		ret = conn->mux->fastfwd(sc, ic->to_forward, flags);
+		if (ret < 0)
+			goto abort_fastfwd;
+		else if (ret > 0) {
 			if (ic->to_forward != CHN_INFINITE_FORWARD)
 				ic->to_forward -= ret;
 			ic->total += ret;
@@ -1300,30 +1356,14 @@ static int sc_conn_recv(struct stconn *sc)
 		if (sc_ep_test(sc, SE_FL_EOS | SE_FL_ERROR))
 			goto end_recv;
 
-		if (conn->flags & CO_FL_WAIT_ROOM) {
-			/* the pipe is full or we have read enough data that it
-			 * could soon be full. Let's stop before needing to poll.
-			 */
-			sc_need_room(sc, 0);
+		if (sc_ep_test(sc, SE_FL_WANT_ROOM))
+			sc_need_room(sc, -1);
+
+		if (sc_ep_test(sc, SE_FL_MAY_FASTFWD_PROD) && ic->to_forward)
 			goto done_recv;
-		}
-
-		/* splice not possible (anymore), let's go on on standard copy */
 	}
 
- abort_splice:
-	if (ic->pipe && unlikely(!ic->pipe->data)) {
-		put_pipe(ic->pipe);
-		ic->pipe = NULL;
-	}
-
-	if (ic->pipe && ic->to_forward && !(flags & CO_RFL_BUF_FLUSH) && sc_ep_test(sc, SE_FL_MAY_SPLICE)) {
-		/* don't break splicing by reading, but still call rcv_buf()
-		 * to pass the flag.
-		 */
-		goto done_recv;
-	}
-
+ abort_fastfwd:
 	/* now we'll need a input buffer for the stream */
 	if (!sc_alloc_ibuf(sc, &(__sc_strm(sc)->buffer_wait)))
 		goto end_recv;
@@ -1345,7 +1385,10 @@ static int sc_conn_recv(struct stconn *sc)
 	}
 
 	/* Instruct the mux it must subscribed for read events */
-	flags |= ((!conn_is_back(conn) && (__sc_strm(sc)->be->options & PR_O_ABRT_CLOSE)) ? CO_RFL_KEEP_RECV : 0);
+	if (!(sc->flags & SC_FL_ISBACK) &&                         /* for frontend conns only */
+	    (sc_opposite(sc)->state != SC_ST_INI) &&               /* before backend connection setup */
+	    (__sc_strm(sc)->be->options & PR_O_ABRT_CLOSE))        /* if abortonclose option is set for the current backend */
+		flags |= CO_RFL_KEEP_RECV;
 
 	/* Important note : if we're called with POLL_IN|POLL_HUP, it means the read polling
 	 * was enabled, which implies that the recv buffer was not full. So we have a guarantee
@@ -1379,6 +1422,7 @@ static int sc_conn_recv(struct stconn *sc)
 			 * cannot be xferred to the channel
 			 */
 			ic->flags |= CF_READ_EVENT;
+			sc_ep_report_read_activity(sc);
 		}
 
 		if (ret <= 0) {
@@ -1455,43 +1499,10 @@ static int sc_conn_recv(struct stconn *sc)
 	} /* while !flags */
 
  done_recv:
-	if (cur_read) {
-		if ((ic->flags & (CF_STREAMER | CF_STREAMER_FAST)) &&
-		    (cur_read <= ic->buf.size / 2)) {
-			ic->xfer_large = 0;
-			ic->xfer_small++;
-			if (ic->xfer_small >= 3) {
-				/* we have read less than half of the buffer in
-				 * one pass, and this happened at least 3 times.
-				 * This is definitely not a streamer.
-				 */
-				ic->flags &= ~(CF_STREAMER | CF_STREAMER_FAST);
-			}
-			else if (ic->xfer_small >= 2) {
-				/* if the buffer has been at least half full twice,
-				 * we receive faster than we send, so at least it
-				 * is not a "fast streamer".
-				 */
-				ic->flags &= ~CF_STREAMER_FAST;
-			}
-		}
-		else if (!(ic->flags & CF_STREAMER_FAST) &&
-			 (cur_read >= ic->buf.size - global.tune.maxrewrite)) {
-			/* we read a full buffer at once */
-			ic->xfer_small = 0;
-			ic->xfer_large++;
-			if (ic->xfer_large >= 3) {
-				/* we call this buffer a fast streamer if it manages
-				 * to be filled in one call 3 consecutive times.
-				 */
-				ic->flags |= (CF_STREAMER | CF_STREAMER_FAST);
-			}
-		}
-		else {
-			ic->xfer_small = 0;
-			ic->xfer_large = 0;
-		}
-		ic->last_read = now_ms;
+	if (!cur_read)
+		se_have_no_more_data(sc->sedesc);
+	else {
+		channel_check_xfer(ic, cur_read);
 		sc_ep_report_read_activity(sc);
 	}
 
@@ -1514,18 +1525,44 @@ static int sc_conn_recv(struct stconn *sc)
 		sc_conn_eos(sc);
 		ret = 1;
 	}
-
 	if (sc_ep_test(sc, SE_FL_ERROR)) {
 		sc->flags |= SC_FL_ERROR;
+		if (!(sc->flags & SC_FL_EOS))
+			sc_report_term_evt(sc, (sc->flags & SC_FL_EOI ? strm_tevt_type_rcv_err: strm_tevt_type_truncated_rcv_err));
 		ret = 1;
 	}
-	else if (!(sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM)) &&
+
+	/* Ensure sc_conn_process() is called if waiting on handshake. */
+	if (!(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)) &&
+	    sc_ep_test(sc, SE_FL_WAIT_FOR_HS)) {
+		ret = 1;
+	}
+
+	if (sc->flags & (SC_FL_EOS|SC_FL_ERROR)) {
+		/* No more data are expected at this stage */
+		se_have_no_more_data(sc->sedesc);
+	}
+	else if (!cur_read &&
+		 !(sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM)) &&
 		 !(sc->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))) {
-		/* Subscribe to receive events if we're blocking on I/O */
+		/* Subscribe to receive events if we're blocking on I/O. Nothing
+		 * was received and it was not because of a blocking
+		 * condition.
+		 */
 		conn->mux->subscribe(sc, SUB_RETRY_RECV, &sc->wait_event);
 		se_have_no_more_data(sc->sedesc);
 	}
+	else if (sc->flags & SC_FL_EOI) {
+		/* No more data are expected at this stage, except if abortonclose is enabled */
+		if (!(flags & CO_RFL_KEEP_RECV))
+			se_have_no_more_data(sc->sedesc);
+		else
+			se_have_more_data(sc->sedesc);
+	}
 	else {
+		/* The mux may have more data to deliver. Be sure to be able to
+		 * ask it ASAP
+		 */
 		se_have_more_data(sc->sedesc);
 		ret = 1;
 	}
@@ -1561,9 +1598,10 @@ int sc_conn_sync_recv(struct stconn *sc)
  * This function is called to send buffer data to a stream socket.
  * It calls the mux layer's snd_buf function. It relies on the
  * caller to commit polling changes. The caller should check conn->flags
- * for errors.
+ * for errors. Please do not statify this function, it's often present in
+ * backtraces, it's useful to recognize it.
  */
-static int sc_conn_send(struct stconn *sc)
+int sc_conn_send(struct stconn *sc)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct stconn *sco = sc_opposite(sc);
@@ -1582,6 +1620,10 @@ static int sc_conn_send(struct stconn *sc)
 		if (sc->state < SC_ST_CON)
 			return 0;
 		BUG_ON(sc_ep_test(sc, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING) == (SE_FL_EOS|SE_FL_ERR_PENDING));
+		if (sc_ep_test(sc, SE_FL_ERROR))
+			sc->flags |= SC_FL_ERROR;
+		if (co_data(oc) || sc_ep_have_ff_data(sc))
+			sc_ep_report_blocked_send(sc, 0);
 		return 1;
 	}
 
@@ -1597,17 +1639,27 @@ static int sc_conn_send(struct stconn *sc)
 	if (!conn->mux)
 		return 0;
 
-	if (oc->pipe && conn->xprt->snd_pipe && conn->mux->snd_pipe) {
-		ret = conn->mux->snd_pipe(sc, oc->pipe);
+	if (sc_ep_have_ff_data(sc)) {
+		unsigned int send_flag = 0;
+
+		if ((!(sc->flags & (SC_FL_SND_ASAP|SC_FL_SND_NEVERWAIT)) &&
+		     ((oc->to_forward && oc->to_forward != CHN_INFINITE_FORWARD) ||
+		      (sc->flags & SC_FL_SND_EXP_MORE) ||
+		      (IS_HTX_STRM(s) &&
+		       (!(sco->flags & (SC_FL_EOI|SC_FL_EOS|SC_FL_ABRT_DONE)) && htx_expect_more(htxbuf(&oc->buf)))))) ||
+		    ((oc->flags & CF_ISRESP) &&
+		     (oc->flags & CF_AUTO_CLOSE) &&
+		     (sc->flags & SC_FL_SHUT_WANTED)))
+			send_flag |= CO_SFL_MSG_MORE;
+
+		if (oc->flags & CF_STREAMER)
+			send_flag |= CO_SFL_STREAMER;
+
+		ret = conn->mux->resume_fastfwd(sc, send_flag);
 		if (ret > 0)
 			did_send = 1;
 
-		if (!oc->pipe->data) {
-			put_pipe(oc->pipe);
-			oc->pipe = NULL;
-		}
-
-		if (oc->pipe)
+		if (sc_ep_have_ff_data(sc))
 			goto end;
 	}
 
@@ -1657,7 +1709,7 @@ static int sc_conn_send(struct stconn *sc)
 			if (s->txn->req.msg_state != HTTP_MSG_DONE)
 				s->txn->flags &= ~TX_L7_RETRY;
 			else {
-				if (b_alloc(&s->txn->l7_buffer) == NULL)
+				if (b_alloc(&s->txn->l7_buffer, DB_UNLIKELY) == NULL)
 					s->txn->flags &= ~TX_L7_RETRY;
 				else {
 					memcpy(b_orig(&s->txn->l7_buffer),
@@ -1669,6 +1721,9 @@ static int sc_conn_send(struct stconn *sc)
 
 			}
 		}
+
+		if ((sc->flags & SC_FL_SHUT_WANTED) && co_data(oc) == c_data(oc))
+			send_flag |= CO_SFL_LAST_DATA;
 
 		ret = conn->mux->snd_buf(sc, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
@@ -1699,18 +1754,30 @@ static int sc_conn_send(struct stconn *sc)
 	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING)) {
 		oc->flags |= CF_WRITE_EVENT;
 		BUG_ON(sc_ep_test(sc, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING) == (SE_FL_EOS|SE_FL_ERR_PENDING));
+		sc_report_term_evt(sc, strm_tevt_type_snd_err);
 		if (sc_ep_test(sc, SE_FL_ERROR))
 			sc->flags |= SC_FL_ERROR;
 		return 1;
 	}
 
-	if (channel_is_empty(oc))
-		sc_ep_report_send_activity(sc);
+	/* FIXME: Must be reviewed for FF */
+	if (!co_data(oc) && !sc_ep_have_ff_data(sc)) {
+		if (did_send)
+			sc_ep_report_send_activity(sc);
+		/* If fast-forwarding is blocked, unblock it now to check for
+		 * receive on the other side
+		 */
+		if (sc->sedesc->iobuf.flags & IOBUF_FL_FF_BLOCKED) {
+			sc->sedesc->iobuf.flags &= ~IOBUF_FL_FF_BLOCKED;
+			sc_have_room(sco);
+			did_send = 1;
+		}
+	}
 	else {
 		/* We couldn't send all of our data, let the mux know we'd like to send more */
 		conn->mux->subscribe(sc, SUB_RETRY_SEND, &sc->wait_event);
 		if (sc_state_in(sc->state, SC_SB_EST|SC_SB_DIS|SC_SB_CLO))
-			sc_ep_report_blocked_send(sc);
+				sc_ep_report_blocked_send(sc, did_send);
 	}
 
 	return did_send;
@@ -1729,7 +1796,7 @@ void sc_conn_sync_send(struct stconn *sc)
 	if (sc->flags & SC_FL_SHUT_DONE)
 		return;
 
-	if (channel_is_empty(oc))
+	if (!co_data(oc))
 		return;
 
 	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
@@ -1745,9 +1812,10 @@ void sc_conn_sync_send(struct stconn *sc)
  * connection flags to the stream connector, updates the stream (which may or
  * may not take this opportunity to try to forward data), then update the
  * connection's polling based on the channels and stream connector's final
- * states. The function always returns 0.
+ * states. The function always returns 0. Please do not statify this function,
+ * it's often present in backtraces, it's useful to recognize it.
  */
-static int sc_conn_process(struct stconn *sc)
+int sc_conn_process(struct stconn *sc)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct channel *ic = sc_ic(sc);
@@ -1756,7 +1824,8 @@ static int sc_conn_process(struct stconn *sc)
 	BUG_ON(!conn);
 
 	/* If we have data to send, try it now */
-	if (!channel_is_empty(oc) && !(sc->wait_event.events & SUB_RETRY_SEND))
+	if ((co_data(oc) || sc_ep_have_ff_data(sc)) &&
+	    !(sc->wait_event.events & SUB_RETRY_SEND))
 		sc_conn_send(sc);
 
 	/* First step, report to the stream connector what was detected at the
@@ -1797,6 +1866,19 @@ static int sc_conn_process(struct stconn *sc)
 			sc->state = SC_ST_RDY;
 	}
 
+	/* Report EOI on the channel if it was reached from the mux point of
+	 * view.
+	 *
+	 * Note: This test is only required because sc_conn_process is also the SI
+	 *       wake callback. Otherwise sc_conn_recv()/sc_conn_send() already take
+	 *       care of it.
+	 */
+	if (sc_ep_test(sc, SE_FL_EOI) && !(sc->flags & SC_FL_EOI)) {
+		sc->flags |= SC_FL_EOI;
+		ic->flags |= CF_READ_EVENT;
+		sc_ep_report_read_activity(sc);
+	}
+
 	/* Report EOS on the channel if it was reached from the mux point of
 	 * view.
 	 *
@@ -1811,20 +1893,11 @@ static int sc_conn_process(struct stconn *sc)
 		sc_conn_eos(sc);
 	}
 
-	/* Report EOI on the channel if it was reached from the mux point of
-	 * view.
-	 *
-	 * Note: This test is only required because sc_conn_process is also the SI
-	 *       wake callback. Otherwise sc_conn_recv()/sc_conn_send() already take
-	 *       care of it.
-	 */
-	if (sc_ep_test(sc, SE_FL_EOI) && !(sc->flags & SC_FL_EOI)) {
-		sc->flags |= SC_FL_EOI;
-		ic->flags |= CF_READ_EVENT;
-	}
-
-	if (sc_ep_test(sc, SE_FL_ERROR))
+	if (sc_ep_test(sc, SE_FL_ERROR) && !(sc->flags & SC_FL_ERROR)) {
+		if (!(sc->flags & SC_FL_EOS))
+			sc_report_term_evt(sc, (sc->flags & SC_FL_EOI ? strm_tevt_type_rcv_err: strm_tevt_type_truncated_rcv_err));
 		sc->flags |= SC_FL_ERROR;
+	}
 
 	/* Second step : update the stream connector and channels, try to forward any
 	 * pending data, then possibly wake the stream up based on the new
@@ -1848,7 +1921,7 @@ struct task *sc_conn_io_cb(struct task *t, void *ctx, unsigned int state)
 	if (!sc_conn(sc))
 		return t;
 
-	if (!(sc->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(sc_oc(sc)))
+	if (!(sc->wait_event.events & SUB_RETRY_SEND) && (co_data(sc_oc(sc)) || sc_ep_have_ff_data(sc) || (sc->sedesc->iobuf.flags & IOBUF_FL_FF_BLOCKED)))
 		ret = sc_conn_send(sc);
 	if (!(sc->wait_event.events & SUB_RETRY_RECV))
 		ret |= sc_conn_recv(sc);
@@ -1874,14 +1947,16 @@ static void sc_applet_eos(struct stconn *sc)
 		return;
 	sc->flags |= SC_FL_EOS;
 	ic->flags |= CF_READ_EVENT;
+	sc_ep_report_read_activity(sc);
+	sc_report_term_evt(sc, (sc->flags & SC_FL_EOI ? strm_tevt_type_eos: strm_tevt_type_truncated_eos));
 
 	/* Note: on abort, we don't call the applet */
 
-	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
+	if (sc->state != SC_ST_EST)
 		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE) {
-		appctx_shut(__sc_appctx(sc));
+		se_shutdown(sc->sedesc, SE_SHR_RESET|SE_SHW_NORMAL);
 		sc->state = SC_ST_DIS;
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
@@ -1890,12 +1965,361 @@ static void sc_applet_eos(struct stconn *sc)
 		return sc_app_shut_applet(sc);
 }
 
+/*
+ * This is the callback which is called by the applet layer to receive data into
+ * the buffer from the appctx. It iterates over the applet's rcv_buf
+ * function. Please do not statify this function, it's often present in
+ * backtraces, it's useful to recognize it.
+ */
+int sc_applet_recv(struct stconn *sc)
+{
+	struct appctx *appctx = __sc_appctx(sc);
+	struct channel *ic = sc_ic(sc);
+	int ret, max, cur_read = 0;
+	int read_poll = MAX_READ_POLL_LOOPS;
+	int flags = 0;
+
+
+	/* If another call to sc_applet_recv() failed, give up now.
+	 */
+	if (sc_waiting_room(sc))
+		return 0;
+
+	/* maybe we were called immediately after an asynchronous abort */
+	if (sc->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))
+		return 1;
+
+	/* We must wait because the applet is not fully initialized */
+	if (se_fl_test(sc->sedesc, SE_FL_ORPHAN))
+		return 0;
+
+	/* stop immediately on errors. */
+	if (!sc_ep_test(sc, SE_FL_RCV_MORE)) {
+		// TODO: be sure SE_FL_RCV_MORE may be set for applet ?
+		if (sc_ep_test(sc, SE_FL_ERROR))
+			goto end_recv;
+	}
+
+	/* prepare to detect if the mux needs more room */
+	sc_ep_clr(sc, SE_FL_WANT_ROOM);
+
+	channel_check_idletimer(ic);
+
+	/* First, let's see if we may fast-forward data from a side to the other
+	 * one without using the channel buffer.
+	 */
+	if (sc_is_fastfwd_supported(sc)) {
+		if (channel_data(ic)) {
+			/* We're embarrassed, there are already data pending in
+			 * the buffer and we don't want to have them at two
+			 * locations at a time. Let's indicate we need some
+			 * place and ask the consumer to hurry.
+			 */
+			flags |= CO_RFL_BUF_FLUSH;
+			goto abort_fastfwd;
+		}
+		ret = appctx_fastfwd(sc, ic->to_forward, flags);
+		if (ret < 0)
+			goto abort_fastfwd;
+		else if (ret > 0) {
+			if (ic->to_forward != CHN_INFINITE_FORWARD)
+				ic->to_forward -= ret;
+			ic->total += ret;
+			cur_read += ret;
+			ic->flags |= CF_READ_EVENT;
+		}
+
+		if (sc_ep_test(sc, SE_FL_EOS | SE_FL_ERROR))
+			goto end_recv;
+
+		if (sc_ep_test(sc, SE_FL_WANT_ROOM))
+			sc_need_room(sc, -1);
+
+		if (sc_ep_test(sc, SE_FL_MAY_FASTFWD_PROD) && ic->to_forward)
+			goto done_recv;
+	}
+
+ abort_fastfwd:
+	if (!sc_alloc_ibuf(sc, &appctx->buffer_wait))
+		goto end_recv;
+
+	/* For an HTX stream, if the buffer is stuck (no output data with some
+	 * input data) and if the HTX message is fragmented or if its free space
+	 * wraps, we force an HTX deframentation. It is a way to have a
+	 * contiguous free space nad to let the mux to copy as much data as
+	 * possible.
+	 *
+	 * NOTE: A possible optim may be to let the mux decides if defrag is
+	 *       required or not, depending on amount of data to be xferred.
+	 */
+	if (IS_HTX_STRM(__sc_strm(sc)) && !co_data(ic)) {
+		struct htx *htx = htxbuf(&ic->buf);
+
+		if (htx_is_not_empty(htx) && ((htx->flags & HTX_FL_FRAGMENTED) || htx_space_wraps(htx)))
+			htx_defrag(htx, NULL, 0);
+	}
+
+	/* Compute transient CO_RFL_* flags */
+	if (co_data(ic)) {
+		flags |= (CO_RFL_BUF_WET | CO_RFL_BUF_NOT_STUCK);
+	}
+
+	/* <max> may be null. This is the mux responsibility to set
+	 * SE_FL_RCV_MORE on the SC if more space is needed.
+	 */
+	max = channel_recv_max(ic);
+	ret = appctx_rcv_buf(sc, &ic->buf, max, flags);
+	if (sc_ep_test(sc, SE_FL_WANT_ROOM)) {
+		/* SE_FL_WANT_ROOM must not be reported if the channel's
+		 * buffer is empty.
+		 */
+		BUG_ON(c_empty(ic));
+
+		sc_need_room(sc, channel_recv_max(ic) + 1);
+		/* Add READ_PARTIAL because some data are pending but
+		 * cannot be xferred to the channel
+		 */
+		ic->flags |= CF_READ_EVENT;
+		sc_ep_report_read_activity(sc);
+	}
+
+	if (ret <= 0) {
+		/* if we refrained from reading because we asked for a flush to
+		 * satisfy rcv_pipe(), report that there's not enough room here
+		 * to proceed.
+		 */
+		if (flags & CO_RFL_BUF_FLUSH)
+			sc_need_room(sc, -1);
+		goto done_recv;
+	}
+
+	cur_read += ret;
+
+	/* if we're allowed to directly forward data, we must update ->o */
+	if (ic->to_forward && !(sc_opposite(sc)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))) {
+		unsigned long fwd = ret;
+		if (ic->to_forward != CHN_INFINITE_FORWARD) {
+			if (fwd > ic->to_forward)
+				fwd = ic->to_forward;
+			ic->to_forward -= fwd;
+		}
+		c_adv(ic, fwd);
+	}
+
+	ic->flags |= CF_READ_EVENT;
+	ic->total += ret;
+
+	/* End-of-input reached, we can leave. In this case, it is
+	 * important to break the loop to not block the SC because of
+	 * the channel's policies.This way, we are still able to receive
+	 * shutdowns.
+	 */
+	if (sc_ep_test(sc, SE_FL_EOI))
+		goto done_recv;
+
+	if ((sc->flags & SC_FL_RCV_ONCE) || --read_poll <= 0) {
+		/* we don't expect to read more data */
+		sc_wont_read(sc);
+		goto done_recv;
+	}
+
+	/* if too many bytes were missing from last read, it means that
+	 * it's pointless trying to read again because the system does
+	 * not have them in buffers.
+	 */
+	if (ret < max) {
+		/* if a streamer has read few data, it may be because we
+		 * have exhausted system buffers. It's not worth trying
+		 * again.
+		 */
+		if (ic->flags & CF_STREAMER) {
+			/* we're stopped by the channel's policy */
+			sc_wont_read(sc);
+			goto done_recv;
+		}
+
+		/* if we read a large block smaller than what we requested,
+		 * it's almost certain we'll never get anything more.
+		 */
+		if (ret >= global.tune.recv_enough) {
+			/* we're stopped by the channel's policy */
+			sc_wont_read(sc);
+		}
+	}
+
+ done_recv:
+	if (cur_read) {
+		channel_check_xfer(ic, cur_read);
+		sc_ep_report_read_activity(sc);
+	}
+
+ end_recv:
+	ret = (cur_read != 0);
+
+	/* Report EOI on the channel if it was reached from the mux point of
+	 * view. */
+	if (sc_ep_test(sc, SE_FL_EOI) && !(sc->flags & SC_FL_EOI)) {
+		sc_ep_report_read_activity(sc);
+		sc->flags |= SC_FL_EOI;
+		ic->flags |= CF_READ_EVENT;
+		ret = 1;
+	}
+
+	if (sc_ep_test(sc, SE_FL_EOS)) {
+		/* we received a shutdown */
+		if (ic->flags & CF_AUTO_CLOSE)
+			sc_schedule_shutdown(sc_opposite(sc));
+		sc_applet_eos(sc);
+		ret = 1;
+	}
+
+	if (sc_ep_test(sc, SE_FL_ERROR)) {
+		sc->flags |= SC_FL_ERROR;
+		ret = 1;
+	}
+	else if (cur_read || (sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM))) {
+		se_have_more_data(sc->sedesc);
+		ret = 1;
+	}
+
+	return ret;
+}
+
+/* This tries to perform a synchronous receive on the stream connector to
+ * try to collect last arrived data. In practice it's only implemented on
+ * stconns. Returns 0 if nothing was done, non-zero if new data or a
+ * shutdown were collected. This may result on some delayed receive calls
+ * to be programmed and performed later, though it doesn't provide any
+ * such guarantee.
+ */
+int sc_applet_sync_recv(struct stconn *sc)
+{
+	if (!(__sc_appctx(sc)->flags & APPCTX_FL_INOUT_BUFS))
+		return 0;
+
+	if (!sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST))
+		return 0;
+
+	if (se_fl_test(sc->sedesc, SE_FL_ORPHAN))
+		return 0;
+
+	if (!sc_is_recv_allowed(sc))
+		return 0; // already failed
+
+	return sc_applet_recv(sc);
+}
+
+/*
+ * This function is called to send buffer data to an applet. It calls the
+ * applet's snd_buf function. Please do not statify this function, it's often
+ * present in backtraces, it's useful to recognize it.
+ */
+int sc_applet_send(struct stconn *sc)
+{
+	struct stconn *sco = sc_opposite(sc);
+	struct channel *oc = sc_oc(sc);
+	size_t ret;
+	int did_send = 0;
+
+	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING)) {
+		BUG_ON(sc_ep_test(sc, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING) == (SE_FL_EOS|SE_FL_ERR_PENDING));
+		if (co_data(oc))
+			sc_ep_report_blocked_send(sc, 0);
+		return 1;
+	}
+
+	if (sc_ep_test(sc, SE_FL_WONT_CONSUME))
+		return 0;
+
+	/* we might have been called just after an asynchronous shutw */
+	if (sc->flags & SC_FL_SHUT_DONE)
+		return 1;
+
+	/* We must wait because the applet is not fully initialized */
+	if (se_fl_test(sc->sedesc, SE_FL_ORPHAN))
+		return 0;
+
+	/* TODO: Splicing is not supported, so it is not possible to have FF data stuck into the I/O buf */
+	BUG_ON(sc_ep_have_ff_data(sc));
+
+	if (co_data(oc)) {
+		unsigned int send_flag = 0;
+
+		if ((sc->flags & SC_FL_SHUT_WANTED) && co_data(oc) == c_data(oc))
+			send_flag |= CO_SFL_LAST_DATA;
+
+		ret = appctx_snd_buf(sc, &oc->buf, co_data(oc), send_flag);
+		if (ret > 0) {
+			did_send = 1;
+			c_rew(oc, ret);
+			c_realign_if_empty(oc);
+
+			if (!co_data(oc)) {
+				/* Always clear both flags once everything has been sent, they're one-shot */
+				sc->flags &= ~(SC_FL_SND_ASAP|SC_FL_SND_EXP_MORE);
+			}
+			/* if some data remain in the buffer, it's only because the
+			 * system buffers are full, we will try next time.
+			 */
+		}
+	}
+
+	if (did_send)
+		oc->flags |= CF_WRITE_EVENT | CF_WROTE_DATA;
+
+	if (!sco->room_needed || (did_send && (sco->room_needed < 0 || channel_recv_max(sc_oc(sc)) >= sco->room_needed)))
+		sc_have_room(sco);
+
+	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING)) {
+		oc->flags |= CF_WRITE_EVENT;
+		BUG_ON(sc_ep_test(sc, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING) == (SE_FL_EOS|SE_FL_ERR_PENDING));
+		if (sc_ep_test(sc, SE_FL_ERROR))
+			sc->flags |= SC_FL_ERROR;
+		return 1;
+	}
+
+	if (!co_data(oc)) {
+		if (did_send)
+			sc_ep_report_send_activity(sc);
+	}
+	else {
+		sc_ep_report_blocked_send(sc, did_send);
+	}
+
+	return did_send;
+}
+
+void sc_applet_sync_send(struct stconn *sc)
+{
+	struct channel *oc = sc_oc(sc);
+
+	oc->flags &= ~CF_WRITE_EVENT;
+
+	if (!(__sc_appctx(sc)->flags & APPCTX_FL_INOUT_BUFS))
+		return;
+
+	if (sc->flags & SC_FL_SHUT_DONE)
+		return;
+
+	if (!co_data(oc))
+		return;
+
+	if (!sc_state_in(sc->state, SC_SB_EST))
+		return;
+
+	if (se_fl_test(sc->sedesc, SE_FL_ORPHAN))
+		return;
+
+	sc_applet_send(sc);
+}
+
 /* Callback to be used by applet handlers upon completion. It updates the stream
  * (which may or may not take this opportunity to try to forward data), then
  * may re-enable the applet's based on the channels and stream connector's final
- * states.
+ * states. Please do not statify this function, it's often present in backtraces,
+ * it's useful to recognize it.
  */
-static int sc_applet_process(struct stconn *sc)
+int sc_applet_process(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
 
@@ -1941,7 +2365,8 @@ static int sc_applet_process(struct stconn *sc)
 	 * appctx but in the case the task is not in runqueue we may have to
 	 * wakeup the appctx immediately.
 	 */
-	if (sc_is_recv_allowed(sc) || sc_is_send_allowed(sc))
+	if ((sc_is_recv_allowed(sc) && !applet_fl_test(__sc_appctx(sc), APPCTX_FL_OUTBLK_ALLOC)) ||
+	    (sc_is_send_allowed(sc) && !applet_fl_test(__sc_appctx(sc), APPCTX_FL_INBLK_ALLOC)))
 		appctx_wakeup(__sc_appctx(sc));
 	return 0;
 }
@@ -1978,3 +2403,150 @@ void sc_conn_commit_endp_upgrade(struct stconn *sc)
 	BUG_ON(!sc);
 	BUG_ON(!sc->sedesc);
 }
+
+/* Return a debug string exposing the internals of the front or back
+ * stream/connection when supported. It will be protocol-dependent and will
+ * change over time like the output of "show fd" or "show sess all".
+ */
+static int smp_fetch_debug_str(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+	struct stconn *sc;
+	union mux_sctl_dbg_str_ctx sctl_ctx = { };
+
+	if (!smp->strm)
+		return 0;
+
+	sc = (kw[0] == 'f' ? smp->strm->scf : smp->strm->scb);
+	conn = sc_conn(sc);
+
+	if (!conn)
+		return 0;
+
+	/* a missing mux is necessarily on the backend, and may arrive later */
+	if (!conn->mux) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* Not implemented, return nothing */
+	if (!conn->mux->sctl)
+		return 0;
+
+	sctl_ctx.arg.debug_flags = args->data.sint ? args->data.sint : ~0U;
+	if (conn->mux->sctl(sc, MUX_SCTL_DBG_STR, &sctl_ctx) == -1)
+		return 0;
+
+	smp->data.type = SMP_T_STR;
+	smp->flags = SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	smp->data.u.str = sctl_ctx.ret.buf;
+	return 1;
+}
+
+/* return the frontend or backend mux stream ID.
+ */
+static int
+smp_fetch_sid(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+	struct stconn *sc;
+	int64_t sid = 0;
+
+	if (!smp->strm)
+		return 0;
+
+	sc = (kw[0] == 'f' ? smp->strm->scf : smp->strm->scb);
+	conn = sc_conn(sc);
+
+	/* No connection */
+	if (!conn)
+		return 0;
+
+	/* No mux install, this may change */
+	if (!conn->mux) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* No sctl, report sid=0 in this case */
+	if (conn->mux->sctl) {
+		if (conn->mux->sctl(sc, MUX_SCTL_SID, &sid) == -1)
+			return 0;
+	}
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = sid;
+
+	return 1;
+}
+
+/* return 1 if the frontend or backend mux stream has received an abort and 0 otherwise.
+ */
+static int
+smp_fetch_strm_aborted(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct stconn *sc;
+	unsigned int aborted = 0;
+
+	if (!smp->strm)
+		return 0;
+
+	sc = (kw[0] == 'f' ? smp->strm->scf : smp->strm->scb);
+	if (sc->sedesc->abort_info.info)
+		aborted = 1;
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_BOOL;
+	smp->data.u.sint = aborted;
+
+	return 1;
+}
+
+/* return the H2/QUIC RESET code of the frontend or backend mux stream. Any value
+ * means an a RST_STREAM was received on H2 and a STOP_SENDING on QUIC. Otherwise the sample fetch fails.
+ */
+static int
+smp_fetch_strm_rst_code(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct stconn *sc;
+	unsigned int source;
+	unsigned long long code = 0;
+
+	if (!smp->strm)
+		return 0;
+
+	sc = (kw[0] == 'f' ? smp->strm->scf : smp->strm->scb);
+	source = ((sc->sedesc->abort_info.info & SE_ABRT_SRC_MASK) >> SE_ABRT_SRC_SHIFT);
+	if (source != SE_ABRT_SRC_MUX_H2 && source != SE_ABRT_SRC_MUX_QUIC) {
+		if (!source)
+			smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+	code = sc->sedesc->abort_info.code;
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = code;
+
+	return 1;
+}
+
+/* Note: must not be declared <const> as its list will be overwritten.
+ * Note: fetches that may return multiple types should be declared using the
+ * appropriate pseudo-type. If not available it must be declared as the lowest
+ * common denominator, the type that can be casted into all other ones.
+ */
+static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
+	{ "bs.debug_str", smp_fetch_debug_str, ARG1(0,SINT), NULL, SMP_T_STR, SMP_USE_L5SRV },
+	{ "bs.id", smp_fetch_sid, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
+	{ "bs.aborted", smp_fetch_strm_aborted, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
+	{ "bs.rst_code", smp_fetch_strm_rst_code, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
+	{ "fs.debug_str", smp_fetch_debug_str, ARG1(0,SINT), NULL, SMP_T_STR, SMP_USE_L5CLI },
+	{ "fs.id", smp_fetch_sid, 0, NULL, SMP_T_STR, SMP_USE_L5CLI },
+	{ "fs.aborted", smp_fetch_strm_aborted, 0, NULL, SMP_T_SINT, SMP_USE_L5CLI },
+	{ "fs.rst_code", smp_fetch_strm_rst_code, 0, NULL, SMP_T_SINT, SMP_USE_L5CLI },
+	{ /* END */ },
+}};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &sample_fetch_keywords);

@@ -1,5 +1,4 @@
 varnishtest "JSON Query converters Test"
-#REQUIRE_VERSION=2.4
 
 feature ignore_unknown_macro
 
@@ -10,6 +9,10 @@ server s1 {
 
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         # WT: limit false-positives causing "HTTP header incomplete" due to
         # idle server connections being randomly used and randomly expiring
         # under us.
@@ -98,4 +101,10 @@ client c1 -connect ${h1_fe_sock} {
 	rxresp
 	expect resp.status == 200
 	expect resp.http.x-var_body_mykey ~ "myvalue"
+
+	txreq -url "/" \
+	 -body "{\"my.key\":[\"val1\",\"val2\",\"val3\"],\"key2\":\"val4\"}"
+	expect resp.status == 200
+	expect resp.http.x-var_body_mykey ~ "[\"val1\",\"val2\",\"val3\"]"
+
 } -run

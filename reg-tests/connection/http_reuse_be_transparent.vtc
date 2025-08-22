@@ -1,81 +1,200 @@
 varnishtest "Test the proper interaction between http-reuse and backend in transparent mode"
+feature cmd "$HAPROXY_PROGRAM -cc 'feature(TPROXY)'"
 
-# If backend is used with the transparent mode, the connection are considered
-# as private and should only be reused for requests of the same session.
-# This is similar to the http-reuse never mode
-
-#REQUIRE_VERSION=2.4
+# Verify that connections made to a backend in transparent mode with
+# "http-reuse never" are only reused with that client, and those with
+# "http-reuse always" are properly shared across subsequent clients.
 
 feature ignore_unknown_macro
 
 haproxy h1 -conf {
+	global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+		nbthread 1
+
 	defaults
+		timeout client 30s
+		timeout server 30s
+		timeout connect 30s
 		mode http
 
-	listen sender
-		bind "fd@${feS}"
-		http-request set-header client-id %[req.hdr(client-id)] if { req.hdr(client-id) -m found }
-		option transparent
-		http-request set-dst-port int(${h1_feR_port})
+	listen never
+		bind "fd@${feN}"
+		http-reuse never
 
-	listen receiver
-		bind "fd@${feR}"
-		http-request set-var(sess.client_id) req.hdr(client-id)
-		http-request return status 200
-		http-after-response set-header http_first_request %[http_first_req]
-		http-after-response set-header client-id %[var(sess.client_id)]
+		http-request set-dst hdr(dst)
+		http-request set-dst-port hdr(dst-port)
+
+		http-after-response set-header http_reuse %[bc_reused]
+		server transparent 0.0.0.0
+
+	listen always
+		bind "fd@${feA}"
+		http-reuse always
+
+		http-request set-dst hdr(dst)
+		http-request set-dst-port hdr(dst-port)
+
+		http-after-response set-header http_reuse %[bc_reused]
+		server transparent 0.0.0.0 pool-max-conn 10
+
+	listen srv1
+		bind "fd@${fes1}"
+		http-request add-header srv-id s1
+		http-request return status 200 hdr srv-id s1
+
+	listen srv2
+		bind "fd@${fes2}"
+		http-request add-header srv-id s2
+		http-request return status 200 hdr srv-id s2
 } -start
 
-client c1 -connect ${h1_feS_sock} {
-	txreq \
-	  -hdr "client-id: c1"
+### now the test in http-reuse never mode
+# 1,1,1
+client c1 -connect ${h1_feN_sock} {
+	txreq -url /c1-1 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
 	rxresp
-	expect resp.http.http_first_request == "1"
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s1"
 
-	txreq
+	txreq -url /c1-2 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
 	rxresp
-	expect resp.http.http_first_request == "0"
-	expect resp.http.client-id == "c1"
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
 
-	txreq
+	txreq -url /c1-3 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
 	rxresp
-	expect resp.http.http_first_request == "0"
-	expect resp.http.client-id == "c1"
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
 } -run
 
-client c2 -connect ${h1_feS_sock} {
-	txreq \
-	  -hdr "client-id: c2"
+# 2,1,2
+client c2 -connect ${h1_feN_sock} {
+	txreq -url /c2-1 \
+	  -hdr "dst: ${h1_fes2_addr}" \
+	  -hdr "dst-port: ${h1_fes2_port}"
 	rxresp
-	expect resp.http.http_first_request == "1"
-	expect resp.http.client-id == "c2"
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s2"
 
-	txreq
+	txreq -url /c2-2 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
 	rxresp
-	expect resp.http.http_first_request == "0"
-	expect resp.http.client-id == "c2"
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s1"
 
-	txreq
+	txreq -url /c2-3 \
+	  -hdr "dst: ${h1_fes2_addr}" \
+	  -hdr "dst-port: ${h1_fes2_port}"
 	rxresp
-	expect resp.http.http_first_request == "0"
-	expect resp.http.client-id == "c2"
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s2"
 } -run
 
-client c3 -connect ${h1_feS_sock} {
-	txreq \
-	  -hdr "client-id: c3"
+# 1,1,2
+client c3 -connect ${h1_feN_sock} {
+	txreq -url /c3-1 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
 	rxresp
-	expect resp.http.http_first_request == "1"
-	expect resp.http.client-id == "c3"
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s1"
 
-	txreq
+	txreq -url /c3-2 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
 	rxresp
-	expect resp.http.http_first_request == "0"
-	expect resp.http.client-id == "c3"
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
 
-	txreq
+	txreq -url /c3-3 \
+	  -hdr "dst: ${h1_fes2_addr}" \
+	  -hdr "dst-port: ${h1_fes2_port}"
 	rxresp
-	expect resp.http.http_first_request == "0"
-	expect resp.http.client-id == "c3"
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s2"
 } -run
 
+### now the test in http-reuse safe mode
+
+# 1,1,1
+client c4 -connect ${h1_feA_sock} {
+	txreq -url /c4-1 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
+	rxresp
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s1"
+
+	txreq -url /c4-2 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
+	rxresp
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
+
+	txreq -url /c4-3 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
+	rxresp
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
+} -run
+
+# 2,1,2
+client c5 -connect ${h1_feA_sock} {
+	txreq -url /c5-1 \
+	  -hdr "dst: ${h1_fes2_addr}" \
+	  -hdr "dst-port: ${h1_fes2_port}"
+	rxresp
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s2"
+
+	txreq -url /c5-2 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
+	rxresp
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
+
+	txreq -url /c5-3 \
+	  -hdr "dst: ${h1_fes2_addr}" \
+	  -hdr "dst-port: ${h1_fes2_port}"
+	rxresp
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s2"
+} -run
+
+# 1,1,2
+client c6 -connect ${h1_feA_sock} {
+	txreq -url /c6-1 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
+	rxresp
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
+
+	txreq -url /c6-2 \
+	  -hdr "dst: ${h1_fes1_addr}" \
+	  -hdr "dst-port: ${h1_fes1_port}"
+	rxresp
+	expect resp.http.http_reuse == "1"
+	expect resp.http.srv-id == "s1"
+
+	txreq -url /c6-3 \
+	  -hdr "dst: ${h1_fes2_addr}" \
+	  -hdr "dst-port: ${h1_fes2_port}"
+	rxresp
+	expect resp.http.http_reuse == "0"
+	expect resp.http.srv-id == "s2"
+} -run

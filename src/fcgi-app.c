@@ -35,9 +35,9 @@ static struct fcgi_app *fcgi_apps = NULL;
 struct flt_ops fcgi_flt_ops;
 const char *fcgi_flt_id = "FCGI filter";
 
-DECLARE_STATIC_POOL(pool_head_fcgi_flt_ctx, "fcgi_flt_ctx", sizeof(struct fcgi_flt_ctx));
-DECLARE_STATIC_POOL(pool_head_fcgi_param_rule, "fcgi_param_rule", sizeof(struct fcgi_param_rule));
-DECLARE_STATIC_POOL(pool_head_fcgi_hdr_rule, "fcgi_hdr_rule", sizeof(struct fcgi_hdr_rule));
+DECLARE_STATIC_TYPED_POOL(pool_head_fcgi_flt_ctx, "fcgi_flt_ctx", struct fcgi_flt_ctx);
+DECLARE_STATIC_TYPED_POOL(pool_head_fcgi_param_rule, "fcgi_param_rule", struct fcgi_param_rule);
+DECLARE_STATIC_TYPED_POOL(pool_head_fcgi_hdr_rule, "fcgi_hdr_rule", struct fcgi_hdr_rule);
 
 /**************************************************************************/
 /***************************** Uitls **************************************/
@@ -134,16 +134,7 @@ static void fcgi_release_rule(struct fcgi_rule *rule)
 	if (!rule)
 		return;
 
-	if (!LIST_ISEMPTY(&rule->value)) {
-		struct logformat_node *lf, *lfb;
-
-		list_for_each_entry_safe(lf, lfb, &rule->value, list) {
-			LIST_DELETE(&lf->list);
-			release_sample_expr(lf->expr);
-			free(lf->arg);
-			free(lf);
-		}
-	}
+	lf_expr_deinit(&rule->value);
 	/* ->cond and ->name are not owned by the rule */
 	free(rule);
 }
@@ -256,7 +247,7 @@ static int fcgi_flt_check(struct proxy *px, struct flt_conf *fconf)
 		rule->type = crule->type;
 		rule->name = ist(crule->name);
 		rule->cond = crule->cond;
-		LIST_INIT(&rule->value);
+		lf_expr_init(&rule->value);
 
 		if (crule->value) {
 			if (!parse_logformat_string(crule->value, px, &rule->value, LOG_OPT_HTTP,
@@ -299,7 +290,7 @@ static int fcgi_flt_start(struct stream *s, struct filter *filter)
 
 static void fcgi_flt_stop(struct stream *s, struct filter *filter)
 {
-	struct flt_fcgi_ctx *fcgi_ctx = filter->ctx;
+	struct fcgi_flt_ctx *fcgi_ctx = filter->ctx;
 
 	if (!fcgi_ctx)
 		return;
@@ -320,7 +311,6 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 	struct eb_root hdr_rules = EB_ROOT;
 	struct htx *htx;
 	struct http_hdr_ctx ctx;
-	int ret;
 
 	htx = htxbuf(&msg->chn->buf);
 
@@ -377,16 +367,8 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 		goto end;
 
 	list_for_each_entry(rule, &fcgi_conf->param_rules, list) {
-		if (rule->cond) {
-			ret = acl_exec_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			/* the rule does not match */
-			if (!ret)
-				continue;
-		}
+		if (!acl_match_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
 		param_rule = NULL;
 		node = ebis_lookup_len(&param_rules, rule->name.ptr, rule->name.len);
@@ -407,16 +389,8 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 	}
 
 	list_for_each_entry(rule, &fcgi_conf->hdr_rules, list) {
-		if (rule->cond) {
-			ret = acl_exec_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			/* the rule does not match */
-			if (!ret)
-				continue;
-		}
+		if (!acl_match_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
 		hdr_rule = NULL;
 		node = ebis_lookup_len(&hdr_rules, rule->name.ptr, rule->name.len);
@@ -472,12 +446,12 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 	goto end;
 
   rewrite_err:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
-	_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
+	_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
   hdr_rule_err:
 	node = ebpt_first(&hdr_rules);
 	while (node) {
@@ -591,12 +565,6 @@ static int proxy_parse_use_fcgi_app(char **args, int section, struct proxy *curp
 		goto end;
         }
 
-	if (curpx->mode != PR_MODE_TCP && curpx->mode != PR_MODE_HTTP) {
-		memprintf(err, "'%s' requires TCP or HTTP mode", args[0]);
-		retval = -1;
-		goto end;
-        }
-
 	if (!*(args[1])) {
 		memprintf(err, "'%s' expects <name> as argument", args[0]);
 		retval = -1;
@@ -621,6 +589,8 @@ static int proxy_parse_use_fcgi_app(char **args, int section, struct proxy *curp
 	if (!fcgi_conf)
 		goto err;
 	fcgi_conf->name = strdup(args[1]);
+	if (!fcgi_conf->name)
+		goto err;
 	LIST_INIT(&fcgi_conf->param_rules);
 	LIST_INIT(&fcgi_conf->hdr_rules);
 
@@ -657,7 +627,7 @@ static int cfg_fcgi_apps_postparser()
 		struct fcgi_flt_conf *fcgi_conf = find_px_fcgi_conf(px);
 		int nb_fcgi_srv = 0;
 
-		if (px->mode == PR_MODE_TCP && fcgi_conf) {
+		if (px->mode != PR_MODE_HTTP && fcgi_conf) {
 			ha_alert("proxy '%s': FCGI application cannot be used in non-HTTP mode.\n",
 				 px->id);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -706,7 +676,7 @@ static int cfg_fcgi_apps_postparser()
 			curapp->maxreqs = 1;
 		}
 
-		err_code |= postresolve_logsrv_list(&curapp->logsrvs, "fcgi-app", curapp->name);
+		err_code |= postresolve_logger_list(NULL, &curapp->loggers, "fcgi-app", curapp->name);
 	}
 
   end:
@@ -810,7 +780,7 @@ static int cfg_parse_fcgi_app(const char *file, int linenum, char **args, int kw
 		curapp->conf.file    = strdup(file);
 		curapp->conf.line    = linenum;
 		LIST_INIT(&curapp->acls);
-		LIST_INIT(&curapp->logsrvs);
+		LIST_INIT(&curapp->loggers);
 		LIST_INIT(&curapp->conf.args.list);
 		LIST_INIT(&curapp->conf.rules);
 
@@ -1051,7 +1021,7 @@ static int cfg_parse_fcgi_app(const char *file, int linenum, char **args, int kw
 		}
 	}
 	else if (strcmp(args[0], "log-stderr") == 0) {
-		if (!parse_logsrv(args, &curapp->logsrvs, (kwm == KWM_NO), file, linenum, &errmsg)) {
+		if (!parse_logger(args, &curapp->loggers, (kwm == KWM_NO), file, linenum, &errmsg)) {
 			ha_alert("parsing [%s:%d] : %s : %s\n", file, linenum, args[0], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
@@ -1073,7 +1043,7 @@ out:
 void fcgi_apps_deinit()
 {
 	struct fcgi_app *curapp, *nextapp;
-	struct logsrv *log, *logb;
+	struct logger *log, *logb;
 
 	for (curapp = fcgi_apps; curapp != NULL; curapp = nextapp) {
 		struct fcgi_rule_conf *rule, *back;
@@ -1084,7 +1054,7 @@ void fcgi_apps_deinit()
 		regex_free(curapp->pathinfo_re);
 		free(curapp->conf.file);
 
-		list_for_each_entry_safe(log, logb, &curapp->logsrvs, list) {
+		list_for_each_entry_safe(log, logb, &curapp->loggers, list) {
 			LIST_DELETE(&log->list);
 			free(log);
 		}

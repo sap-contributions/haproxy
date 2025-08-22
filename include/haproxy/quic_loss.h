@@ -40,6 +40,7 @@ static inline void quic_loss_init(struct quic_loss *ql)
 	ql->rtt_min = 0;
 	ql->pto_count = 0;
 	ql->nb_lost_pkt = 0;
+	ql->nb_reordered_pkt = 0;
 }
 
 /* Return 1 if a persistent congestion is observed for a list of
@@ -84,6 +85,8 @@ struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
                                   unsigned int *pto);
 
 void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
-                           struct list *lost_pkts);
+                           struct list *lost_pkts, uint32_t *bytes_lost);
+int qc_release_lost_pkts(struct quic_conn *qc, struct quic_pktns *pktns,
+                         struct list *pkts, uint64_t now_us);
 #endif /* USE_QUIC */
 #endif /* _PROTO_QUIC_LOSS_H */

@@ -27,10 +27,11 @@
 #include <haproxy/cli.h>
 #include <haproxy/dgram.h>
 #include <haproxy/dns.h>
+#include <haproxy/dns_ring.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/log.h>
-#include <haproxy/ring.h>
+#include <haproxy/protocol.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
@@ -38,8 +39,8 @@
 
 static THREAD_LOCAL char *dns_msg_trash;
 
-DECLARE_STATIC_POOL(dns_session_pool, "dns_session", sizeof(struct dns_session));
-DECLARE_STATIC_POOL(dns_query_pool, "dns_query", sizeof(struct dns_query));
+DECLARE_STATIC_TYPED_POOL(dns_session_pool, "dns_session", struct dns_session);
+DECLARE_STATIC_TYPED_POOL(dns_query_pool, "dns_query", struct dns_query);
 DECLARE_STATIC_POOL(dns_msg_buf, "dns_msg_buf", DNS_TCP_MSG_RING_MAX_SIZE);
 
 /* Opens an UDP socket on the namesaver's IP/Port, if required. Returns 0 on
@@ -48,6 +49,7 @@ DECLARE_STATIC_POOL(dns_msg_buf, "dns_msg_buf", DNS_TCP_MSG_RING_MAX_SIZE);
 static int dns_connect_nameserver(struct dns_nameserver *ns)
 {
 	struct dgram_conn *dgram = &ns->dgram->conn;
+	const struct protocol *proto;
 	int fd;
 
 	/* Already connected */
@@ -55,18 +57,63 @@ static int dns_connect_nameserver(struct dns_nameserver *ns)
 		return 0;
 
 	/* Create an UDP socket and connect it on the nameserver's IP/Port */
-	if ((fd = socket(dgram->addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+	proto = protocol_lookup(dgram->addr.to.ss_family, PROTO_TYPE_DGRAM, 1);
+	BUG_ON(!proto);
+	if ((fd = socket(proto->fam->sock_domain, proto->sock_type, proto->sock_prot)) == -1) {
 		send_log(NULL, LOG_WARNING,
 			 "DNS : section '%s': can't create socket for nameserver '%s'.\n",
 			 ns->counters->pid, ns->id);
 		return -1;
 	}
-	if (connect(fd, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to)) == -1) {
-		send_log(NULL, LOG_WARNING,
-			 "DNS : section '%s': can't connect socket for nameserver '%s'.\n",
-			 ns->counters->id, ns->id);
+
+	switch (proto->fam->sock_domain) {
+	case AF_INET: {
+		struct sockaddr_in address = {
+			.sin_family = AF_INET,
+			.sin_port = 0,
+			.sin_addr = { .s_addr = INADDR_ANY }
+		};
+		if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't bind socket for nameserver '%s' on 0.0.0.0:0.\n",
+				 ns->counters->pid, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	}
+	case AF_INET6: {
+		struct sockaddr_in6 address6 = {
+			.sin6_family = AF_INET6,
+			.sin6_port = 0,
+			.sin6_addr = in6addr_any,
+			.sin6_flowinfo = 0,
+			.sin6_scope_id = 0
+		};
+		if (bind(fd, (struct sockaddr *)&address6, sizeof(address6)) < 0) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't bind socket for nameserver '%s' on :::0.\n",
+				 ns->counters->pid, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	}
+	case AF_UNIX:
+		/* if IPC is used via local domain sockets, we don't expect that
+		 * the path to DNS server socket can change dynamically.
+		 */
+		if (connect(fd, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to)) == -1) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't connect socket for nameserver '%s'.\n",
+				 ns->counters->id, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	default:
 		close(fd);
-		return -1;
+		BUG_ON(1, "DNS: Unsupported address family.");
 	}
 
 	/* Make the socket non blocking */
@@ -102,13 +149,23 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 			fd = dgram->t.sock.fd;
 		}
 
-		ret = send(fd, buf, len, 0);
+		if (dgram->addr.to.ss_family == AF_UNIX) {
+			/* we do connect for AF_UNIX sockets and from the man
+			 * sendto: "If sendto() is  used on a connection-mode
+			 * (SOCK_STREAM, SOCK_SEQPACKET) socket, the arguments
+			 * dest_addr and addrlen are ignored (and the error
+			 * EISCONN may be returned when they are not NULL and 0)..."
+			 */
+			ret = send(fd, buf, len, 0);
+		} else
+			ret = sendto(fd, buf, len, 0, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to));
+
 		if (ret < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				struct ist myist;
 
 				myist = ist2(buf, len);
-				ret = ring_write(ns->dgram->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
+				ret = dns_ring_write(ns->dgram->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
 				if (!ret) {
 					ns->counters->snd_error++;
 					HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
@@ -131,7 +188,7 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 		struct ist myist;
 
 		myist = ist2(buf, len);
-                ret = ring_write(ns->stream->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
+                ret = dns_ring_write(ns->stream->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
 		if (!ret) {
 			ns->counters->snd_error++;
 			return -1;
@@ -290,7 +347,7 @@ static void dns_resolve_send(struct dgram_conn *dgram)
 {
 	int fd;
 	struct dns_nameserver *ns;
-	struct ring *ring;
+	struct dns_ring *ring;
 	struct buffer *buf;
 	uint64_t msg_len;
 	size_t len, cnt, ofs;
@@ -407,21 +464,21 @@ int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk)
 	ns->dgram = dgram;
 
 	dgram->ofs_req = ~0; /* init ring offset */
-	dgram->ring_req = ring_new(2*DNS_TCP_MSG_RING_MAX_SIZE);
+	dgram->ring_req = dns_ring_new(2*DNS_TCP_MSG_RING_MAX_SIZE);
 	if (!dgram->ring_req) {
 		ha_alert("memory allocation error initializing the ring for nameserver.\n");
 		goto out;
 	}
 
 	/* attach the task as reader */
-	if (!ring_attach(dgram->ring_req)) {
+	if (!dns_ring_attach(dgram->ring_req)) {
 		/* mark server attached to the ring */
 		ha_alert("nameserver sets too many watchers > 255 on ring. This is a bug and should not happen.\n");
 		goto out;
 	}
 	return 0;
 out:
-	ring_free(dgram->ring_req);
+	dns_ring_free(dgram->ring_req);
 
 	free(dgram);
 
@@ -434,17 +491,16 @@ out:
  */
 static void dns_session_io_handler(struct appctx *appctx)
 {
-	struct stconn *sc = appctx_sc(appctx);
 	struct dns_session *ds = appctx->svcctx;
-	struct ring *ring = &ds->ring;
+	struct dns_ring *ring = &ds->ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
 	int available_room;
 	size_t len, cnt, ofs;
 	int ret = 0;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
-		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
+		applet_reset_input(appctx);
 		goto out;
 	}
 
@@ -463,15 +519,19 @@ static void dns_session_io_handler(struct appctx *appctx)
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
 	 */
-	if (sc_opposite(sc)->state < SC_ST_EST) {
+	if (se_fl_test(appctx->sedesc, SE_FL_APPLET_NEED_CONN)) {
 		applet_need_more_data(appctx);
-		se_need_remote_conn(appctx->sedesc);
+		applet_have_more_data(appctx);
+		goto out;
+	}
+
+	if (applet_get_outbuf(appctx) == NULL) {
 		applet_have_more_data(appctx);
 		goto out;
 	}
 
 	HA_RWLOCK_WRLOCK(DNS_LOCK, &ring->lock);
-	LIST_DEL_INIT(&appctx->wait_entry);
+	MT_LIST_DELETE(&appctx->wait_entry);
 	HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ring->lock);
 
 	HA_RWLOCK_RDLOCK(DNS_LOCK, &ring->lock);
@@ -517,7 +577,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 		BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
 
 		/* retrieve available room on output channel */
-		available_room = channel_recv_max(sc_ic(sc));
+		available_room = applet_output_room(appctx);
 
 		/* tx_msg_offset null means we are at the start of a new message */
 		if (!ds->tx_msg_offset) {
@@ -525,7 +585,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 			/* check if there is enough room to put message len and query id */
 			if (available_room < sizeof(slen) + sizeof(new_qid)) {
-				sc_need_room(sc, sizeof(slen) + sizeof(new_qid));
+				applet_have_more_data(appctx);
 				ret = 0;
 				break;
 			}
@@ -574,6 +634,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				LIST_APPEND(&ds->queries, &query->list);
 				eb32_insert(&ds->query_ids, &query->qid);
 				ds->onfly_queries++;
+				HA_ATOMIC_STORE(&ds->dss->consecutive_errors, 0);
 			}
 
 			/* update the tx_offset to handle output in 16k streams */
@@ -583,7 +644,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 		/* check if it remains available room on output chan */
 		if (unlikely(!available_room)) {
-			sc_need_room(sc, 1);
+			applet_have_more_data(appctx);
 			ret = 0;
 			break;
 		}
@@ -617,7 +678,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 		if (ds->tx_msg_offset) {
 			/* msg was not fully processed, we must  be awake to drain pending data */
-			sc_need_room(sc, 0);
+			applet_have_more_data(appctx);
 			ret = 0;
 			break;
 		}
@@ -633,8 +694,8 @@ static void dns_session_io_handler(struct appctx *appctx)
 	if (ret) {
 		/* let's be woken up once new request to write arrived */
 		HA_RWLOCK_WRLOCK(DNS_LOCK, &ring->lock);
-		BUG_ON(LIST_INLIST(&appctx->wait_entry));
-		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
+		BUG_ON(MT_LIST_INLIST(&appctx->wait_entry));
+		MT_LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ring->lock);
 		applet_have_no_more_data(appctx);
 	}
@@ -646,6 +707,11 @@ static void dns_session_io_handler(struct appctx *appctx)
 	 */
 	__ha_barrier_load();
 	if (!LIST_INLIST_ATOMIC(&ds->waiter)) {
+		if (applet_get_inbuf(appctx) == NULL) {
+			applet_need_more_data(appctx);
+			goto out;
+		}
+
 		while (1) {
 			uint16_t query_id;
 			struct eb32_node *eb;
@@ -653,7 +719,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 			if (!ds->rx_msg.len) {
 				/* retrieve message len */
-				ret = co_getblk(sc_oc(sc), (char *)&msg_len, 2, 0);
+				ret = applet_getblk(appctx, (char *)&msg_len, 2, 0);
 				if (ret <= 0) {
 					if (ret == -1)
 						goto error;
@@ -662,7 +728,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				}
 
 				/* mark as consumed */
-				co_skip(sc_oc(sc), 2);
+				applet_skip_input(appctx, 2);
 
 				/* store message len */
 				ds->rx_msg.len = ntohs(msg_len);
@@ -670,11 +736,11 @@ static void dns_session_io_handler(struct appctx *appctx)
 					continue;
 			}
 
-			if (co_data(sc_oc(sc)) + ds->rx_msg.offset < ds->rx_msg.len) {
+			if (applet_input_data(appctx) + ds->rx_msg.offset < ds->rx_msg.len) {
 				/* message only partially available */
 
 				/* read available data */
-				ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, co_data(sc_oc(sc)), 0);
+				ret = applet_getblk(appctx, ds->rx_msg.area + ds->rx_msg.offset, applet_input_data(appctx), 0);
 				if (ret <= 0) {
 					if (ret == -1)
 						goto error;
@@ -683,10 +749,10 @@ static void dns_session_io_handler(struct appctx *appctx)
 				}
 
 				/* update message offset */
-				ds->rx_msg.offset += co_data(sc_oc(sc));
+				ds->rx_msg.offset += applet_input_data(appctx);
 
 				/* consume all pending data from the channel */
-				co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+				applet_skip_input(appctx, applet_input_data(appctx));
 
 				/* we need to wait for more data */
 				applet_need_more_data(appctx);
@@ -696,7 +762,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			/* enough data is available into the channel to read the message until the end */
 
 			/* read from the channel until the end of the message */
-			ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			ret = applet_getblk(appctx, ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
 			if (ret <= 0) {
 				if (ret == -1)
 					goto error;
@@ -705,7 +771,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			}
 
 			/* consume all data until the end of the message from the channel */
-			co_skip(sc_oc(sc), ds->rx_msg.len - ds->rx_msg.offset);
+			applet_skip_input(appctx, ds->rx_msg.len - ds->rx_msg.offset);
 
 			/* reset reader offset to 0 for next message reand */
 			ds->rx_msg.offset = 0;
@@ -754,11 +820,12 @@ out:
 	return;
 
 close:
-	se_fl_set(appctx->sedesc, SE_FL_EOS|SE_FL_EOI);
+	applet_set_eos(appctx);
 	goto out;
 
 error:
-	se_fl_set(appctx->sedesc, SE_FL_ERROR);
+	applet_set_eos(appctx);
+	applet_set_error(appctx);
 	goto out;
 }
 
@@ -797,12 +864,12 @@ void dns_session_free(struct dns_session *ds)
 	BUG_ON(!LIST_ISEMPTY(&ds->list));
 	BUG_ON(!LIST_ISEMPTY(&ds->waiter));
 	BUG_ON(!LIST_ISEMPTY(&ds->queries));
-	BUG_ON(!LIST_ISEMPTY(&ds->ring.waiters));
+	BUG_ON(!MT_LIST_ISEMPTY(&ds->ring.waiters));
 	BUG_ON(!eb_is_empty(&ds->query_ids));
 	pool_free(dns_session_pool, ds);
 }
 
-static struct appctx *dns_session_create(struct dns_session *ds);
+static struct appctx *dns_session_create(struct dns_session *ds, int tempo);
 
 static int dns_session_init(struct appctx *appctx)
 {
@@ -819,14 +886,16 @@ static int dns_session_init(struct appctx *appctx)
 	s = appctx_strm(appctx);
 	s->scb->dst = addr;
 	s->scb->flags |= (SC_FL_RCV_ONCE|SC_FL_NOLINGER);
-	s->target = &ds->dss->srv->obj_type;
+	stream_set_srv_target(s, ds->dss->srv);
 	s->flags = SF_ASSIGNED;
 
 	s->do_log = NULL;
 	s->uniq_id = 0;
 
+	se_need_remote_conn(appctx->sedesc);
 	applet_expect_no_data(appctx);
 	ds->appctx = appctx;
+	appctx->t->expire = TICK_ETERNITY;
 	return 0;
 
   error:
@@ -840,16 +909,17 @@ static void dns_session_release(struct appctx *appctx)
 {
 	struct dns_session *ds = appctx->svcctx;
 	struct dns_stream_server *dss __maybe_unused;
+	int consecutive_errors;
 
 	if (!ds)
 		return;
 
-	/* We do not call ring_appctx_detach here
+	/* We do not call dns_ring_appctx_detach here
 	 * because we want to keep readers counters
 	 * to retry a conn with a different appctx.
 	 */
 	HA_RWLOCK_WRLOCK(DNS_LOCK, &ds->ring.lock);
-	LIST_DEL_INIT(&appctx->wait_entry);
+	MT_LIST_DELETE(&appctx->wait_entry);
 	HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ds->ring.lock);
 
 	dss = ds->dss;
@@ -902,13 +972,24 @@ static void dns_session_release(struct appctx *appctx)
 	/* reset offset to be sure to start from message start */
 	ds->tx_msg_offset = 0;
 
+	consecutive_errors = HA_ATOMIC_LOAD(&ds->dss->consecutive_errors);
+	/* we know ds encountered an error because it failed to send all
+	 * its queries: increase consecutive_errors (we take some precautions
+	 * to prevent the counter from overflowing since it is atomically
+	 * updated)
+	 */
+	while (consecutive_errors < DNS_MAX_DSS_CONSECUTIVE_ERRORS &&
+	       !HA_ATOMIC_CAS(&ds->dss->consecutive_errors,
+	                      &consecutive_errors, consecutive_errors + 1) &&
+	       __ha_cpu_relax());
+
 	/* here the ofs and the attached counter
 	 * are kept unchanged
 	 */
 
 	/* Create a new appctx, We hope we can
 	 * create from the release callback! */
-	ds->appctx = dns_session_create(ds);
+	ds->appctx = dns_session_create(ds, 1);
 	if (!ds->appctx) {
 		dns_session_free(ds);
 		HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
@@ -924,8 +1005,11 @@ static void dns_session_release(struct appctx *appctx)
 /* DNS tcp session applet */
 static struct applet dns_session_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<STRMDNS>", /* used for logging */
 	.fct = dns_session_io_handler,
+	.rcv_buf = appctx_raw_rcv_buf,
+	.snd_buf = appctx_raw_snd_buf,
 	.init = dns_session_init,
 	.release = dns_session_release,
 };
@@ -933,8 +1017,10 @@ static struct applet dns_session_applet = {
 /*
  * Function used to create an appctx for a DNS session
  * It sets its context into appctx->svcctx.
+ * if <tempo> is set, then the session startup will be delayed by 1
+ * second
  */
-static struct appctx *dns_session_create(struct dns_session *ds)
+static struct appctx *dns_session_create(struct dns_session *ds, int tempo)
 {
 	struct appctx *appctx;
 
@@ -943,10 +1029,14 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 		goto out_close;
 	appctx->svcctx = (void *)ds;
 
-	if (appctx_init(appctx) == -1) {
-		ha_alert("out of memory in dns_session_create().\n");
-		goto out_free_appctx;
+	if (!tempo) {
+		if (appctx_init(appctx) == -1) {
+			ha_alert("out of memory in dns_session_create().\n");
+			goto out_free_appctx;
+		}
 	}
+	else
+		appctx_schedule(appctx, tick_add(now_ms, MS_TO_TICKS(1000)));
 
 	return appctx;
 
@@ -1033,6 +1123,9 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	if (dss->maxconn && (dss->maxconn <= dss->cur_conns))
 		return NULL;
 
+	if (HA_ATOMIC_LOAD(&dss->consecutive_errors) >= DNS_MAX_DSS_CONSECUTIVE_ERRORS)
+		return NULL;
+
 	ds = pool_zalloc(dns_session_pool);
 	if (!ds)
 		return NULL;
@@ -1058,9 +1151,9 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	if (!ds->tx_ring_area)
 		goto error;
 
-	ring_init(&ds->ring, ds->tx_ring_area, DNS_TCP_MSG_RING_MAX_SIZE);
+	dns_ring_init(&ds->ring, ds->tx_ring_area, DNS_TCP_MSG_RING_MAX_SIZE);
 	/* never fail because it is the first watcher attached to the ring */
-	DISGUISE(ring_attach(&ds->ring));
+	DISGUISE(dns_ring_attach(&ds->ring));
 
 	if ((ds->task_exp = task_new_here()) == NULL)
 		goto error;
@@ -1068,7 +1161,7 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	ds->task_exp->process = dns_process_query_exp;
 	ds->task_exp->context = ds;
 
-	ds->appctx = dns_session_create(ds);
+	ds->appctx = dns_session_create(ds, 0);
 	if (!ds->appctx)
 		goto error;
 
@@ -1095,7 +1188,7 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned int 
 {
 	struct dns_nameserver *ns = (struct dns_nameserver *)context;
 	struct dns_stream_server *dss = ns->stream;
-	struct ring *ring = dss->ring_req;
+	struct dns_ring *ring = dss->ring_req;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
 	size_t len, cnt, ofs;
@@ -1151,7 +1244,7 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned int 
 		if (!LIST_ISEMPTY(&dss->free_sess)) {
 			ds = LIST_NEXT(&dss->free_sess, struct dns_session *, list);
 
-			if (ring_write(&ds->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1) > 0) {
+			if (dns_ring_write(&ds->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1) > 0) {
 				ds->nb_queries++;
 				if (ds->nb_queries >= DNS_STREAM_MAX_PIPELINED_REQ)
 					LIST_DEL_INIT(&ds->list);
@@ -1171,8 +1264,8 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned int 
 			if (!LIST_ISEMPTY(&dss->idle_sess)) {
 				ds = LIST_NEXT(&dss->idle_sess, struct dns_session *, list);
 
-				/* ring is empty so this ring_write should never fail */
-				ring_write(&ds->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
+				/* ring is empty so this dns_ring_write should never fail */
+				dns_ring_write(&ds->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
 				ds->nb_queries++;
 				LIST_DEL_INIT(&ds->list);
 
@@ -1196,8 +1289,8 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned int 
 			/* allocate a new session */
 			ads = dns_session_new(dss);
 			if (ads) {
-				/* ring is empty so this ring_write should never fail */
-				ring_write(&ads->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
+				/* ring is empty so this dns_ring_write should never fail */
+				dns_ring_write(&ads->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
 				ads->nb_queries++;
 				LIST_INSERT(&dss->free_sess, &ads->list);
 			}
@@ -1248,7 +1341,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 	dss->maxconn = srv->maxconn;
 
 	dss->ofs_req = ~0; /* init ring offset */
-	dss->ring_req = ring_new(2*DNS_TCP_MSG_RING_MAX_SIZE);
+	dss->ring_req = dns_ring_new(2*DNS_TCP_MSG_RING_MAX_SIZE);
 	if (!dss->ring_req) {
 		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
 		goto out;
@@ -1264,7 +1357,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 	dss->task_req->context = ns;
 
 	/* attach the task as reader */
-	if (!ring_attach(dss->ring_req)) {
+	if (!dns_ring_attach(dss->ring_req)) {
 		/* mark server attached to the ring */
 		ha_alert("server '%s': too many watchers for ring. this should never happen.\n", srv->id);
 		goto out;
@@ -1306,7 +1399,7 @@ out:
 	if (dss && dss->task_req)
 		task_destroy(dss->task_req);
 	if (dss && dss->ring_req)
-		ring_free(dss->ring_req);
+		dns_ring_free(dss->ring_req);
 
 	free(dss);
 	return -1;

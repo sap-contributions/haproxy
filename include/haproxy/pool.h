@@ -30,19 +30,80 @@
 #include <haproxy/pool-t.h>
 #include <haproxy/thread.h>
 
-/* This registers a call to create_pool_callback(ptr, name, size) */
+/* This creates a pool_reg registers a call to create_pool_callback(ptr) with it.
+ * Do not use this one, use REGISTER_POOL() instead.
+ */
+#define __REGISTER_POOL(_line, _ptr, _name, _size, _type_align, _align)    \
+	static struct pool_registration __pool_reg_##_line = { \
+		.name = _name,				       \
+		.file = __FILE__,			       \
+		.line = __LINE__,			       \
+		.size = _size,				       \
+		.flags = MEM_F_STATREG,			       \
+		.type_align = _type_align,		       \
+		.align = _align,			       \
+	};						       \
+	INITCALL3(STG_POOL, create_pool_callback, (_ptr), (_name), &__pool_reg_##_line);
+
+/* intermediary level for line number resolution, do not use this one, use
+ * REGISTER_POOL() instead.
+ */
+#define _REGISTER_POOL(line, ptr, name, size, align, type_align)	\
+	__REGISTER_POOL(line, ptr, name, size, align, type_align)
+
+/* This registers a call to create_pool_callback(ptr) with these args */
 #define REGISTER_POOL(ptr, name, size)  \
-	INITCALL3(STG_POOL, create_pool_callback, (ptr), (name), (size))
+	_REGISTER_POOL(__LINE__, ptr, name, size, 0, 0)
 
 /* This macro declares a pool head <ptr> and registers its creation */
 #define DECLARE_POOL(ptr, name, size)   \
 	struct pool_head *(ptr) __read_mostly = NULL; \
-	REGISTER_POOL(&ptr, name, size)
+	_REGISTER_POOL(__LINE__, &ptr, name, size, 0, 0)
 
 /* This macro declares a static pool head <ptr> and registers its creation */
 #define DECLARE_STATIC_POOL(ptr, name, size) \
 	static struct pool_head *(ptr) __read_mostly; \
-	REGISTER_POOL(&ptr, name, size)
+	_REGISTER_POOL(__LINE__, &ptr, name, size, 0, 0)
+
+/*** below are the aligned pool macros, taking one extra arg for alignment ***/
+
+/* This registers a call to create_pool_callback(ptr) with these args */
+#define REGISTER_ALIGNED_POOL(ptr, name, size, align)	\
+	_REGISTER_POOL(__LINE__, ptr, name, size, 0, align)
+
+/* This macro declares an aligned pool head <ptr> and registers its creation */
+#define DECLARE_ALIGNED_POOL(ptr, name, size, align)	      \
+	struct pool_head *(ptr) __read_mostly = NULL; \
+	_REGISTER_POOL(__LINE__, &ptr, name, size, 0, align)
+
+/* This macro declares a static aligned pool head <ptr> and registers its creation */
+#define DECLARE_STATIC_ALIGNED_POOL(ptr, name, size, align) \
+	static struct pool_head *(ptr) __read_mostly; \
+	_REGISTER_POOL(__LINE__, &ptr, name, size, 0, align)
+
+/*** below are the typed pool macros, taking a type and an extra size ***/
+
+/* This is only used by REGISTER_TYPED_POOL below */
+#define _REGISTER_TYPED_POOL(ptr, name, type, extra, align, ...)		\
+	_REGISTER_POOL(__LINE__, ptr, name, sizeof(type) + extra, __alignof__(type), align)
+
+/* This registers a call to create_pool_callback(ptr) with these args.
+ * It supports two optional args:
+ *  - extra: the extra size to be allocated at the end of the type. Def: 0.
+ *  - align: the desired alignment on the type. Def: 0 = same as type.
+ */
+#define REGISTER_TYPED_POOL(ptr, name, type, args...)	\
+	_REGISTER_TYPED_POOL(ptr, name, type, ##args, 0, 0)
+
+/* This macro declares an aligned pool head <ptr> and registers its creation */
+#define DECLARE_TYPED_POOL(ptr, name, type, args...)	      \
+	struct pool_head *(ptr) __read_mostly = NULL; \
+	_REGISTER_TYPED_POOL(&ptr, name, type, ##args, 0, 0)
+
+/* This macro declares a static aligned pool head <ptr> and registers its creation */
+#define DECLARE_STATIC_TYPED_POOL(ptr, name, type, args...)   \
+	static struct pool_head *(ptr) __read_mostly; \
+	_REGISTER_TYPED_POOL(&ptr, name, type, ##args, 0, 0)
 
 /* By default, free objects are linked by a pointer stored at the beginning of
  * the memory area. When DEBUG_MEMORY_POOLS is set, the allocated area is
@@ -77,7 +138,7 @@
 		if (likely(!(pool_debugging & POOL_DBG_TAG)))		\
 			break;						\
 		if (*(typeof(pool)*)(((char *)__i) + __p->size) != __p)	{ \
-			pool_inspect_item("tag mismatch on free()", pool, item, caller); \
+			pool_inspect_item("tag mismatch on free()", __p, __i, caller, -1); \
 			ABORT_NOW();					\
 		}							\
 	} while (0)
@@ -100,8 +161,14 @@
 /* poison each newly allocated area with this byte if >= 0 */
 extern int mem_poison_byte;
 
+/* trim() in progress */
+extern int pool_trim_in_progress;
+
 /* set of POOL_DBG_* flags */
 extern uint pool_debugging;
+
+/* pools are listed here */
+extern struct list pools;
 
 int malloc_trim(size_t pad);
 void trim_all_pools(void);
@@ -117,13 +184,21 @@ unsigned long long pool_total_allocated(void);
 unsigned long long pool_total_used(void);
 void pool_flush(struct pool_head *pool);
 void pool_gc(struct pool_head *pool_ctx);
-struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags);
-void create_pool_callback(struct pool_head **ptr, char *name, unsigned int size);
+struct pool_head *create_pool_with_loc(const char *name, unsigned int size, unsigned int align,
+                                       unsigned int flags, const char *file, unsigned int line);
+struct pool_head *create_pool_from_reg(const char *name, struct pool_registration *reg);
+void create_pool_callback(struct pool_head **ptr, char *name, struct pool_registration *reg);
 void *pool_destroy(struct pool_head *pool);
 void pool_destroy_all(void);
 void *__pool_alloc(struct pool_head *pool, unsigned int flags);
 void __pool_free(struct pool_head *pool, void *ptr);
-void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item, const void *caller);
+void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item, const void *caller, ssize_t ofs);
+
+#define create_pool(name, size, flags) \
+	create_pool_with_loc(name, size, 0, flags, __FILE__, __LINE__)
+
+#define create_aligned_pool(name, size, align, flags)			\
+	create_pool_with_loc(name, size, align, flags, __FILE__, __LINE__)
 
 
 /****************** Thread-local cache management ******************/
@@ -205,8 +280,8 @@ static inline uint pool_releasable(const struct pool_head *pool)
 
 	alloc = pool_allocated(pool);
 	used  = pool_used(pool);
-	if (used < alloc)
-		used = alloc;
+	if (used > alloc)
+		alloc = used;
 
 	needed_raw = pool_needed_avg(pool);
 	if (alloc < swrate_avg(needed_raw + needed_raw / 4, POOL_AVG_SAMPLES))

@@ -32,10 +32,14 @@ server s4 {
 } -start
 
 haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
   defaults
     mode http
     log global
-    option httplog
     timeout connect  "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout client   "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout server   "${HAPROXY_TEST_TIMEOUT-5s}"
@@ -63,7 +67,7 @@ haproxy h1 -conf {
 
     default_backend be1
 
-    backend be1
+  backend be1
     http-request redirect prefix %[var(txn.testvar)] code 301 if { var(txn.testvar) -m found }
     http-request deny
 

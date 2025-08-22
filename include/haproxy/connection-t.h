@@ -37,12 +37,14 @@
 #include <haproxy/port_range-t.h>
 #include <haproxy/protocol-t.h>
 #include <haproxy/show_flags-t.h>
+#include <haproxy/task-t.h>
 #include <haproxy/thread-t.h>
 
 /* referenced below */
 struct connection;
 struct stconn;
 struct sedesc;
+struct se_abort_info;
 struct cs_info;
 struct buffer;
 struct proxy;
@@ -53,14 +55,6 @@ struct quic_conn;
 struct bind_conf;
 struct qcs;
 struct ssl_sock_ctx;
-
-/* Note: subscribing to these events is only valid after the caller has really
- * attempted to perform the operation, and failed to proceed or complete.
- */
-enum sub_event_type {
-	SUB_RETRY_RECV       = 0x00000001,  /* Schedule the tasklet when we can attempt to recv again */
-	SUB_RETRY_SEND       = 0x00000002,  /* Schedule the tasklet when we can attempt to send again */
-};
 
 /* For each direction, we have a CO_FL_XPRT_<DIR>_ENA flag, which
  * indicates if read or write is desired in that direction for the respective
@@ -74,6 +68,50 @@ enum sub_event_type {
  * conn_cond_update_polling().
  */
 
+/* A bit of explanation is required for backend connection reuse. A connection
+ * may be shared between multiple streams of the same thread (e.g. h2, fcgi,
+ * quic) and may be reused by subsequent streams of a different thread if it
+ * is totally idle (i.e. not used at all). In order to permit other streams
+ * to find a connection, it has to appear in lists and/or trees that reflect
+ * its current state. If the connection is full and cannot be shared anymore,
+ * it is not in any of such places. The various states are the following:
+ *
+ * - private: a private connection is not visible to other threads. It is
+ *   attached via its <idle_list> member to the <conn_list> head of a
+ *   sess_priv_conns struct specific to the server, itself attached to the
+ *   session. Only other streams of the same session may find this connection.
+ *   Such connections include totally idle connections as well as connections
+ *   with available slots left. The <hash_node> part is still used to store
+ *   the hash key but the tree node part is otherwise left unused.
+ *
+ * - avail: an available connection is a connection that has at least one
+ *   stream in use and at least one slot available for a new stream. Such a
+ *   connection is indexed in the server's <avail_conns> member based on the
+ *   key of the hash_node. It cannot be used by other threads, and is not
+ *   present in the server's <idle_conn_list>, so its <idle_list> member is
+ *   always empty. Since this connection is in use by a single thread and
+ *   cannot be taken over, it doesn't require any locking to enter/leave the
+ *   tree.
+ *
+ * - safe: a safe connection is an idle connection that has proven that it
+ *   could reliably be reused. Such a connection may be taken over at any
+ *   instant by other threads, and must only be manipulated under the server's
+ *   <idle_lock>. It is indexed in the server's <safe_conns> member based on
+ *   the key of the hash_node. It is attached to the server's <idle_conn_list>
+ *   via its <idle_list> member. It may be purged after too long inactivity,
+ *   though the thread responsible for doing this will first take it over. Such
+ *   a connection has (conn->flags & CO_FL_LIST_MASK) = CO_FL_SAFE_LIST.
+ *
+ * - idle: a purely idle connection has not yet proven that it could reliably
+ *   be reused. Such a connection may be taken over at any instant by other
+ *   threads, and must only be manipulated under the server's <idle_lock>. It
+ *   is indexed in the server's <idle_conns> member based on the key of the
+ *   hash_node. It is attached to the server's <idle_conn_list> via its
+ *   <idle_list> member. It may be purged after too long inactivity, though the
+ *   thread responsible for doing this will first take it over. Such a
+ *   connection has (conn->flags & CO_FL_LIST_MASK) = CO_FL_IDLE_LIST.
+ */
+
 /* flags for use in connection->flags. Please also update the conn_show_flags()
  * function below in case of changes.
  */
@@ -85,11 +123,13 @@ enum {
 	CO_FL_IDLE_LIST     = 0x00000002,  /* 2 = in idle_list, 3 = invalid */
 	CO_FL_LIST_MASK     = 0x00000003,  /* Is the connection in any server-managed list ? */
 
-	CO_FL_REVERSED      = 0x00000004,  /* connection has been reversed but not yet accepted */
-	/* unused : 0x00000008 */
+	CO_FL_REVERSED      = 0x00000004,  /* connection has been reversed to backend / reversed and accepted on frontend */
+	CO_FL_ACT_REVERSING = 0x00000008,  /* connection has been reversed to frontend but not yet accepted */
 
-	/* unused : 0x00000010 */
-	/* unused : 0x00000020 */
+	CO_FL_OPT_MARK      = 0x00000010,  /* connection has a special sockopt mark */
+
+	CO_FL_OPT_TOS       = 0x00000020,  /* connection has a special sockopt tos */
+
 	/* unused : 0x00000040, 0x00000080 */
 
 	/* These flags indicate whether the Control and Transport layers are initialized */
@@ -104,8 +144,7 @@ enum {
 	 */
 	CO_FL_WAIT_ROOM     = 0x00000800,  /* data sink is full */
 
-	/* These flags are used to report whether the from/to addresses are set or not */
-	/* unused: 0x00001000 */
+	CO_FL_WANT_SPLICING = 0x00001000,  /* we wish to use splicing on the connection when possible */
 	/* unused: 0x00002000 */
 
 	CO_FL_EARLY_SSL_HS  = 0x00004000,  /* We have early data pending, don't start SSL handshake yet */
@@ -171,13 +210,15 @@ static forceinline char *conn_show_flags(char *buf, size_t len, const char *deli
 	/* prologue */
 	_(0);
 	/* flags */
-	_(CO_FL_SAFE_LIST, _(CO_FL_IDLE_LIST, _(CO_FL_CTRL_READY, _(CO_FL_XPRT_READY,
-	_(CO_FL_WANT_DRAIN, _(CO_FL_WAIT_ROOM, _(CO_FL_EARLY_SSL_HS, _(CO_FL_EARLY_DATA,
-	_(CO_FL_SOCKS4_SEND, _(CO_FL_SOCKS4_RECV, _(CO_FL_SOCK_RD_SH, _(CO_FL_SOCK_WR_SH,
-	_(CO_FL_ERROR, _(CO_FL_FDLESS, _(CO_FL_WAIT_L4_CONN, _(CO_FL_WAIT_L6_CONN,
-	_(CO_FL_SEND_PROXY, _(CO_FL_ACCEPT_PROXY, _(CO_FL_ACCEPT_CIP, _(CO_FL_SSL_WAIT_HS,
-	_(CO_FL_PRIVATE, _(CO_FL_RCVD_PROXY, _(CO_FL_SESS_IDLE, _(CO_FL_XPRT_TRACKED
-	))))))))))))))))))))))));
+	_(CO_FL_SAFE_LIST, _(CO_FL_IDLE_LIST, _(CO_FL_CTRL_READY,
+	_(CO_FL_REVERSED, _(CO_FL_ACT_REVERSING, _(CO_FL_OPT_MARK, _(CO_FL_OPT_TOS,
+	_(CO_FL_XPRT_READY, _(CO_FL_WANT_DRAIN, _(CO_FL_WAIT_ROOM, _(CO_FL_EARLY_SSL_HS,
+	_(CO_FL_EARLY_DATA, _(CO_FL_SOCKS4_SEND, _(CO_FL_SOCKS4_RECV, _(CO_FL_SOCK_RD_SH,
+	_(CO_FL_SOCK_WR_SH, _(CO_FL_ERROR, _(CO_FL_FDLESS, _(CO_FL_WAIT_L4_CONN,
+	_(CO_FL_WAIT_L6_CONN, _(CO_FL_SEND_PROXY, _(CO_FL_ACCEPT_PROXY, _(CO_FL_ACCEPT_CIP,
+	_(CO_FL_SSL_WAIT_HS, _(CO_FL_PRIVATE, _(CO_FL_RCVD_PROXY, _(CO_FL_SESS_IDLE,
+	_(CO_FL_XPRT_TRACKED
+	))))))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -240,9 +281,22 @@ enum {
 	CO_ER_SOCKS4_DENY,       /* SOCKS4 Proxy deny the request */
 	CO_ER_SOCKS4_ABORT,      /* SOCKS4 Proxy handshake aborted by server */
 
-	CO_ERR_SSL_FATAL,        /* SSL fatal error during a SSL_read or SSL_write */
+	CO_ER_SSL_FATAL,         /* SSL fatal error during a SSL_read or SSL_write */
 
 	CO_ER_REVERSE,           /* Error during reverse connect */
+
+	CO_ER_POLLERR,           /* we only noticed POLLERR */
+	CO_ER_EREFUSED,          /* ECONNREFUSED returned to recv/send */
+	CO_ER_ERESET,            /* ECONNRESET returned to recv/send */
+	CO_ER_EUNREACH,          /* ENETUNREACH returned to recv/send */
+	CO_ER_ENOMEM,            /* ENOMEM returned to recv/send */
+	CO_ER_EBADF,             /* EBADF returned to recv/send (serious bug) */
+	CO_ER_EFAULT,            /* EFAULT returned to recv/send (serious bug) */
+	CO_ER_EINVAL,            /* EINVAL returned to recv/send (serious bug) */
+	CO_ER_ENCONN,            /* ENCONN returned to recv/send */
+	CO_ER_ENSOCK,            /* ENSOCK returned to recv/send */
+	CO_ER_ENOBUFS,           /* ENOBUFS returned to send */
+	CO_ER_EPIPE,             /* EPIPE returned to send */
 };
 
 /* error return codes for accept_conn() */
@@ -274,24 +328,14 @@ enum {
 	CO_RFL_READ_ONCE     = 0x0004,    /* don't loop even if the request/response is small */
 	CO_RFL_KEEP_RECV     = 0x0008,    /* Instruct the mux to still wait for read events  */
 	CO_RFL_BUF_NOT_STUCK = 0x0010,    /* Buffer is not stuck. Optims are possible during data copy */
+	CO_RFL_MAY_SPLICE    = 0x0020,    /* The producer can use the kernel splicing */
 };
 
 /* flags that can be passed to xprt->snd_buf() and mux->snd_buf() */
 enum {
 	CO_SFL_MSG_MORE    = 0x0001,    /* More data to come afterwards */
 	CO_SFL_STREAMER    = 0x0002,    /* Producer is continuously streaming data */
-};
-
-/* mux->shutr() modes */
-enum co_shr_mode {
-	CO_SHR_DRAIN        = 0,           /* read shutdown, drain any extra stuff */
-	CO_SHR_RESET        = 1,           /* read shutdown, reset any extra stuff */
-};
-
-/* mux->shutw() modes */
-enum co_shw_mode {
-	CO_SHW_NORMAL       = 0,           /* regular write shutdown */
-	CO_SHW_SILENT       = 1,           /* imminent close, don't notify peer */
+	CO_SFL_LAST_DATA   = 0x0003,    /* Sent data are the last ones, shutdown is pending */
 };
 
 /* known transport layers (for ease of lookup) */
@@ -318,7 +362,8 @@ enum proto_proxy_mode {
 	PROTO_MODE_NONE = 0,
 	PROTO_MODE_TCP  = 1 << 0, // must not be changed!
 	PROTO_MODE_HTTP = 1 << 1, // must not be changed!
-	PROTO_MODE_ANY  = PROTO_MODE_TCP | PROTO_MODE_HTTP,
+	PROTO_MODE_SPOP = 1 << 2, // must not be changed!
+	PROTO_MODE_ANY  = PROTO_MODE_TCP | PROTO_MODE_HTTP | PROTO_MODE_SPOP,
 };
 
 enum proto_proxy_side {
@@ -330,10 +375,29 @@ enum proto_proxy_side {
 
 /* ctl command used by mux->ctl() */
 enum mux_ctl_type {
-	MUX_STATUS, /* Expects an int as output, sets it to a combinaison of MUX_STATUS flags */
-	MUX_EXIT_STATUS, /* Expects an int as output, sets the mux exist/error/http status, if known or 0 */
-	MUX_REVERSE_CONN, /* Notify about an active reverse connection accepted. */
+	MUX_CTL_STATUS, /* Expects an int as output, sets it to a combination of MUX_CTL_STATUS flags */
+	MUX_CTL_EXIT_STATUS, /* Expects an int as output, sets the mux exist/error/http status, if known or 0 */
+	MUX_CTL_REVERSE_CONN, /* Notify about an active reverse connection accepted. */
+	MUX_CTL_SUBS_RECV, /* Notify the mux it must wait for read events again  */
+	MUX_CTL_GET_GLITCHES, /* returns number of glitches on the connection */
+	MUX_CTL_GET_NBSTRM, /* Return the current number of streams on the connection */
+	MUX_CTL_GET_MAXSTRM, /* Return the max number of streams supported by the connection */
+	MUX_CTL_TEVTS, /* Return the termination events log of the mux connection */
 };
+
+/* sctl command used by mux->sctl() */
+enum mux_sctl_type {
+	MUX_SCTL_SID, /* Return the mux stream ID as output, as a signed 64bits integer */
+	MUX_SCTL_DBG_STR,    /* takes a mux_sctl_dbg_str_ctx argument, reads flags and returns debug info */
+	MUX_SCTL_TEVTS, /* Return the termination events log of the mux stream */
+};
+
+#define MUX_SCTL_DBG_STR_L_MUXS  0x00000001  // info from mux stream
+#define MUX_SCTL_DBG_STR_L_MUXC  0x00000002  // info from mux connection
+#define MUX_SCTL_DBG_STR_L_XPRT  0x00000004  // info from xprt layer
+#define MUX_SCTL_DBG_STR_L_CONN  0x00000008  // info from struct connection layer
+#define MUX_SCTL_DBG_STR_L_SOCK  0x00000010  // info from socket layer (quic_conn as well)
+
 
 /* response for ctl MUX_STATUS */
 #define MUX_STATUS_READY (1 << 0)
@@ -359,16 +423,6 @@ struct socks4_request {
 	char user_id[8];	/* the user ID string, variable length, terminated with a null (0x00); Using "HAProxy\0" */
 };
 
-/* Describes a set of subscriptions. Multiple events may be registered at the
- * same time. The callee should assume everything not pending for completion is
- * implicitly possible. It's illegal to change the tasklet if events are still
- * registered.
- */
-struct wait_event {
-	struct tasklet *tasklet;
-	int events;             /* set of enum sub_event_type above */
-};
-
 /* A connection handle is how we differentiate two connections on the lower
  * layers. It usually is a file descriptor but can be a connection id. The
  * CO_FL_FDLESS flag indicates which one is relevant.
@@ -378,16 +432,26 @@ union conn_handle {
 	int fd;                 /* file descriptor, for regular sockets (CO_FL_FDLESS=0) */
 };
 
+enum xprt_capabilities {
+	XPRT_CAN_SPLICE,
+};
+
+enum xprt_splice_cap {
+	XPRT_CONN_CAN_NOT_SPLICE, /* This connection can't, and won't ever be able to splice */
+	XPRT_CONN_COULD_SPLICE, /* This connection can't splice, but may later */
+	XPRT_CONN_CAN_SPLICE /* This connection can splice */
+};
+
 /* xprt_ops describes transport-layer operations for a connection. They
  * generally run over a socket-based control layer, but not always. Some
  * of them are used for data transfer with the upper layer (rcv_*, snd_*)
  * and the other ones are used to setup and release the transport layer.
  */
 struct xprt_ops {
-	size_t (*rcv_buf)(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags); /* recv callback */
-	size_t (*snd_buf)(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags); /* send callback */
+	size_t (*rcv_buf)(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, void *msg_control, size_t *msg_controllen, int flags); /* recv callback */
+	size_t (*snd_buf)(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, void *msg_control, size_t msg_controllen, int flags); /* send callback */
 	int  (*rcv_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
-	int  (*snd_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe); /* send-to-pipe callback */
+	int  (*snd_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count); /* send-to-pipe callback */
 	void (*shutr)(struct connection *conn, void *xprt_ctx, int);    /* shutr function */
 	void (*shutw)(struct connection *conn, void *xprt_ctx, int);    /* shutw function */
 	void (*close)(struct connection *conn, void *xprt_ctx);         /* close the transport layer */
@@ -398,7 +462,7 @@ struct xprt_ops {
 	int  (*prepare_srv)(struct server *srv);    /* prepare a server context */
 	void (*destroy_srv)(struct server *srv);    /* destroy a server context */
 	int  (*get_alpn)(const struct connection *conn, void *xprt_ctx, const char **str, int *len); /* get application layer name */
-	int (*takeover)(struct connection *conn, void *xprt_ctx, int orig_tid); /* Let the xprt know the fd have been taken over */
+	int (*takeover)(struct connection *conn, void *xprt_ctx, int orig_tid, int release); /* Let the xprt know the fd have been taken over */
 	void (*set_idle)(struct connection *conn, void *xprt_ctx); /* notify the xprt that the connection becomes idle. implies set_used. */
 	void (*set_used)(struct connection *conn, void *xprt_ctx); /* notify the xprt that the connection leaves idle. implies set_idle. */
 	char name[8];                               /* transport layer name, zero-terminated */
@@ -408,6 +472,13 @@ struct xprt_ops {
 	int (*add_xprt)(struct connection *conn, void *xprt_ctx, void *toadd_ctx, const struct xprt_ops *toadd_ops, void **oldxprt_ctx, const struct xprt_ops **oldxprt_ops); /* Add a new XPRT as the new xprt, and return the old one */
 	struct ssl_sock_ctx *(*get_ssl_sock_ctx)(struct connection *); /* retrieve the ssl_sock_ctx in use, or NULL if none */
 	int (*show_fd)(struct buffer *, const struct connection *, const void *ctx); /* append some data about xprt for "show fd"; returns non-zero if suspicious */
+	void (*dump_info)(struct buffer *, const struct connection *);
+	/*
+	 * Returns the value for various capabilities.
+	 * Returns 0 if the capability is known, iwth the actual value in arg,
+	 * or -1 otherwise
+	 */
+	int (*get_capability)(struct connection *connection, void *xprt_ctx, enum xprt_capabilities, void *arg);
 };
 
 /* mux_ops describes the mux operations, which are to be performed at the
@@ -422,10 +493,11 @@ struct mux_ops {
 	int  (*wake)(struct connection *conn);        /* mux-layer callback to report activity, mandatory */
 	size_t (*rcv_buf)(struct stconn *sc, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to get data */
 	size_t (*snd_buf)(struct stconn *sc, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to send data */
-	int  (*rcv_pipe)(struct stconn *sc, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
-	int  (*snd_pipe)(struct stconn *sc, struct pipe *pipe); /* send-to-pipe callback */
-	void (*shutr)(struct stconn *sc, enum co_shr_mode);     /* shutr function */
-	void (*shutw)(struct stconn *sc, enum co_shw_mode);     /* shutw function */
+	size_t (*nego_fastfwd)(struct stconn *sc, struct buffer *input, size_t count, unsigned int may_splice); /* Callback to fill the SD iobuf */
+	size_t (*done_fastfwd)(struct stconn *sc); /* Callback to terminate fast data forwarding */
+	int (*fastfwd)(struct stconn *sc, unsigned int count, unsigned int flags); /* Callback to init fast data forwarding */
+	int (*resume_fastfwd)(struct stconn *sc, unsigned int flags); /* Callback to resume fast data forwarding */
+	void (*shut)(struct stconn *sc, unsigned int mode, struct se_abort_info *reason); /* shutdown function */
 
 	int (*attach)(struct connection *conn, struct sedesc *, struct session *sess); /* attach a stconn to an outgoing connection */
 	struct stconn *(*get_first_sc)(const struct connection *); /* retrieves any valid stconn from this connection */
@@ -434,13 +506,17 @@ struct mux_ops {
 	int (*show_sd)(struct buffer *, struct sedesc *, const char *pfx); /* append some data about the mux stream into chunk for "show sess"; returns non-zero if suspicious */
 	int (*subscribe)(struct stconn *sc, int event_type,  struct wait_event *es); /* Subscribe <es> to events, such as "being able to send" */
 	int (*unsubscribe)(struct stconn *sc, int event_type,  struct wait_event *es); /* Unsubscribe <es> from events */
+	int (*sctl)(struct stconn *sc, enum mux_sctl_type mux_sctl, void *arg); /* Provides information about the mux stream */
 	int (*avail_streams)(struct connection *conn); /* Returns the number of streams still available for a connection */
-	int (*avail_streams_bidi)(struct connection *conn); /* Returns the number of bidirectional streams still available for a connection */
-	int (*avail_streams_uni)(struct connection *conn); /* Returns the number of unidirectional streams still available for a connection */
 	int (*used_streams)(struct connection *conn);  /* Returns the number of streams in use on a connection. */
 	void (*destroy)(void *ctx); /* Let the mux know one of its users left, so it may have to disappear */
-	int (*ctl)(struct connection *conn, enum mux_ctl_type mux_ctl, void *arg); /* Provides information about the mux */
-	int (*takeover)(struct connection *conn, int orig_tid); /* Attempts to migrate the connection to the current thread */
+	int (*ctl)(struct connection *conn, enum mux_ctl_type mux_ctl, void *arg); /* Provides information about the mux connection */
+
+	/* Attempts to migrate <conn> from <orig_tid> to the current thread. If
+	 * <release> is true, it will be destroyed immediately after by caller.
+	 */
+	int (*takeover)(struct connection *conn, int orig_tid, int release);
+
 	unsigned int flags;                           /* some flags characterizing the mux's capabilities (MX_FL_*) */
 	char name[8];                                 /* mux layer name, zero-terminated */
 };
@@ -479,14 +555,15 @@ struct conn_src {
  * CAUTION! Always update CONN_HASH_PARAMS_TYPE_COUNT when adding a new entry.
  */
 enum conn_hash_params_t {
-	CONN_HASH_PARAMS_TYPE_SNI      = 0x1,
+	CONN_HASH_PARAMS_TYPE_NAME     = 0x1,
 	CONN_HASH_PARAMS_TYPE_DST_ADDR = 0x2,
 	CONN_HASH_PARAMS_TYPE_DST_PORT = 0x4,
 	CONN_HASH_PARAMS_TYPE_SRC_ADDR = 0x8,
 	CONN_HASH_PARAMS_TYPE_SRC_PORT = 0x10,
 	CONN_HASH_PARAMS_TYPE_PROXY    = 0x20,
+	CONN_HASH_PARAMS_TYPE_MARK_TOS = 0x40,
 };
-#define CONN_HASH_PARAMS_TYPE_COUNT 6
+#define CONN_HASH_PARAMS_TYPE_COUNT 7
 
 #define CONN_HASH_PAYLOAD_LEN \
 	(((sizeof(((struct conn_hash_node *)0)->node.key)) * 8) - CONN_HASH_PARAMS_TYPE_COUNT)
@@ -499,8 +576,9 @@ enum conn_hash_params_t {
  * connection hash.
  */
 struct conn_hash_params {
-	uint64_t sni_prehash;
+	uint64_t name_prehash;
 	uint64_t proxy_prehash;
+	uint64_t mark_tos_prehash;
 	void *target;
 	struct sockaddr_storage *src_addr;
 	struct sockaddr_storage *dst_addr;
@@ -518,6 +596,7 @@ struct conn_tlv_list {
 	unsigned char type;
 	char value[0];
 } __attribute__((packed));
+
 
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
@@ -547,7 +626,7 @@ struct connection {
 		struct mt_list toremove_list; /* list element when idle connection is ready to be purged */
 	};
 	union {
-		struct list session_list;  /* used by backend conns, list of attached connections to a session */
+		struct list sess_el;       /* used by private backend conns, list elem into session */
 		struct list stopping_list; /* used by frontend conns, attach point in mux stopping list */
 	};
 	union conn_handle handle;     /* connection handle at the socket layer */
@@ -569,6 +648,10 @@ struct connection {
 		enum obj_type *target; /* Listener for active reverse, server for passive. */
 		struct buffer name;    /* Only used for passive reverse. Used as SNI when connection added to server idle pool. */
 	} reverse;
+
+	uint32_t term_evts_log;        /* Termination events log: first 4 events reported from fd, handshake or xprt */
+	uint32_t mark;                 /* set network mark, if CO_FL_OPT_MARK is set */
+	uint8_t tos;                   /* set ip tos, if CO_FL_OPT_TOS is set */
 };
 
 /* node for backend connection in the idle trees for http-reuse
@@ -646,8 +729,8 @@ struct mux_proto_list {
 #define TLV_HEADER_SIZE 3
 
 #define HA_PP2_AUTHORITY_MAX 255  /* Maximum length of an authority TLV */
-#define HA_PP2_TLV_VALUE_128 128  /* E.g., accomodate unique IDs (128 B) */
-#define HA_PP2_TLV_VALUE_256 256  /* E.g., accomodate authority TLVs (currently, <= 255 B) */
+#define HA_PP2_TLV_VALUE_128 128  /* E.g., accommodate unique IDs (128 B) */
+#define HA_PP2_TLV_VALUE_256 256  /* E.g., accommodate authority TLVs (currently, <= 255 B) */
 #define HA_PP2_MAX_ALLOC     1024 /* Maximum TLV value for PPv2 to prevent DoS */
 
 struct proxy_hdr_v2 {
@@ -689,6 +772,15 @@ struct tlv_ssl {
 	uint8_t sub_tlv[VAR_ARRAY];
 }__attribute__((packed));
 
+/* context for a MUX_SCTL_DBG_STR call */
+union mux_sctl_dbg_str_ctx {
+	struct {
+		uint debug_flags; // union of MUX_SCTL_DBG_STR_L_*
+	} arg; // sctl argument for the call
+	struct {
+		struct buffer buf;
+	} ret; // sctl return contents
+};
 
 /* This structure is used to manage idle connections, their locking, and the
  * list of such idle connections to be removed. It is per-thread and must be
@@ -699,6 +791,102 @@ struct idle_conns {
 	struct task *cleanup_task;
 	__decl_thread(HA_SPINLOCK_T idle_conns_lock);
 } THREAD_ALIGNED(64);
+
+
+/* Termination events logs:
+ * Each event is stored on 8 bits: 4 bits bor the event location and
+ * 4 bits for the event type.
+ */
+
+/* Locations for termination event logs (4-bits). But only 7 locations are
+ * supported because 1 bit is reserved to distinguish frontend to backend
+ * events: the msb is set to 1 for backend events.
+ */
+enum term_event_loc {
+	tevt_loc_fd    = 1,
+	tevt_loc_hs    = 2,
+	tevt_loc_xprt  = 3,
+	tevt_loc_muxc  = 4,
+	tevt_loc_se    = 5,
+	tevt_loc_strm  = 6,
+};
+
+/* Types for termination event logs (4-bits) per location */
+enum fd_term_event_type {
+	fd_tevt_type_shutw       = 1,
+	fd_tevt_type_shutr       = 2,
+	fd_tevt_type_rcv_err     = 3,
+	fd_tevt_type_snd_err     = 4,
+	/* unused: 5, 6 */
+	fd_tevt_type_connect_err = 7,
+	fd_tevt_type_intercepted = 8,
+
+	fd_tevt_type_connect_poll_err  =  9,
+	fd_tevt_type_poll_err          = 10,
+	fd_tevt_type_poll_hup          = 11,
+};
+
+enum hs_term_event_type {
+	/* unused: 1, 2, 3 */
+	hs_tevt_type_snd_err           = 4,
+	hs_tevt_type_truncated_shutr   = 5,
+	hs_tevt_type_truncated_rcv_err = 6,
+};
+
+enum xprt_term_event_type {
+	xprt_tevt_type_shutw   = 1,
+	xprt_tevt_type_shutr   = 2,
+	xprt_tevt_type_rcv_err = 3,
+	xprt_tevt_type_snd_err = 4,
+};
+
+enum muxc_term_event_type {
+	muxc_tevt_type_shutw            =  1,
+	muxc_tevt_type_shutr            =  2,
+	muxc_tevt_type_rcv_err          =  3,
+	muxc_tevt_type_snd_err          =  4,
+	muxc_tevt_type_truncated_shutr  =  5,
+	muxc_tevt_type_truncated_rcv_err=  6,
+
+	muxc_tevt_type_tout             =  7,
+	muxc_tevt_type_goaway_rcvd      =  8,
+	muxc_tevt_type_proto_err        =  9,
+	muxc_tevt_type_internal_err     = 10,
+	muxc_tevt_type_other_err        = 11,
+	muxc_tevt_type_graceful_shut    = 12,
+};
+
+enum se_term_event_type {
+	se_tevt_type_shutw            =  1,
+	se_tevt_type_eos              =  2,
+	se_tevt_type_rcv_err          =  3,
+	se_tevt_type_snd_err          =  4,
+	se_tevt_type_truncated_eos    =  5,
+	se_tevt_type_truncated_rcv_err=  6,
+	/* unused: 7 */
+	se_tevt_type_rst_rcvd         =  8,
+	se_tevt_type_proto_err        =  9,
+	se_tevt_type_internal_err     = 10,
+	se_tevt_type_other_err        = 11,
+	se_tevt_type_cancelled        = 12,
+};
+
+enum strm_term_event_type {
+	strm_tevt_type_shutw            =  1,
+	strm_tevt_type_eos              =  2,
+	strm_tevt_type_rcv_err          =  3,
+	strm_tevt_type_snd_err          =  4,
+	strm_tevt_type_truncated_eos    =  5,
+	strm_tevt_type_truncated_rcv_err=  6,
+
+	strm_tevt_type_tout             =  7,
+	strm_tevt_type_intercepted      =  8,
+
+	strm_tevt_type_proto_err        =  9,
+	strm_tevt_type_internal_err     = 10,
+	strm_tevt_type_other_err        = 11,
+	strm_tevt_type_aborted          = 12,
+};
 
 #endif /* _HAPROXY_CONNECTION_T_H */
 

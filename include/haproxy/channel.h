@@ -34,7 +34,7 @@
 
 struct stconn;
 
-/* perform minimal intializations, report 0 in case of error, 1 if OK. */
+/* perform minimal initializations, report 0 in case of error, 1 if OK. */
 int init_channel();
 
 unsigned long long __channel_forward(struct channel *chn, unsigned long long bytes);
@@ -44,6 +44,7 @@ int ci_putblk(struct channel *chn, const char *str, int len);
 int ci_putchr(struct channel *chn, char c);
 int ci_getline_nc(const struct channel *chn, char **blk1, size_t *len1, char **blk2, size_t *len2);
 int ci_getblk_nc(const struct channel *chn, char **blk1, size_t *len1, char **blk2, size_t *len2);
+int ci_insert(struct channel *c, int pos, const char *str, int len);
 int ci_insert_line2(struct channel *c, int pos, const char *str, int len);
 int co_inject(struct channel *chn, const char *msg, int len);
 int co_getchar(const struct channel *chn, char *c);
@@ -323,7 +324,6 @@ static inline void channel_init(struct channel *chn)
 	chn->last_read = now_ms;
 	chn->xfer_small = chn->xfer_large = 0;
 	chn->total = 0;
-	chn->pipe = NULL;
 	chn->analysers = 0;
 	chn->flags = 0;
 	chn->output = 0;
@@ -402,16 +402,6 @@ static inline void channel_htx_forward_forever(struct channel *chn, struct htx *
 /*********************************************************************/
 /* These functions are used to compute various channel content sizes */
 /*********************************************************************/
-
-/* Reports non-zero if the channel is empty, which means both its
- * buffer and pipe are empty. The construct looks strange but is
- * jump-less and much more efficient on both 32 and 64-bit than
- * the boolean test.
- */
-static inline unsigned int channel_is_empty(const struct channel *c)
-{
-	return !(co_data(c) | (long)c->pipe);
-}
 
 /* Returns non-zero if the channel is rewritable, which means that the buffer
  * it is attached to has at least <maxrewrite> bytes immediately available.
@@ -704,7 +694,7 @@ static inline int channel_htx_recv_limit(const struct channel *chn, const struct
 	unsigned int transit;
 	int reserve;
 
-	/* return zeor if not allocated */
+	/* return zero if not allocated */
 	if (!htx->size)
 		return 0;
 
@@ -793,6 +783,106 @@ static inline int channel_recv_max(const struct channel *chn)
 	return ret;
 }
 
+/* Returns the maximum absolute amount of data that can be copied in a channel,
+ * taking the reserved space into account but also the HTX overhead for HTX
+ * streams.
+ */
+static inline size_t channel_data_limit(const struct channel *chn)
+{
+	size_t max = (global.tune.bufsize - global.tune.maxrewrite);
+
+	if (IS_HTX_STRM(chn_strm(chn)))
+		max -= HTX_BUF_OVERHEAD;
+	return max;
+}
+
+/* Returns the amount of data in a channel, taking the HTX streams into
+ * account. For raw channels, it is equivalent to c_data. For HTX channels, we
+ * rely on the HTX api.
+ */
+static inline size_t channel_data(const struct channel *chn)
+{
+	return (IS_HTX_STRM(chn_strm(chn)) ? htx_used_space(htxbuf(&chn->buf)) : c_data(chn));
+}
+
+/* Returns the amount of input data in a channel, taking he HTX streams into
+ * account. This function relies on channel_data().
+ */
+static inline size_t channel_input_data(const struct channel *chn)
+{
+	return channel_data(chn) - co_data(chn);
+}
+
+/* Returns 1 if the channel is empty, taking he HTX streams into account */
+static inline size_t channel_empty(const struct channel *chn)
+{
+	return (IS_HTX_STRM(chn) ? htx_is_empty(htxbuf(&chn->buf)) : c_empty(chn));
+}
+
+/* Check channel's last_read date against the idle timeer to verify the producer
+ * is still streaming data or not
+ */
+static inline void channel_check_idletimer(struct channel *chn)
+{
+	if ((chn->flags & (CF_STREAMER | CF_STREAMER_FAST)) && !co_data(chn) &&
+	    global.tune.idle_timer &&
+	    (unsigned short)(now_ms - chn->last_read) >= global.tune.idle_timer) {
+		/* The buffer was empty and nothing was transferred for more
+		 * than one second. This was caused by a pause and not by
+		 * congestion. Reset any streaming mode to reduce latency.
+		 */
+		chn->xfer_small = 0;
+		chn->xfer_large = 0;
+		chn->flags &= ~(CF_STREAMER | CF_STREAMER_FAST);
+	}
+}
+
+/* Check amount of transferred data after a receive. If <xferred> is greater
+ * than 0, the <last_read> date is updated and STREAMER flags for the channels
+ * are verified.
+ */
+static inline void channel_check_xfer(struct channel *chn, size_t xferred)
+{
+	if (!xferred)
+		return;
+
+	if ((chn->flags & (CF_STREAMER | CF_STREAMER_FAST)) &&
+	    (xferred <= c_size(chn) / 2)) {
+		chn->xfer_large = 0;
+		chn->xfer_small++;
+		if (chn->xfer_small >= 3) {
+			/* we have read less than half of the buffer in
+			 * one pass, and this happened at least 3 times.
+			 * This is definitely not a streamer.
+			 */
+			chn->flags &= ~(CF_STREAMER | CF_STREAMER_FAST);
+		}
+		else if (chn->xfer_small >= 2) {
+			/* if the buffer has been at least half full twchne,
+			 * we receive faster than we send, so at least it
+			 * is not a "fast streamer".
+			 */
+			chn->flags &= ~CF_STREAMER_FAST;
+		}
+	}
+	else if (!(chn->flags & CF_STREAMER_FAST) && (xferred >= channel_data_limit(chn))) {
+		/* we read a full buffer at once */
+		chn->xfer_small = 0;
+		chn->xfer_large++;
+		if (chn->xfer_large >= 3) {
+			/* we call this buffer a fast streamer if it manages
+			 * to be filled in one call 3 consecutive times.
+			 */
+			chn->flags |= (CF_STREAMER | CF_STREAMER_FAST);
+		}
+	}
+	else {
+		chn->xfer_small = 0;
+		chn->xfer_large = 0;
+	}
+	chn->last_read = now_ms;
+}
+
 /* Returns the amount of bytes that can be written over the input data at once,
  * including reserved space which may be overwritten. This is used by Lua to
  * insert data in the input side just before the other data using buffer_replace().
@@ -826,12 +916,17 @@ static inline int ci_space_for_replace(const struct channel *chn)
  */
 static inline int channel_alloc_buffer(struct channel *chn, struct buffer_wait *wait)
 {
-	if (b_alloc(&chn->buf) != NULL)
+	int force_noqueue;
+
+	/* If the producer has been notified of recent availability, we must
+	 * not check the queue again.
+	 */
+	force_noqueue = !!(chn_prod(chn)->flags & SC_FL_HAVE_BUFF);
+
+	if (b_alloc(&chn->buf, DB_CHANNEL | (force_noqueue ? DB_F_NOQUEUE : 0)) != NULL)
 		return 1;
 
-	if (!LIST_INLIST(&wait->list))
-		LIST_APPEND(&th_ctx->buffer_wq, &wait->list);
-
+	b_requeue(DB_CHANNEL, wait);
 	return 0;
 }
 
@@ -977,7 +1072,7 @@ static inline int ci_putstr(struct channel *chn, const char *str)
 static inline int co_getchr(struct channel *chn)
 {
 	/* closed or empty + imminent close = -2; empty = -1 */
-	if (unlikely((chn_cons(chn)->flags & SC_FL_SHUT_DONE) || channel_is_empty(chn))) {
+	if (unlikely((chn_cons(chn)->flags & SC_FL_SHUT_DONE) || !co_data(chn))) {
 		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 			return -2;
 		return -1;

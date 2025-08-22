@@ -24,13 +24,14 @@
 #include <netinet/tcp.h>
 #include <netinet/in.h>
 
-#include <haproxy/action-t.h>
+#include <haproxy/action.h>
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/channel.h>
 #include <haproxy/connection.h>
 #include <haproxy/global.h>
 #include <haproxy/http_rules.h>
+#include <haproxy/log.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
@@ -69,6 +70,29 @@ static enum act_return tcp_action_attach_srv(struct act_rule *rule, struct proxy
 	}
 
 	return ACT_RET_CONT;
+}
+
+/* tries to extract integer value from rule's argument:
+ *  if expr is set, computes expr and sets the result into <value>
+ *  else, it's already a numerical value, use it as-is.
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+static int extract_int_from_rule(struct act_rule *rule,
+                                 struct proxy *px, struct session *sess, struct stream *s,
+                                 int *value)
+{
+	struct sample *smp;
+
+	if (!rule->arg.expr_int.expr) {
+		*value = rule->arg.expr_int.value;
+		return 1;
+	}
+	smp = sample_fetch_as_type(px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->arg.expr_int.expr, SMP_T_SINT);
+	if (!smp)
+		return 0;
+	*value = smp->data.u.sint;
+	return 1;
 }
 
 /*
@@ -373,35 +397,73 @@ static enum act_return tcp_exec_action_silent_drop(struct act_rule *rule, struct
 		strm->req.analysers &= AN_REQ_FLT_END;
 		strm->res.analysers &= AN_RES_FLT_END;
 		if (strm->flags & SF_BE_ASSIGNED)
-			_HA_ATOMIC_INC(&strm->be->be_counters.denied_req);
+			_HA_ATOMIC_INC(&strm->be_tgcounters->denied_req);
 		if (!(strm->flags & SF_ERR_MASK))
 			strm->flags |= SF_ERR_PRXCOND;
 		if (!(strm->flags & SF_FINST_MASK))
 			strm->flags |= SF_FINST_R;
 	}
 
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->denied_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->denied_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->denied_req);
 
 	return ACT_RET_ABRT;
 }
 
 
 #if defined(SO_MARK) || defined(SO_USER_COOKIE) || defined(SO_RTABLE)
-static enum act_return tcp_action_set_mark(struct act_rule *rule, struct proxy *px,
-					   struct session *sess, struct stream *s, int flags)
+static enum act_return tcp_action_set_fc_mark(struct act_rule *rule, struct proxy *px,
+                                              struct session *sess, struct stream *s, int flags)
 {
-	conn_set_mark(objt_conn(sess->origin), (uintptr_t)rule->arg.act.p[0]);
+	unsigned int mark;
+
+	if (extract_int_from_rule(rule, px, sess, s, (int *)&mark))
+		conn_set_mark(objt_conn(sess->origin), mark);
+	return ACT_RET_CONT;
+}
+static enum act_return tcp_action_set_bc_mark(struct act_rule *rule, struct proxy *px,
+                                              struct session *sess, struct stream *s, int flags)
+{
+	struct connection __maybe_unused *conn = (s && s->scb) ? sc_conn(s->scb) : NULL;
+	unsigned int mark;
+
+	BUG_ON(!s || conn);
+	if (extract_int_from_rule(rule, px, sess, s, (int *)&mark)) {
+		/* connection does not exist yet, ensure it will be applied
+		 * before connection is used by saving it within the stream
+		 */
+		s->bc_mark = mark;
+		s->flags |= SF_BC_MARK;
+	}
 	return ACT_RET_CONT;
 }
 #endif
 
 #ifdef IP_TOS
-static enum act_return tcp_action_set_tos(struct act_rule *rule, struct proxy *px,
-					  struct session *sess, struct stream *s, int flags)
+static enum act_return tcp_action_set_fc_tos(struct act_rule *rule, struct proxy *px,
+                                             struct session *sess, struct stream *s, int flags)
 {
-	conn_set_tos(objt_conn(sess->origin), (uintptr_t)rule->arg.act.p[0]);
+	int tos;
+
+	if (extract_int_from_rule(rule, px, sess, s, &tos))
+		conn_set_tos(objt_conn(sess->origin), tos);
+	return ACT_RET_CONT;
+}
+static enum act_return tcp_action_set_bc_tos(struct act_rule *rule, struct proxy *px,
+                                             struct session *sess, struct stream *s, int flags)
+{
+	struct connection __maybe_unused *conn = (s && s->scb) ? sc_conn(s->scb) : NULL;
+	int tos;
+
+	BUG_ON(!s || conn);
+	if (extract_int_from_rule(rule, px, sess, s, &tos)) {
+		/* connection does not exist yet, ensure it will be applied
+		 * before connection is used by saving it within the stream
+		 */
+		s->bc_tos = tos;
+		s->flags |= SF_BC_TOS;
+	}
 	return ACT_RET_CONT;
 }
 #endif
@@ -446,15 +508,21 @@ static int tcp_check_attach_srv(struct act_rule *rule, struct proxy *px, char **
 		memprintf(err, "attach-srv rule: no such backend '%s/%s'", ist0(be_name), ist0(sv_name));
 		return 0;
 	}
-	if (!(srv = server_find_by_name(be, ist0(sv_name)))) {
+	if (!(srv = server_find(be, ist0(sv_name)))) {
 		memprintf(err, "attach-srv rule: no such server '%s/%s'", ist0(be_name), ist0(sv_name));
 		return 0;
 	}
 
-	if ((rule->arg.attach_srv.name && (!srv->use_ssl || !srv->sni_expr)) ||
-	    (!rule->arg.attach_srv.name && srv->use_ssl && srv->sni_expr)) {
-		memprintf(err, "attach-srv rule: connection will never be used; either specify name argument in conjonction with defined SSL SNI on targetted server or none of these");
-		return 0;
+	if (rule->arg.attach_srv.name) {
+		if (!srv->pool_conn_name) {
+			memprintf(err, "attach-srv rule has a name argument while server '%s/%s' does not use pool-conn-name; either reconfigure the server or remove the name argument from this attach-srv rule", ist0(be_name), ist0(sv_name));
+			return 0;
+		}
+	} else {
+		if (srv->pool_conn_name) {
+			memprintf(err, "attach-srv rule has no name argument while server '%s/%s' uses pool-conn-name; either add a name argument to the attach-srv rule or reconfigure the server", ist0(be_name), ist0(sv_name));
+			return 0;
+		}
 	}
 
 	rule->arg.attach_srv.srv = srv;
@@ -467,6 +535,14 @@ static enum act_parse_ret tcp_parse_attach_srv(const char **args, int *cur_arg, 
 {
 	char *srvname;
 	struct sample_expr *expr;
+
+	/* TODO duplicated code from check_kw_experimental() */
+	if (!experimental_directives_allowed) {
+		memprintf(err, "parsing [%s:%d] : '%s' action is experimental, must be allowed via a global 'expose-experimental-directives'",
+		          px->conf.args.file, px->conf.args.line, args[2]);
+		return ACT_RET_PRS_ERR;
+	}
+	mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
 
 	rule->action      = ACT_CUSTOM;
 	rule->action_ptr  = tcp_action_attach_srv;
@@ -557,29 +633,56 @@ static enum act_parse_ret tcp_parse_set_src_dst(const char **args, int *orig_arg
 /* Parse a "set-mark" action. It takes the MARK value as argument. It returns
  * ACT_RET_PRS_OK on success, ACT_RET_PRS_ERR on error.
  */
-static enum act_parse_ret tcp_parse_set_mark(const char **args, int *cur_arg, struct proxy *px,
-					     struct act_rule *rule, char **err)
+static enum act_parse_ret tcp_parse_set_mark(const char **args, int *orig_arg, struct proxy *px,
+                                             struct act_rule *rule, char **err)
 {
 #if defined(SO_MARK) || defined(SO_USER_COOKIE) || defined(SO_RTABLE)
+	struct sample_expr *expr;
 	char *endp;
-	unsigned int mark;
+	unsigned int where;
+	int cur_arg = *orig_arg;
 
-	if (!*args[*cur_arg]) {
-		memprintf(err, "expects exactly 1 argument (integer/hex value)");
-		return ACT_RET_PRS_ERR;
-	}
-	mark = strtoul(args[*cur_arg], &endp, 0);
-	if (endp && *endp != '\0') {
-		memprintf(err, "invalid character starting at '%s' (integer/hex value expected)", endp);
+	if (!*args[*orig_arg]) {
+		memprintf(err, "expects an argument");
 		return ACT_RET_PRS_ERR;
 	}
 
-	(*cur_arg)++;
+	/* value may be either an unsigned integer or an expression */
+	rule->arg.expr_int.expr = NULL;
+	rule->arg.expr_int.value = strtoul(args[*orig_arg], &endp, 0);
+	if (*endp == '\0') {
+		/* valid unsigned integer */
+		(*orig_arg)++;
+	}
+	else {
+		/* invalid unsigned integer, fallback to expr */
+		expr = sample_parse_expr((char **)args, orig_arg, px->conf.args.file, px->conf.args.line, err, &px->conf.args, NULL);
+		if (!expr)
+			return ACT_RET_PRS_ERR;
+
+		where = 0;
+		if (px->cap & PR_CAP_FE)
+			where |= SMP_VAL_FE_HRQ_HDR;
+		if (px->cap & PR_CAP_BE)
+			where |= SMP_VAL_BE_HRQ_HDR;
+
+		if (!(expr->fetch->val & where)) {
+			memprintf(err,
+				  "fetch method '%s' extracts information from '%s', none of which is available here",
+				  args[cur_arg-1], sample_src_names(expr->fetch->use));
+			free(expr);
+			return ACT_RET_PRS_ERR;
+		}
+		rule->arg.expr_int.expr = expr;
+	}
 
 	/* Register processing function. */
-	rule->action_ptr = tcp_action_set_mark;
+	if (strcmp("set-bc-mark", args[cur_arg - 1]) == 0)
+		rule->action_ptr = tcp_action_set_bc_mark;
+	else
+		rule->action_ptr = tcp_action_set_fc_mark; // fc mark
 	rule->action = ACT_CUSTOM;
-	rule->arg.act.p[0] = (void *)(uintptr_t)mark;
+	rule->release_ptr = release_expr_int_action;
 	global.last_checks |= LSTCHK_NETADM;
 	return ACT_RET_PRS_OK;
 #else
@@ -592,29 +695,56 @@ static enum act_parse_ret tcp_parse_set_mark(const char **args, int *cur_arg, st
 /* Parse a "set-tos" action. It takes the TOS value as argument. It returns
  * ACT_RET_PRS_OK on success, ACT_RET_PRS_ERR on error.
  */
-static enum act_parse_ret tcp_parse_set_tos(const char **args, int *cur_arg, struct proxy *px,
-					     struct act_rule *rule, char **err)
+static enum act_parse_ret tcp_parse_set_tos(const char **args, int *orig_arg, struct proxy *px,
+                                            struct act_rule *rule, char **err)
 {
 #ifdef IP_TOS
+	struct sample_expr *expr;
 	char *endp;
-	int tos;
+	unsigned int where;
+	int cur_arg = *orig_arg;
 
-	if (!*args[*cur_arg]) {
-		memprintf(err, "expects exactly 1 argument (integer/hex value)");
-		return ACT_RET_PRS_ERR;
-	}
-	tos = strtol(args[*cur_arg], &endp, 0);
-	if (endp && *endp != '\0') {
-		memprintf(err, "invalid character starting at '%s' (integer/hex value expected)", endp);
+	if (!*args[*orig_arg]) {
+		memprintf(err, "expects an argument");
 		return ACT_RET_PRS_ERR;
 	}
 
-	(*cur_arg)++;
+	/* value may be either an integer or an expression */
+	rule->arg.expr_int.expr = NULL;
+	rule->arg.expr_int.value = strtol(args[*orig_arg], &endp, 0);
+	if (*endp == '\0') {
+		/* valid integer */
+		(*orig_arg)++;
+	}
+	else {
+		/* invalid unsigned integer, fallback to expr */
+		expr = sample_parse_expr((char **)args, orig_arg, px->conf.args.file, px->conf.args.line, err, &px->conf.args, NULL);
+		if (!expr)
+			return ACT_RET_PRS_ERR;
+
+		where = 0;
+		if (px->cap & PR_CAP_FE)
+			where |= SMP_VAL_FE_HRQ_HDR;
+		if (px->cap & PR_CAP_BE)
+			where |= SMP_VAL_BE_HRQ_HDR;
+
+		if (!(expr->fetch->val & where)) {
+			memprintf(err,
+				  "fetch method '%s' extracts information from '%s', none of which is available here",
+				  args[cur_arg-1], sample_src_names(expr->fetch->use));
+			free(expr);
+			return ACT_RET_PRS_ERR;
+		}
+		rule->arg.expr_int.expr = expr;
+	}
 
 	/* Register processing function. */
-	rule->action_ptr = tcp_action_set_tos;
+	if (strcmp("set-bc-tos", args[cur_arg - 1]) == 0)
+		rule->action_ptr = tcp_action_set_bc_tos;
+	else
+		rule->action_ptr = tcp_action_set_fc_tos; // fc tos
 	rule->action = ACT_CUSTOM;
-	rule->arg.act.p[0] = (void *)(uintptr_t)tos;
+	rule->release_ptr = release_expr_int_action;
 	return ACT_RET_PRS_OK;
 #else
 	memprintf(err, "not supported on this platform (IP_TOS undefined)");
@@ -660,14 +790,59 @@ static enum act_parse_ret tcp_parse_silent_drop(const char **args, int *cur_arg,
 	return ACT_RET_PRS_OK;
 }
 
+static enum log_orig_id do_log_tcp_req_conn;
+static enum log_orig_id do_log_tcp_req_sess;
+static enum log_orig_id do_log_tcp_req_cont;
+static enum log_orig_id do_log_tcp_res_cont;
+
+static void init_do_log(void)
+{
+	do_log_tcp_req_conn = log_orig_register("tcp-req-conn");
+	BUG_ON(do_log_tcp_req_conn == LOG_ORIG_UNSPEC);
+	do_log_tcp_req_sess = log_orig_register("tcp-req-sess");
+	BUG_ON(do_log_tcp_req_sess == LOG_ORIG_UNSPEC);
+	do_log_tcp_req_cont = log_orig_register("tcp-req-cont");
+	BUG_ON(do_log_tcp_req_cont == LOG_ORIG_UNSPEC);
+	do_log_tcp_res_cont = log_orig_register("tcp-res-cont");
+	BUG_ON(do_log_tcp_res_cont == LOG_ORIG_UNSPEC);
+}
+
+INITCALL0(STG_PREPARE, init_do_log);
+
+static enum act_parse_ret tcp_req_conn_parse_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                    struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_tcp_req_conn, args, orig_arg, px, rule, err);
+}
+
+static enum act_parse_ret tcp_req_sess_parse_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                    struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_tcp_req_sess, args, orig_arg, px, rule, err);
+}
+
+static enum act_parse_ret tcp_req_cont_parse_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                    struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_tcp_req_cont, args, orig_arg, px, rule, err);
+}
+
+static enum act_parse_ret tcp_res_cont_parse_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                    struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_tcp_res_cont, args, orig_arg, px, rule, err);
+}
 
 static struct action_kw_list tcp_req_conn_actions = {ILH, {
+	{ "do-log"      , tcp_req_conn_parse_do_log },
 	{ "set-dst"     , tcp_parse_set_src_dst },
 	{ "set-dst-port", tcp_parse_set_src_dst },
-	{ "set-mark",     tcp_parse_set_mark    },
+	{ "set-fc-mark",  tcp_parse_set_mark    },
+	{ "set-fc-tos",   tcp_parse_set_tos     },
+	{ "set-mark",     tcp_parse_set_mark    }, // DEPRECATED, see set-fc-mark
 	{ "set-src",      tcp_parse_set_src_dst },
 	{ "set-src-port", tcp_parse_set_src_dst },
-	{ "set-tos",      tcp_parse_set_tos     },
+	{ "set-tos",      tcp_parse_set_tos     }, // DEPRECATED, see set-fc-tos
 	{ "silent-drop",  tcp_parse_silent_drop },
 	{ /* END */ }
 }};
@@ -676,12 +851,15 @@ INITCALL1(STG_REGISTER, tcp_req_conn_keywords_register, &tcp_req_conn_actions);
 
 static struct action_kw_list tcp_req_sess_actions = {ILH, {
 	{ "attach-srv"  , tcp_parse_attach_srv  },
+	{ "do-log",       tcp_req_sess_parse_do_log },
 	{ "set-dst"     , tcp_parse_set_src_dst },
 	{ "set-dst-port", tcp_parse_set_src_dst },
-	{ "set-mark",     tcp_parse_set_mark    },
+	{ "set-fc-mark",  tcp_parse_set_mark    },
+	{ "set-fc-tos",   tcp_parse_set_tos     },
+	{ "set-mark",     tcp_parse_set_mark    }, // DEPRECATED, see set-fc-mark
 	{ "set-src",      tcp_parse_set_src_dst },
 	{ "set-src-port", tcp_parse_set_src_dst },
-	{ "set-tos",      tcp_parse_set_tos     },
+	{ "set-tos",      tcp_parse_set_tos     }, // DEPRECATED, see set-fc-tos
 	{ "silent-drop",  tcp_parse_silent_drop },
 	{ /* END */ }
 }};
@@ -689,12 +867,17 @@ static struct action_kw_list tcp_req_sess_actions = {ILH, {
 INITCALL1(STG_REGISTER, tcp_req_sess_keywords_register, &tcp_req_sess_actions);
 
 static struct action_kw_list tcp_req_cont_actions = {ILH, {
-	{ "set-src",      tcp_parse_set_src_dst },
-	{ "set-src-port", tcp_parse_set_src_dst },
+	{ "do-log",       tcp_req_cont_parse_do_log },
+	{ "set-bc-mark",  tcp_parse_set_mark    },
+	{ "set-bc-tos",   tcp_parse_set_tos     },
 	{ "set-dst"     , tcp_parse_set_src_dst },
 	{ "set-dst-port", tcp_parse_set_src_dst },
-	{ "set-mark",     tcp_parse_set_mark    },
-	{ "set-tos",      tcp_parse_set_tos     },
+	{ "set-fc-mark",  tcp_parse_set_mark    },
+	{ "set-fc-tos",   tcp_parse_set_tos     },
+	{ "set-mark",     tcp_parse_set_mark    }, // DEPRECATED, see set-fc-mark
+	{ "set-src",      tcp_parse_set_src_dst },
+	{ "set-src-port", tcp_parse_set_src_dst },
+	{ "set-tos",      tcp_parse_set_tos     }, // DEPRECATED, see set-fc-tos
 	{ "silent-drop",  tcp_parse_silent_drop },
 	{ /* END */ }
 }};
@@ -702,8 +885,11 @@ static struct action_kw_list tcp_req_cont_actions = {ILH, {
 INITCALL1(STG_REGISTER, tcp_req_cont_keywords_register, &tcp_req_cont_actions);
 
 static struct action_kw_list tcp_res_cont_actions = {ILH, {
-	{ "set-mark",     tcp_parse_set_mark   },
-	{ "set-tos",      tcp_parse_set_tos     },
+	{ "do-log",      tcp_res_cont_parse_do_log },
+	{ "set-fc-mark", tcp_parse_set_mark    },
+	{ "set-fc-tos",  tcp_parse_set_tos     },
+	{ "set-mark",    tcp_parse_set_mark    }, // DEPRECATED, see set-fc-mark
+	{ "set-tos",     tcp_parse_set_tos     }, // DEPRECATED, see set-fc-tos
 	{ "silent-drop", tcp_parse_silent_drop },
 	{ /* END */ }
 }};
@@ -711,12 +897,16 @@ static struct action_kw_list tcp_res_cont_actions = {ILH, {
 INITCALL1(STG_REGISTER, tcp_res_cont_keywords_register, &tcp_res_cont_actions);
 
 static struct action_kw_list http_req_actions = {ILH, {
+	{ "set-bc-mark",  tcp_parse_set_mark    },
+	{ "set-bc-tos",   tcp_parse_set_tos     },
 	{ "set-dst",      tcp_parse_set_src_dst },
 	{ "set-dst-port", tcp_parse_set_src_dst },
-	{ "set-mark",     tcp_parse_set_mark    },
+	{ "set-fc-mark",  tcp_parse_set_mark    },
+	{ "set-fc-tos",   tcp_parse_set_tos     },
+	{ "set-mark",     tcp_parse_set_mark    }, // DEPRECATED, see set-fc-mark
 	{ "set-src",      tcp_parse_set_src_dst },
 	{ "set-src-port", tcp_parse_set_src_dst },
-	{ "set-tos",      tcp_parse_set_tos     },
+	{ "set-tos",      tcp_parse_set_tos     }, // DEPRECATED, see set-fc-tos
 	{ "silent-drop",  tcp_parse_silent_drop },
 	{ /* END */ }
 }};
@@ -724,8 +914,10 @@ static struct action_kw_list http_req_actions = {ILH, {
 INITCALL1(STG_REGISTER, http_req_keywords_register, &http_req_actions);
 
 static struct action_kw_list http_res_actions = {ILH, {
-	{ "set-mark",    tcp_parse_set_mark    },
-	{ "set-tos",     tcp_parse_set_tos    },
+	{ "set-fc-mark", tcp_parse_set_mark    },
+	{ "set-fc-tos",  tcp_parse_set_tos     },
+	{ "set-mark",    tcp_parse_set_mark    }, // DEPRECATED, see set-fc-mark
+	{ "set-tos",     tcp_parse_set_tos     }, // DEPRECATED, see set-fc-tos
 	{ "silent-drop", tcp_parse_silent_drop },
 	{ /* END */ }
 }};

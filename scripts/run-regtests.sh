@@ -52,10 +52,6 @@ _help()
     #REQUIRE_SERVICE=prometheus-exporter
     #REQUIRE_SERVICES=prometheus-exporter,foo
 
-    # To define a range of versions that a test can run with:
-    #REQUIRE_VERSION=0.0
-    #REQUIRE_VERSION_BELOW=99.9
-
   Configure environment variables to set the haproxy and vtest binaries to use
     setenv HAPROXY_PROGRAM /usr/local/sbin/haproxy
     setenv VTEST_PROGRAM /usr/local/bin/vtest
@@ -124,15 +120,13 @@ _findtests() {
     set -- $(grep '^#[0-9A-Z_]*=' "$i")
     IFS="$OLDIFS"
 
-    require_version=""; require_version_below=""; require_options="";
+    require_options="";
     require_services=""; exclude_targets=""; regtest_type=""
     requiredoption=""; requiredservice=""; excludedtarget="";
 
     while [ $# -gt 0 ]; do
       v="$1"; v="${v#*=}"
       case "$1" in
-        "#REQUIRE_VERSION="*)       require_version="$v" ;;
-        "#REQUIRE_VERSION_BELOW="*) require_version_below="$v" ;;
         "#REQUIRE_OPTIONS="*)       require_options="$v" ;;
         "#REQUIRE_SERVICES="*)      require_services="$v" ;;
         "#EXCLUDE_TARGETS="*)       exclude_targets="$v" ;;
@@ -170,21 +164,6 @@ _findtests() {
     IFS=","; set -- $require_options;  IFS=$OLDIFS; require_options="$*"
     IFS=","; set -- $require_services; IFS=$OLDIFS; require_services="$*"
     IFS=","; set -- $exclude_targets;  IFS=$OLDIFS; exclude_targets="$*"
-
-    if [ -n "$require_version" ]; then
-      if [ $(_version "$HAPROXY_VERSION") -lt $(_version "$require_version") ]; then
-        echo "  Skip $i because option haproxy is version: $HAPROXY_VERSION"
-        echo "    REASON: this test requires at least version: $require_version"
-        skiptest=1
-      fi
-    fi
-    if [ -n "$require_version_below" ]; then
-      if [ $(_version "$HAPROXY_VERSION") -ge $(_version "$require_version_below") ]; then
-        echo "  Skip $i because option haproxy is version: $HAPROXY_VERSION"
-        echo "    REASON: this test requires a version below: $require_version_below"
-        skiptest=1
-      fi
-    fi
 
     for excludedtarget in $exclude_targets; do
       if [ "$excludedtarget" = "$TARGET" ]; then
@@ -312,8 +291,9 @@ _version() {
 
 
 HAPROXY_PROGRAM="${HAPROXY_PROGRAM:-${PWD}/haproxy}"
-HAPROXY_ARGS="${HAPROXY_ARGS--dM}"
+HAPROXY_ARGS="${HAPROXY_ARGS--dM -dI -dW}"
 VTEST_PROGRAM="${VTEST_PROGRAM:-vtest}"
+VTEST_TIMEOUT="${VTEST_TIMEOUT:-10}"
 TESTDIR="${TMPDIR:-/tmp}"
 REGTESTS=""
 LINEFEED="
@@ -344,16 +324,16 @@ if [ $preparefailed ]; then
 fi
 
 { read HAPROXY_VERSION; read TARGET; read FEATURES; read SERVICES; } << EOF
-$($HAPROXY_PROGRAM $HAPROXY_ARGS -vv | grep 'HA-\?Proxy version\|TARGET.*=\|^Feature\|^Available services' | sed 's/.* [:=] //')
+$($HAPROXY_PROGRAM $HAPROXY_ARGS -vv | grep -E 'HA-?Proxy version|TARGET.*=|^Feature|^Available services' | sed 's/.* [:=] //')
 EOF
 
 HAPROXY_VERSION=$(echo $HAPROXY_VERSION | cut -d " " -f 3)
 echo "Testing with haproxy version: $HAPROXY_VERSION"
 
-PROJECT_VERSION=$(${MAKE:-make} version 2>&1 | grep '^VERSION:\|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
+PROJECT_VERSION=$(${MAKE:-make} version 2>&1 | grep -E '^VERSION:|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
 if [ -z "${PROJECT_VERSION}${MAKE}" ]; then
         # try again with gmake, just in case
-        PROJECT_VERSION=$(gmake version 2>&1 | grep '^VERSION:\|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
+        PROJECT_VERSION=$(gmake version 2>&1 | grep -E '^VERSION:|^SUBVERS:'|cut -f2 -d' '|tr -d '\012')
 fi
 
 FEATURES_PATTERN=" $FEATURES "
@@ -396,7 +376,7 @@ if [ -n "$testlist" ]; then
   if [ -n "$jobcount" ]; then
     jobcount="-j $jobcount"
   fi
-  cmd="$VTEST_PROGRAM -b $((2<<20)) -k -t 10 $keep_logs $verbose $debug $jobcount $vtestparams $testlist"
+  cmd="$VTEST_PROGRAM -b $((2<<20)) -k -t ${VTEST_TIMEOUT} $keep_logs $verbose $debug $jobcount $vtestparams $testlist"
   eval $cmd
   _vtresult=$?
 else
@@ -419,6 +399,7 @@ if [ -d "${TESTDIR}" ]; then
     cat <<- EOF | tee -a "$TESTDIR/failedtests.log"
 $(echo "###### $(cat "$i/INFO") ######")
 $(echo "## test results in: \"$i\"")
+$(echo "## test log file: $i/LOG")
 $(grep -E -- "^(----|\*    diag)" "$i/LOG")
 EOF
   done' sh {} +

@@ -94,7 +94,7 @@ void enable_listener(struct listener *listener);
 void dequeue_all_listeners(void);
 
 /* Dequeues all listeners waiting for a resource in proxy <px>'s queue */
-void dequeue_proxy_listeners(struct proxy *px);
+void dequeue_proxy_listeners(struct proxy *px, int lpx);
 
 /* This function closes the listening socket for the specified listener,
  * provided that it's already in a listening state. The listener enters the
@@ -191,6 +191,13 @@ int default_resume_listener(struct listener *l);
  * alerts. Extra listeners may be created on the fly.
  */
 int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code);
+
+/* Generate and insert unique GUID for each listeners of <bind_conf> instance
+ * if GUID prefix is defined.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int bind_generate_guid(struct bind_conf *bind_conf);
 
 /*
  * Registers the bind keyword list <kwl> as a list of valid keywords for next

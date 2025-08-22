@@ -17,12 +17,44 @@
 #error "Must define USE_OPENSSL"
 #endif
 
+#include <haproxy/openssl-compat.h>
+#if defined(OPENSSL_IS_AWSLC)
+#include <openssl/chacha.h>
+#endif
 #include <openssl/evp.h>
 
 #include <import/ebtree.h>
 
+#include <haproxy/buf-t.h>
+#include <haproxy/ncbuf-t.h>
 #include <haproxy/quic_ack-t.h>
-#include <haproxy/openssl-compat.h>
+
+/* Use EVP_CIPHER or EVP_AEAD API depending on the library */
+#if defined(OPENSSL_IS_AWSLC)
+
+# define QUIC_AEAD_API
+
+# define QUIC_AEAD            EVP_AEAD
+# define QUIC_AEAD_CTX        EVP_AEAD_CTX
+
+# define QUIC_AEAD_CTX_free   EVP_AEAD_CTX_free
+# define QUIC_AEAD_key_length EVP_AEAD_key_length
+# define QUIC_AEAD_iv_length  EVP_AEAD_nonce_length
+
+# define EVP_CIPHER_CTX_CHACHA20 ((EVP_CIPHER_CTX *)EVP_aead_chacha20_poly1305())
+# define EVP_CIPHER_CHACHA20     ((EVP_CIPHER*)EVP_aead_chacha20_poly1305())
+
+#else
+
+# define QUIC_AEAD            EVP_CIPHER
+# define QUIC_AEAD_CTX        EVP_CIPHER_CTX
+
+# define QUIC_AEAD_CTX_free   EVP_CIPHER_CTX_free
+# define QUIC_AEAD_key_length EVP_CIPHER_key_length
+# define QUIC_AEAD_iv_length  EVP_CIPHER_iv_length
+
+#endif
+
 
 /* It seems TLS 1.3 ciphersuites macros differ between openssl and boringssl */
 
@@ -160,7 +192,7 @@ struct quic_pktns {
 
 /* Key phase used for Key Update */
 struct quic_tls_kp {
-	EVP_CIPHER_CTX *ctx;
+	QUIC_AEAD_CTX *ctx;
 	unsigned char *secret;
 	size_t secretlen;
 	unsigned char *iv;
@@ -176,8 +208,8 @@ struct quic_tls_kp {
 #define QUIC_FL_TLS_KP_BIT_SET   (1 << 0)
 
 struct quic_tls_secrets {
-	EVP_CIPHER_CTX *ctx;
-	const EVP_CIPHER *aead;
+	QUIC_AEAD_CTX *ctx;
+	const QUIC_AEAD *aead;
 	const EVP_MD *md;
 	EVP_CIPHER_CTX *hp_ctx;
 	const EVP_CIPHER *hp;
@@ -203,12 +235,45 @@ struct quic_tls_ctx {
 	unsigned char flags;
 };
 
+#define QUIC_CRYPTO_BUF_SHIFT  10
+#define QUIC_CRYPTO_BUF_MASK   ((1UL << QUIC_CRYPTO_BUF_SHIFT) - 1)
+/* The maximum allowed size of CRYPTO data buffer provided by the TLS stack. */
+#define QUIC_CRYPTO_BUF_SZ    (1UL << QUIC_CRYPTO_BUF_SHIFT) /* 1 KB */
+
+extern struct pool_head *pool_head_quic_crypto_buf;
+
+/*
+ * CRYPTO buffer struct.
+ * Such buffers are used to send CRYPTO data.
+ */
+struct quic_crypto_buf {
+	unsigned char data[QUIC_CRYPTO_BUF_SZ];
+	size_t sz;
+};
+
+/* Crypto data stream (one by encryption level) */
+struct quic_cstream {
+	struct {
+		uint64_t offset;       /* absolute current base offset of ncbuf */
+		struct ncbuf ncbuf;    /* receive buffer - can handle out-of-order offset frames */
+	} rx;
+	struct {
+		uint64_t offset;      /* last offset of data ready to be sent */
+		uint64_t sent_offset; /* last offset sent by transport layer */
+		struct buffer buf;    /* transmit buffer before sending via xprt */
+	} tx;
+
+	struct qc_stream_desc *desc;
+};
+
 struct quic_enc_level {
 	struct list list;
-	/* Attach point to enqueue this encryption level during retransmissions */
-	struct list retrans;
-	/* pointer to list used only during retransmissions */
-	struct list *retrans_frms;
+
+	/* Attach point to register encryption level before sending. */
+	struct list el_send;
+	/* Pointer to the frames used by sending functions */
+	struct list *send_frms;
+
 	/* Encryption level, as defined by the TLS stack. */
 	enum ssl_encryption_level_t level;
 	/* TLS encryption context (AEAD only) */

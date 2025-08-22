@@ -40,16 +40,15 @@
 /* unused                 0x00000008 */
 #define TASK_SELF_WAKING  0x00000010  /* task/tasklet found waking itself */
 #define TASK_KILLED       0x00000020  /* task/tasklet killed, may now be freed */
-#define TASK_IN_LIST      0x00000040  /* tasklet is in a tasklet list */
 #define TASK_HEAVY        0x00000080  /* this task/tasklet is extremely heavy */
 
 #define TASK_WOKEN_INIT   0x00000100  /* woken up for initialisation purposes */
 #define TASK_WOKEN_TIMER  0x00000200  /* woken up because of expired timer */
 #define TASK_WOKEN_IO     0x00000400  /* woken up because of completed I/O */
 #define TASK_WOKEN_SIGNAL 0x00000800  /* woken up by a system signal */
-#define TASK_WOKEN_MSG    0x00001000  /* woken up by another task's message */
+#define TASK_WOKEN_MSG    0x00001000  /* woken up by another task's message (see also UEVT/USR1) */
 #define TASK_WOKEN_RES    0x00002000  /* woken up because of available resource */
-#define TASK_WOKEN_OTHER  0x00004000  /* woken up for an unspecified reason */
+#define TASK_WOKEN_OTHER  0x00004000  /* woken up for an unspecified reason (see also UEVT/USR1) */
 
 /* use this to check a task state or to clean it up before queueing */
 #define TASK_WOKEN_ANY    (TASK_WOKEN_OTHER|TASK_WOKEN_INIT|TASK_WOKEN_TIMER| \
@@ -58,11 +57,16 @@
 
 #define TASK_F_TASKLET    0x00008000  /* nature of this task: 0=task 1=tasklet */
 #define TASK_F_USR1       0x00010000  /* preserved user flag 1, application-specific, def:0 */
-/* unused: 0x20000..0x80000000 */
+#define TASK_F_UEVT1      0x00020000  /* one-shot user event type 1, application specific, def:0 */
+#define TASK_F_UEVT2      0x00040000  /* one-shot user event type 2, application specific, def:0 */
+#define TASK_F_WANTS_TIME 0x00080000  /* task/tasklet wants th_ctx->sched_call_date to be set */
+#define TASK_F_UEVT3      0x00100000  /* one-shot user event type 3, application specific, def:0 */
+/* unused: 0x200000..0x80000000 */
 
 /* These flags are persistent across scheduler calls */
 #define TASK_PERSISTENT   (TASK_SELF_WAKING | TASK_KILLED | \
-                           TASK_HEAVY | TASK_F_TASKLET | TASK_F_USR1)
+                           TASK_HEAVY | TASK_F_TASKLET | TASK_F_USR1 | \
+                           TASK_F_WANTS_TIME)
 
 /* This function is used to report state in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -75,10 +79,10 @@ static forceinline char *task_show_state(char *buf, size_t len, const char *deli
 	_(0);
 	/* flags */
 	_(TASK_RUNNING, _(TASK_QUEUED, _(TASK_SELF_WAKING,
-	_(TASK_KILLED, _(TASK_IN_LIST, _(TASK_HEAVY, _(TASK_WOKEN_INIT,
+	_(TASK_KILLED, _(TASK_HEAVY, _(TASK_WOKEN_INIT,
 	_(TASK_WOKEN_TIMER, _(TASK_WOKEN_IO, _(TASK_WOKEN_SIGNAL,
 	_(TASK_WOKEN_MSG, _(TASK_WOKEN_RES, _(TASK_WOKEN_OTHER,
-	_(TASK_F_TASKLET, _(TASK_F_USR1)))))))))))))));
+	_(TASK_F_TASKLET, _(TASK_F_USR1))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -94,15 +98,15 @@ enum {
 	WAKEUP_TYPE_TASK_INSTANT_WAKEUP,
 	WAKEUP_TYPE_TASKLET_WAKEUP,
 	WAKEUP_TYPE_TASKLET_WAKEUP_AFTER,
-	WAKEUP_TYPE_TASK_DROP_RUNNING,
+	WAKEUP_TYPE_TASK_SCHEDULE,
+	WAKEUP_TYPE_TASK_QUEUE,
 	WAKEUP_TYPE_APPCTX_WAKEUP,
 };
 
 struct notification {
 	struct list purge_me; /* Part of the list of signals to be purged in the
 	                         case of the LUA execution stack crash. */
-	struct list wake_me; /* Part of list of signals to be targeted if an
-	                        event occurs. */
+	struct mt_list wake_me; /* thread safe signal list */
 	struct task *task; /* The task to be wake if an event occurs. */
 	__decl_thread(HA_SPINLOCK_T lock);
 };
@@ -161,6 +165,24 @@ struct tasklet {
 	 * list starts and this works because both are exclusive. Never ever
 	 * reorder these fields without taking this into account!
 	 */
+};
+
+/* Note: subscribing to these events is only valid after the caller has really
+ * attempted to perform the operation, and failed to proceed or complete.
+ */
+enum sub_event_type {
+	SUB_RETRY_RECV       = 0x00000001,  /* Schedule the tasklet when we can attempt to recv again */
+	SUB_RETRY_SEND       = 0x00000002,  /* Schedule the tasklet when we can attempt to send again */
+};
+
+/* Describes a set of subscriptions. Multiple events may be registered at the
+ * same time. The callee should assume everything not pending for completion is
+ * implicitly possible. It's illegal to change the tasklet if events are still
+ * registered.
+ */
+struct wait_event {
+	struct tasklet *tasklet;
+	int events;             /* set of enum sub_event_type above */
 };
 
 /*

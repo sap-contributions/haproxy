@@ -1,6 +1,5 @@
 varnishtest "Health-checks: http-check send test"
 #REGTEST_TYPE=slow
-#REQUIRE_VERSION=2.4
 feature ignore_unknown_macro
 
 # This script tests HTTP health-checks and more particularly the "http-check
@@ -109,6 +108,11 @@ syslog S6 -level notice {
 
 
 haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         mode http
         timeout client "${HAPROXY_TEST_TIMEOUT-5s}"

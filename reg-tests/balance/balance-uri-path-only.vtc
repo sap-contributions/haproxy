@@ -1,6 +1,5 @@
 vtest "Test for balance URI"
 feature ignore_unknown_macro
-#REQUIRE_VERSION=2.3
 
 server s1 {
     rxreq
@@ -23,6 +22,11 @@ server s4 {
 } -repeat 5 -start
 
 haproxy h1 -arg "-L A" -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         mode http
         timeout server "${HAPROXY_TEST_TIMEOUT-5s}"

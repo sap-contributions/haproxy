@@ -27,15 +27,20 @@
 #include <import/ist.h>
 #include <haproxy/api.h>
 #include <haproxy/http-t.h>
+#include <haproxy/intops.h>
 
 extern const int http_err_codes[HTTP_ERR_SIZE];
 extern const char *http_err_msgs[HTTP_ERR_SIZE];
 extern const struct ist http_known_methods[HTTP_METH_OTHER];
 extern const uint8_t http_char_classes[256];
+extern long http_err_status_codes[512 / sizeof(long)];
+extern long http_fail_status_codes[512 / sizeof(long)];
 
 enum http_meth_t find_http_meth(const char *str, const int len);
 int http_get_status_idx(unsigned int status);
 const char *http_get_reason(unsigned int status);
+void http_status_add_range(long *array, uint low, uint high);
+void http_status_del_range(long *array, uint low, uint high);
 struct ist http_get_host_port(const struct ist host);
 int http_is_default_port(const struct ist schm, const struct ist port);
 int http_validate_scheme(const struct ist schm);
@@ -51,6 +56,8 @@ char *http_find_cookie_value_end(char *s, const char *e);
 char *http_extract_cookie_value(char *hdr, const char *hdr_end,
                                 char *cookie_name, size_t cookie_name_l,
                                 int list, char **value, size_t *value_l);
+char *http_extract_next_cookie_name(char *hdr_beg, char *hdr_end, int is_req,
+                                    char **ptr, size_t *len);
 int http_parse_qvalue(const char *qvalue, const char **end);
 const char *http_find_url_param_pos(const char **chunks,
                                     const char* url_param_name,
@@ -190,6 +197,21 @@ static inline int http_header_has_forbidden_char(const struct ist ist, const cha
 	return 0;
 }
 
+/* Check that method only contains token as required.
+ * See RFC 9110 9. Methods
+ */
+static inline int http_method_has_forbidden_char(const struct ist ist)
+{
+	const char *start = istptr(ist);
+
+	do {
+		if (!HTTP_IS_TOKEN(*start))
+			return 1;
+		start++;
+	} while (start < istend(ist));
+	return 0;
+}
+
 /* Looks into <ist> for forbidden characters for :path values (0x00..0x1F,
  * 0x20, 0x23), starting at pointer <start> which must be within <ist>.
  * Returns non-zero if such a character is found, 0 otherwise. When run on
@@ -208,6 +230,64 @@ static inline int http_path_has_forbidden_char(const struct ist ist, const char 
 		start++;
 	} while (start < istend(ist));
 	return 0;
+}
+
+/* Checks whether the :authority pseudo header contains dangerous chars that
+ * might affect its reassembly. We want to catch anything below 0x21, above
+ * 0x7e, as well as '@', '[', ']', '/','?', '#', '\', CR, LF, NUL. Then we
+ * fall back to the slow path and decide. Brackets are used for IP-literal and
+ * deserve special case, that is better handled in the slow path. The function
+ * returns 0 if no forbidden char is presnet, non-zero otherwise.
+ */
+static inline int http_authority_has_forbidden_char(const struct ist ist)
+{
+	size_t ofs, len = istlen(ist);
+	const char *p = istptr(ist);
+	int brackets = 0;
+	uchar c;
+
+	/* Many attempts with various methods have shown that moderately recent
+	 * compilers (gcc >= 9, clang >= 13) will arrange the code below as an
+	 * evaluation tree that remains efficient at -O2 and above (~1.2ns per
+	 * char). The immediate next efficient one is the bitmap from 64-bit
+	 * registers but it's extremely sensitive to code arrangements and
+	 * optimization.
+	 */
+	for (ofs = 0; ofs < len; ofs++) {
+		c = p[ofs];
+
+		if (unlikely(c < 0x21 || c > 0x7e ||
+			     c == '#' || c == '/' || c == '?' || c == '@' ||
+			     c == '[' || c == '\\' || c == ']')) {
+			/* all of them must be rejected, except '[' which may
+			 * only appear at the beginning, and ']' which may
+			 * only appear at the end or before a colon.
+			 */
+			if ((c == '[' && ofs == 0) ||
+			    (c == ']' && (ofs == len - 1 || p[ofs + 1] == ':'))) {
+				/* that's an IP-literal (see RFC3986#3.2), it's
+				 * OK for now.
+				 */
+				brackets ^= 1;
+			} else {
+				return 1;
+			}
+		}
+	}
+	/* there must be no opening bracket left nor lone closing one */
+	return brackets;
+}
+
+/* Checks status code array <array> for the presence of status code <status>.
+ * Returns non-zero if the code is present, zero otherwise. Any status code is
+ * permitted.
+ */
+static inline int http_status_matches(const long *array, uint status)
+{
+	if (status < 100 || status > 599)
+		return 0;
+
+	return ha_bit_test(status - 100, array);
 }
 
 #endif /* _HAPROXY_HTTP_H */

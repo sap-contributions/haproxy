@@ -7,7 +7,7 @@
 #include <haproxy/quic_trace.h>
 #include <haproxy/trace.h>
 
-DECLARE_STATIC_POOL(pool_head_quic_arng, "quic_arng", sizeof(struct quic_arng_node));
+DECLARE_STATIC_TYPED_POOL(pool_head_quic_arng, "quic_arng", struct quic_arng_node);
 
 /* Deallocate <l> list of ACK ranges. */
 void quic_free_arngs(struct quic_conn *qc, struct quic_arngs *arngs)
@@ -81,12 +81,12 @@ struct quic_arng_node *quic_insert_new_range(struct quic_conn *qc,
 	TRACE_ENTER(QUIC_EV_CONN_RXPKT, qc);
 
 	if (arngs->sz >= QUIC_MAX_ACK_RANGES) {
-		struct eb64_node *last;
+		struct eb64_node *first;
 
-		last = eb64_last(&arngs->root);
-		BUG_ON(last == NULL);
-		eb64_delete(last);
-		pool_free(pool_head_quic_arng, last);
+		first = eb64_first(&arngs->root);
+		BUG_ON(first == NULL);
+		eb64_delete(first);
+		pool_free(pool_head_quic_arng, first);
 		arngs->sz--;
 	}
 

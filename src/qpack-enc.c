@@ -69,8 +69,8 @@ int qpack_encode_int_status(struct buffer *out, unsigned int status)
 {
 	int status_size, idx = 0;
 
-	if (status < 100 || status > 599)
-		return 1;
+	/* HTTP layer must not encode invalid status codes. */
+	BUG_ON(status < 100 || status > 999);
 
 	switch (status) {
 	case 103: idx = 24; break;
@@ -129,6 +129,123 @@ int qpack_encode_int_status(struct buffer *out, unsigned int status)
 		b_putchr(out, c);
 	}
 
+	return 0;
+}
+
+/* Returns 0 on success else non-zero. */
+int qpack_encode_method(struct buffer *out, enum http_meth_t meth, struct ist other)
+{
+	int sz, idx = 0;
+	size_t i;
+
+	switch (meth) {
+	case HTTP_METH_CONNECT: idx = 15; break;
+	case HTTP_METH_DELETE:  idx = 16; break;
+	case HTTP_METH_GET:     idx = 17; break;
+	case HTTP_METH_HEAD:    idx = 18; break;
+	case HTTP_METH_OPTIONS: idx = 19; break;
+	case HTTP_METH_POST:    idx = 20; break;
+	case HTTP_METH_PUT:     idx = 21; break;
+	default: break;
+	}
+
+	if (idx) {
+		/* indexed field line */
+		if (b_room(out) < 2)
+			return 1;
+
+		qpack_encode_prefix_integer(out, idx, 6, 0xc0);
+	}
+	else {
+		BUG_ON(!istlen(other)); /* non standard method, <other> must be set. */
+
+		sz = 2 + qpack_get_prefix_int_size(istlen(other), 7) + istlen(other);
+		if (b_room(out) < sz)
+			return 1;
+
+		/* literal field line with name ref */
+		qpack_encode_prefix_integer(out, 15, 4, 0x50);
+		qpack_encode_prefix_integer(out, istlen(other), 7, 0);
+		for (i = 0; i < istlen(other); ++i)
+			b_putchr(out, istptr(other)[i]);
+	}
+
+	return 0;
+}
+
+/* Returns 0 on success else non-zero. */
+int qpack_encode_scheme(struct buffer *out, const struct ist scheme)
+{
+	size_t i;
+	int sz;
+
+	if (unlikely(!isteq(scheme, ist("https"))) && !isteq(scheme, ist("http"))) {
+		sz = 2 + qpack_get_prefix_int_size(istlen(scheme), 7) + istlen(scheme);
+		if (b_room(out) < sz)
+			return 1;
+
+		/* literal field line with name ref */
+		qpack_encode_prefix_integer(out, 23, 4, 0x50);
+		qpack_encode_prefix_integer(out, istlen(scheme), 7, 0);
+		for (i = 0; i < istlen(scheme); ++i)
+			b_putchr(out, istptr(scheme)[i]);
+	}
+	else {
+		const int idx = isteq(scheme, ist("https")) ?
+		  23 : /* :scheme: https */
+		  22;  /* :scheme: http */
+
+		if (b_room(out) < 2)
+			return 1;
+
+		/* :scheme: http[s] */
+		qpack_encode_prefix_integer(out, idx, 6, 0xc0);
+	}
+
+	return 0;
+}
+
+/* Returns 0 on success else non-zero. */
+int qpack_encode_path(struct buffer *out, const struct ist path)
+{
+	size_t sz, i;
+
+	if (unlikely(isteq(path, ist("/")))) {
+		if (!b_room(out))
+			return 1;
+
+		qpack_encode_prefix_integer(out, 1, 6, 0xc0);
+		return 0;
+	}
+	else {
+		sz = 1 + qpack_get_prefix_int_size(istlen(path), 7) + istlen(path);
+		if (b_room(out) < sz)
+			return 1;
+
+		qpack_encode_prefix_integer(out, 1, 4, 0x50);
+		qpack_encode_prefix_integer(out, istlen(path), 7, 0);
+		for (i = 0; i < istlen(path); ++i)
+			b_putchr(out, istptr(path)[i]);
+		return 0;
+	}
+}
+
+/* Encode pseudo-header authority defined to <auth> into <out> buffer.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int qpack_encode_auth(struct buffer *out, const struct ist auth)
+{
+	size_t sz, i;
+
+	sz = 1 + qpack_get_prefix_int_size(istlen(auth), 7) + istlen(auth);
+	if (b_room(out) < sz)
+		return 1;
+
+	qpack_encode_prefix_integer(out, 0, 4, 0x50);
+	qpack_encode_prefix_integer(out, istlen(auth), 7, 0);
+	for (i = 0; i < istlen(auth); ++i)
+		b_putchr(out, istptr(auth)[i]);
 	return 0;
 }
 

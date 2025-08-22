@@ -11,6 +11,7 @@
  */
 
 #include <haproxy/api.h>
+#include <haproxy/buf.h>
 #include <haproxy/connection.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/ssl_sock.h>
@@ -23,6 +24,8 @@ static void quic_close(struct connection *conn, void *xprt_ctx)
 	struct quic_conn *qc = conn_ctx->qc;
 
 	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
+
+	qc->conn = NULL;
 
 	/* Next application data can be dropped. */
 	qc->mux_state = QC_MUX_RELEASED;
@@ -108,20 +111,39 @@ static int quic_conn_unsubscribe(struct connection *conn, void *xprt_ctx, int ev
  */
 static int qc_conn_init(struct connection *conn, void **xprt_ctx)
 {
+	int ret = -1;
 	struct quic_conn *qc = NULL;
 
 	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
+
+	if (objt_listener(conn->target)) {
+		qc = conn->handle.qc;
+	}
+	else {
+		int ipv4 = conn->dst->ss_family == AF_INET;
+		struct server *srv = objt_server(conn->target);
+		qc = qc_new_conn(quic_version_1, ipv4, NULL, NULL, NULL,
+		                 NULL, NULL, &srv->addr, 0, srv, conn);
+	}
+
+	if (!qc)
+		goto out;
+
+	ret = 0;
+	/* Ensure thread connection migration is finalized ASAP. */
+	if (qc->flags & QUIC_FL_CONN_TID_REBIND)
+		qc_finalize_tid_rebind(qc);
 
 	/* do not store the context if already set */
 	if (*xprt_ctx)
 		goto out;
 
-	*xprt_ctx = conn->handle.qc->xprt_ctx;
+	*xprt_ctx = qc->xprt_ctx;
 
  out:
 	TRACE_LEAVE(QUIC_EV_CONN_NEW, qc);
 
-	return 0;
+	return ret;
 }
 
 /* Start the QUIC transport layer */
@@ -133,11 +155,20 @@ static int qc_xprt_start(struct connection *conn, void *ctx)
 	qc = conn->handle.qc;
 	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
 
-	if (qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED)
-		qc_finalize_affinity_rebind(qc);
+	if (objt_listener(conn->target)) {
+		/* mux-quic can now be considered ready. */
+		qc->mux_state = QC_MUX_READY;
+	}
+	else {
+		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
+	}
 
-	/* mux-quic can now be considered ready. */
-	qc->mux_state = QC_MUX_READY;
+	/* Schedule quic-conn to ensure post handshake frames are emitted. This
+	 * is not done for 0-RTT as xprt->start happens before handshake
+	 * completion.
+	 */
+	if (qc->flags & QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS)
+		tasklet_wakeup(qc->wait_event.tasklet);
 
 	ret = 1;
  out:
@@ -153,6 +184,11 @@ static struct ssl_sock_ctx *qc_get_ssl_sock_ctx(struct connection *conn)
 	return conn->handle.qc->xprt_ctx;
 }
 
+static void qc_xprt_dump_info(struct buffer *msg, const struct connection *conn)
+{
+	quic_dump_qc_info(msg, conn->handle.qc);
+}
+
 /* transport-layer operations for QUIC connections. */
 static struct xprt_ops ssl_quic = {
 	.close    = quic_close,
@@ -162,8 +198,11 @@ static struct xprt_ops ssl_quic = {
 	.start    = qc_xprt_start,
 	.prepare_bind_conf = ssl_sock_prepare_bind_conf,
 	.destroy_bind_conf = ssl_sock_destroy_bind_conf,
+	.prepare_srv = ssl_sock_prepare_srv_ctx,
+	.destroy_srv = ssl_sock_free_srv_ctx,
 	.get_alpn = ssl_sock_get_alpn,
 	.get_ssl_sock_ctx = qc_get_ssl_sock_ctx,
+	.dump_info = qc_xprt_dump_info,
 	.name     = "QUIC",
 };
 

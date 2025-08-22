@@ -1,4 +1,5 @@
 #include <haproxy/h3.h>
+#include <haproxy/qpack-t.h>
 #include <haproxy/stats.h>
 
 enum {
@@ -35,7 +36,7 @@ enum {
 	H3_STATS_COUNT /* must be the last */
 };
 
-static struct name_desc h3_stats[] = {
+static struct stat_col h3_stats[] = {
 	/* h3 frame type counters */
 	[H3_ST_DATA]         = { .name = "h3_data",
 	                         .desc = "Total number of DATA frames received" },
@@ -128,40 +129,114 @@ static struct h3_counters {
 	long long qpack_decoder_stream_error; /* total number of QPACK_DECODER_STREAM_ERROR errors received */
 } h3_counters;
 
-static void h3_fill_stats(void *data, struct field *stats)
+static int h3_fill_stats(void *data, struct field *stats, unsigned int *selected_field)
 {
 	struct h3_counters *counters = data;
+	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
 
-	/* h3 frame type counters */
-	stats[H3_ST_DATA]         = mkf_u64(FN_COUNTER, counters->h3_data);
-	stats[H3_ST_HEADERS]      = mkf_u64(FN_COUNTER, counters->h3_headers);
-	stats[H3_ST_CANCEL_PUSH]  = mkf_u64(FN_COUNTER, counters->h3_cancel_push);
-	stats[H3_ST_PUSH_PROMISE] = mkf_u64(FN_COUNTER, counters->h3_push_promise);
-	stats[H3_ST_MAX_PUSH_ID]  = mkf_u64(FN_COUNTER, counters->h3_max_push_id);
-	stats[H3_ST_GOAWAY]       = mkf_u64(FN_COUNTER, counters->h3_goaway);
-	stats[H3_ST_SETTINGS]     = mkf_u64(FN_COUNTER, counters->h3_settings);
-	/* h3 error counters */
-	stats[H3_ST_H3_NO_ERROR]               = mkf_u64(FN_COUNTER, counters->h3_no_error);
-	stats[H3_ST_H3_GENERAL_PROTOCOL_ERROR] = mkf_u64(FN_COUNTER, counters->h3_general_protocol_error);
-	stats[H3_ST_H3_INTERNAL_ERROR]         = mkf_u64(FN_COUNTER, counters->h3_internal_error);
-	stats[H3_ST_H3_STREAM_CREATION_ERROR]  = mkf_u64(FN_COUNTER, counters->h3_stream_creation_error);
-	stats[H3_ST_H3_CLOSED_CRITICAL_STREAM] = mkf_u64(FN_COUNTER, counters->h3_closed_critical_stream);
-	stats[H3_ST_H3_FRAME_UNEXPECTED]       = mkf_u64(FN_COUNTER, counters->h3_frame_unexpected);
-	stats[H3_ST_H3_FRAME_ERROR]            = mkf_u64(FN_COUNTER, counters->h3_frame_error);
-	stats[H3_ST_H3_EXCESSIVE_LOAD]         = mkf_u64(FN_COUNTER, counters->h3_excessive_load);
-	stats[H3_ST_H3_ID_ERROR]               = mkf_u64(FN_COUNTER, counters->h3_id_error);
-	stats[H3_ST_H3_SETTINGS_ERROR]         = mkf_u64(FN_COUNTER, counters->h3_settings_error);
-	stats[H3_ST_H3_MISSING_SETTINGS]       = mkf_u64(FN_COUNTER, counters->h3_missing_settings);
-	stats[H3_ST_H3_REQUEST_REJECTED]       = mkf_u64(FN_COUNTER, counters->h3_request_rejected);
-	stats[H3_ST_H3_REQUEST_CANCELLED]      = mkf_u64(FN_COUNTER, counters->h3_request_cancelled);
-	stats[H3_ST_H3_REQUEST_INCOMPLETE]     = mkf_u64(FN_COUNTER, counters->h3_request_incomplete);
-	stats[H3_ST_H3_MESSAGE_ERROR]          = mkf_u64(FN_COUNTER, counters->h3_message_error);
-	stats[H3_ST_H3_CONNECT_ERROR]          = mkf_u64(FN_COUNTER, counters->h3_connect_error);
-	stats[H3_ST_H3_VERSION_FALLBACK]       = mkf_u64(FN_COUNTER, counters->h3_version_fallback);
-	/* QPACK error counters */
-	stats[H3_ST_QPACK_DECOMPRESSION_FAILED] = mkf_u64(FN_COUNTER, counters->qpack_decompression_failed);
-	stats[H3_ST_QPACK_ENCODER_STREAM_ERROR] = mkf_u64(FN_COUNTER, counters->qpack_encoder_stream_error);
-	stats[H3_ST_QPACK_DECODER_STREAM_ERROR] = mkf_u64(FN_COUNTER, counters->qpack_decoder_stream_error);
+	for (; current_field < H3_STATS_COUNT; current_field++) {
+		struct field metric = { 0 };
+
+		switch (current_field) {
+		/* h3 frame type counters */
+		case H3_ST_DATA:
+			metric = mkf_u64(FN_COUNTER, counters->h3_data);
+			break;
+		case H3_ST_HEADERS:
+			metric = mkf_u64(FN_COUNTER, counters->h3_headers);
+			break;
+		case H3_ST_CANCEL_PUSH:
+			metric = mkf_u64(FN_COUNTER, counters->h3_cancel_push);
+			break;
+		case H3_ST_PUSH_PROMISE:
+			metric = mkf_u64(FN_COUNTER, counters->h3_push_promise);
+			break;
+		case H3_ST_MAX_PUSH_ID:
+			metric = mkf_u64(FN_COUNTER, counters->h3_max_push_id);
+			break;
+		case H3_ST_GOAWAY:
+			metric = mkf_u64(FN_COUNTER, counters->h3_goaway);
+			break;
+		case H3_ST_SETTINGS:
+			metric = mkf_u64(FN_COUNTER, counters->h3_settings);
+			break;
+
+		/* h3 error counters */
+		case H3_ST_H3_NO_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_no_error);
+			break;
+		case H3_ST_H3_GENERAL_PROTOCOL_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_general_protocol_error);
+			break;
+		case H3_ST_H3_INTERNAL_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_internal_error);
+			break;
+		case H3_ST_H3_STREAM_CREATION_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_stream_creation_error);
+			break;
+		case H3_ST_H3_CLOSED_CRITICAL_STREAM:
+			metric = mkf_u64(FN_COUNTER, counters->h3_closed_critical_stream);
+			break;
+		case H3_ST_H3_FRAME_UNEXPECTED:
+			metric = mkf_u64(FN_COUNTER, counters->h3_frame_unexpected);
+			break;
+		case H3_ST_H3_FRAME_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_frame_error);
+			break;
+		case H3_ST_H3_EXCESSIVE_LOAD:
+			metric = mkf_u64(FN_COUNTER, counters->h3_excessive_load);
+			break;
+		case H3_ST_H3_ID_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_id_error);
+			break;
+		case H3_ST_H3_SETTINGS_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_settings_error);
+			break;
+		case H3_ST_H3_MISSING_SETTINGS:
+			metric = mkf_u64(FN_COUNTER, counters->h3_missing_settings);
+			break;
+		case H3_ST_H3_REQUEST_REJECTED:
+			metric = mkf_u64(FN_COUNTER, counters->h3_request_rejected);
+			break;
+		case H3_ST_H3_REQUEST_CANCELLED:
+			metric = mkf_u64(FN_COUNTER, counters->h3_request_cancelled);
+			break;
+		case H3_ST_H3_REQUEST_INCOMPLETE:
+			metric = mkf_u64(FN_COUNTER, counters->h3_request_incomplete);
+			break;
+		case H3_ST_H3_MESSAGE_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_message_error);
+			break;
+		case H3_ST_H3_CONNECT_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->h3_connect_error);
+			break;
+		case H3_ST_H3_VERSION_FALLBACK:
+			metric = mkf_u64(FN_COUNTER, counters->h3_version_fallback);
+			break;
+
+		/* QPACK error counters */
+		case H3_ST_QPACK_DECOMPRESSION_FAILED:
+			metric = mkf_u64(FN_COUNTER, counters->qpack_decompression_failed);
+			break;
+		case H3_ST_QPACK_ENCODER_STREAM_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->qpack_encoder_stream_error);
+			break;
+		case H3_ST_QPACK_DECODER_STREAM_ERROR:
+			metric = mkf_u64(FN_COUNTER, counters->qpack_decoder_stream_error);
+			break;
+		default:
+			/* not used for frontends. If a specific metric
+			 * is requested, return an error. Otherwise continue.
+			 */
+			if (selected_field != NULL)
+				return 0;
+			continue;
+		}
+		stats[current_field] = metric;
+		if (selected_field != NULL)
+			break;
+	}
+	return 1;
 }
 
 struct stats_module h3_stats_module = {
@@ -180,64 +255,64 @@ INITCALL1(STG_REGISTER, stats_register_module, &h3_stats_module);
 void h3_inc_err_cnt(struct h3_counters *ctrs, int error_code)
 {
 	switch (error_code) {
-	case H3_NO_ERROR:
+	case H3_ERR_NO_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_no_error);
 		break;
-	case H3_GENERAL_PROTOCOL_ERROR:
+	case H3_ERR_GENERAL_PROTOCOL_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_general_protocol_error);
 		break;
-	case H3_INTERNAL_ERROR:
+	case H3_ERR_INTERNAL_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_internal_error);
 		break;
-	case H3_STREAM_CREATION_ERROR:
+	case H3_ERR_STREAM_CREATION_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_stream_creation_error);
 		break;
-	case H3_CLOSED_CRITICAL_STREAM:
+	case H3_ERR_CLOSED_CRITICAL_STREAM:
 		HA_ATOMIC_INC(&ctrs->h3_closed_critical_stream);
 		break;
-	case H3_FRAME_UNEXPECTED:
+	case H3_ERR_FRAME_UNEXPECTED:
 		HA_ATOMIC_INC(&ctrs->h3_frame_unexpected);
 		break;
-	case H3_FRAME_ERROR:
+	case H3_ERR_FRAME_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_frame_error);
 		break;
-	case H3_EXCESSIVE_LOAD:
+	case H3_ERR_EXCESSIVE_LOAD:
 		HA_ATOMIC_INC(&ctrs->h3_excessive_load);
 		break;
-	case H3_ID_ERROR:
+	case H3_ERR_ID_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_id_error);
 		break;
-	case H3_SETTINGS_ERROR:
+	case H3_ERR_SETTINGS_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_settings_error);
 		break;
-	case H3_MISSING_SETTINGS:
+	case H3_ERR_MISSING_SETTINGS:
 		HA_ATOMIC_INC(&ctrs->h3_missing_settings);
 		break;
-	case H3_REQUEST_REJECTED:
+	case H3_ERR_REQUEST_REJECTED:
 		HA_ATOMIC_INC(&ctrs->h3_request_rejected);
 		break;
-	case H3_REQUEST_CANCELLED:
+	case H3_ERR_REQUEST_CANCELLED:
 		HA_ATOMIC_INC(&ctrs->h3_request_cancelled);
 		break;
-	case H3_REQUEST_INCOMPLETE:
+	case H3_ERR_REQUEST_INCOMPLETE:
 		HA_ATOMIC_INC(&ctrs->h3_request_incomplete);
 		break;
-	case H3_MESSAGE_ERROR:
+	case H3_ERR_MESSAGE_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_message_error);
 		break;
-	case H3_CONNECT_ERROR:
+	case H3_ERR_CONNECT_ERROR:
 		HA_ATOMIC_INC(&ctrs->h3_connect_error);
 		break;
-	case H3_VERSION_FALLBACK:
+	case H3_ERR_VERSION_FALLBACK:
 		HA_ATOMIC_INC(&ctrs->h3_version_fallback);
 		break;
-	case QPACK_DECOMPRESSION_FAILED:
+	case QPACK_ERR_DECOMPRESSION_FAILED:
 		HA_ATOMIC_INC(&ctrs->qpack_decompression_failed);
 		break;
-	case QPACK_ENCODER_STREAM_ERROR:
+	case QPACK_ERR_ENCODER_STREAM_ERROR:
 		HA_ATOMIC_INC(&ctrs->qpack_encoder_stream_error);
 		break;
-	case QPACK_DECODER_STREAM_ERROR:
+	case QPACK_ERR_DECODER_STREAM_ERROR:
 		HA_ATOMIC_INC(&ctrs->qpack_decoder_stream_error);
 		break;
 	default:

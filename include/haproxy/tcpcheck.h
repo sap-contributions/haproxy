@@ -83,6 +83,10 @@ struct tcpcheck_rule *parse_tcpcheck_expect(char **args, int cur_arg, struct pro
                                             struct list *rules, unsigned int proto,
                                             const char *file, int line, char **errmsg);
 
+int proxy_parse_tcpcheck(char **args, int section, struct proxy *curpx,
+                         const struct proxy *defpx, const char *file, int line,
+                         char **errmsg);
+
 int proxy_parse_tcp_check_opt(char **args, int cur_arg, struct proxy *curpx, const struct proxy *defpx,
 			      const char *file, int line);
 int proxy_parse_redis_check_opt(char **args, int cur_arg, struct proxy *curpx, const struct proxy *defpx,
@@ -113,6 +117,20 @@ static inline struct action_kw *action_kw_tcp_check_lookup(const char *kw)
 static inline void action_kw_tcp_check_build_list(struct buffer *chk)
 {
 	action_build_list(&tcp_check_keywords.list, chk);
+}
+
+/*
+ * Map tcpcheck rules type (TCPCHK_RULES_*) to equivalent proto_proxy_mode (PROTO_MODE_*)
+ */
+static inline int tcpchk_rules_type_to_proto_mode(int tcpchk_rules_type)
+{
+	int mode;
+
+	mode = (((tcpchk_rules_type & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_HTTP_CHK) ? PROTO_MODE_HTTP :
+		(((tcpchk_rules_type & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_SPOP_CHK) ? PROTO_MODE_SPOP :
+		 PROTO_MODE_TCP));
+
+	return mode;
 }
 
 #endif /* _HAPROXY_TCPCHECK_H */

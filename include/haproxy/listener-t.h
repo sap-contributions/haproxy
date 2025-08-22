@@ -28,6 +28,7 @@
 #include <import/ebtree-t.h>
 
 #include <haproxy/api-t.h>
+#include <haproxy/guid-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_sock-t.h>
@@ -111,6 +112,8 @@ enum li_status {
 #define BC_O_ACC_CIP            0x00001000 /* find the proxied address in the NetScaler Client IP header */
 #define BC_O_UNLIMITED          0x00002000 /* listeners not subject to global limits (peers & stats socket) */
 #define BC_O_NOSTOP             0x00004000 /* keep the listeners active even after a soft stop */
+#define BC_O_REVERSE_HTTP       0x00008000 /* a reverse HTTP bind is used */
+#define BC_O_XPRT_MAXCONN       0x00010000 /* transport layer allocates its own resource prior to accept and is responsible to check maxconn limit */
 
 
 /* flags used with bind_conf->ssl_options */
@@ -118,6 +121,7 @@ enum li_status {
 #define BC_SSL_O_NONE           0x0000
 #define BC_SSL_O_NO_TLS_TICKETS 0x0100	/* disable session resumption tickets */
 #define BC_SSL_O_PREF_CLIE_CIPH 0x0200  /* prefer client ciphers */
+#define BC_SSL_O_STRICT_SNI     0x0400  /* refuse negotiation if sni doesn't match a certificate */
 #endif
 
 struct tls_version_filter {
@@ -136,7 +140,7 @@ struct ssl_bind_conf {
 	unsigned int verify:3;     /* verify method (set of SSL_VERIFY_* flags) */
 	unsigned int no_ca_names:1;/* do not send ca names to clients (ca_file related) */
 	unsigned int early_data:1; /* early data allowed */
-	unsigned int ocsp_update:2;/* enable OCSP auto update */
+	unsigned int ktls:1;       /* use kTLS if available */
 	char *ca_file;             /* CAfile to use on verify and ca-names */
 	char *ca_verify_file;      /* CAverify file to use on verify only */
 	char *crl_file;            /* CRLfile to use on verify */
@@ -167,10 +171,6 @@ struct bind_conf {
 	unsigned long long ca_ignerr_bitfield[IGNERR_BF_SIZE];   /* ignored verify errors in handshake if depth > 0 */
 	unsigned long long crt_ignerr_bitfield[IGNERR_BF_SIZE];  /* ignored verify errors in handshake if depth == 0 */
 	void *initial_ctx;             /* SSL context for initial negotiation */
-	void *default_ctx;             /* SSL context of first/default certificate */
-	struct ckch_inst *default_inst;
-	struct ssl_bind_conf *default_ssl_conf; /* custom SSL conf of default_ctx */
-	int strict_sni;            /* refuse negotiation if sni doesn't match a certificate */
 	int ssl_options;           /* ssl options */
 	struct eb_root sni_ctx;    /* sni_ctx tree of all known certs full-names sorted by name */
 	struct eb_root sni_w_ctx;  /* sni_ctx tree of all known certs wildcards sorted by name */
@@ -184,6 +184,7 @@ struct bind_conf {
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters. */
 	struct quic_cc_algo *quic_cc_algo; /* QUIC control congestion algorithm */
+	size_t max_cwnd;                   /* QUIC maximumu congestion control window size (kB) */
 	enum quic_sock_mode quic_mode;     /* QUIC socket allocation strategy */
 #endif
 	struct proxy *frontend;    /* the frontend all these listeners belong to, or NULL */
@@ -193,6 +194,8 @@ struct bind_conf {
 	unsigned int analysers;    /* bitmap of required protocol analysers */
 	int maxseg;                /* for TCP, advertised MSS */
 	int tcp_ut;                /* for TCP, user timeout */
+	char *tcp_md5sig;          /* TCP MD5 signature password (RFC2385) */
+	int idle_ping;             /* MUX idle-ping interval in ms */
 	int maxaccept;             /* if set, max number of connections accepted at once (-1 when disabled) */
 	unsigned int backlog;      /* if set, listen backlog */
 	int maxconn;               /* maximum connections allowed on this listener */
@@ -207,7 +210,10 @@ struct bind_conf {
 	char *arg;                 /* argument passed to "bind" for better error reporting */
 	char *file;                /* file where the section appears */
 	int line;                  /* line where the section appears */
-	char *reverse_srvname;     /* name of server when using "rev@" address */
+	char *guid_prefix;         /* prefix for listeners GUID */
+	size_t guid_idx;           /* next index for listeners GUID generation */
+	char *rhttp_srvname;       /* name of server when using "rhttp@" address */
+	int rhttp_nbconn;          /* count of connections to initiate in parallel */
 	__decl_thread(HA_RWLOCK_T sni_lock); /* lock the SNI trees during add/del operations */
 	struct thread_set thread_set; /* entire set of the allowed threads (0=no restriction) */
 	struct rx_settings settings; /* all the settings needed for the listening socket */
@@ -240,7 +246,7 @@ struct listener {
 	struct fe_counters *counters;	/* statistics counters */
 	struct mt_list wait_queue;	/* link element to make the listener wait for something (LI_LIMITED)  */
 	char *name;			/* listener's name */
-
+	char *label;                    /* listener's label */
 	unsigned int thr_conn[MAX_THREADS_PER_GROUP]; /* number of connections per thread for the group */
 
 	struct list by_fe;              /* chaining in frontend's list of listeners */
@@ -251,6 +257,8 @@ struct listener {
 		struct eb32_node id;	/* place in the tree of used IDs */
 	} conf;				/* config information */
 
+	struct guid_node guid;		/* GUID global tree node */
+
 	struct li_per_thread *per_thr;  /* per-thread fields (one per thread in the group) */
 
 	EXTRA_COUNTERS(extra_counters);
@@ -259,6 +267,7 @@ struct listener {
 /* listener flags (16 bits) */
 #define LI_F_FINALIZED           0x0001  /* listener made it to the READY||LIMITED||FULL state at least once, may be suspended/resumed safely */
 #define LI_F_SUSPENDED           0x0002  /* listener has been suspended using suspend_listener(), it is either is LI_PAUSED or LI_ASSIGNED state */
+#define LI_F_UDP_GSO_NOTSUPP     0x0004  /* UDP GSO disabled after send error */
 
 /* Descriptor for a "bind" keyword. The ->parse() function returns 0 in case of
  * success, or a combination of ERR_* flags if an error is encountered. The
@@ -270,6 +279,7 @@ struct bind_kw {
 	const char *kw;
 	int (*parse)(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err);
 	int skip; /* nb of args to skip */
+	int rhttp_ok; /* non-zero if kw is support for reverse HTTP bind */
 };
 
 /* same as bind_kw but for crtlist keywords */

@@ -3,11 +3,19 @@
  *
  * Copyright 2022 HAProxy Technologies
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2.1 of the License, or (at your option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
 #include <string.h>
@@ -18,6 +26,7 @@
 #include <haproxy/errors.h>
 #include <haproxy/signal.h>
 #include <haproxy/xxhash.h>
+#include <haproxy/cfgparse.h>
 
 /* event types changes in event_hdl-t.h file should be reflected in the
  * map below to allow string to type and type to string conversions
@@ -32,6 +41,13 @@ static struct event_hdl_sub_type_map event_hdl_sub_type_map[] = {
 	{"SERVER_STATE",        EVENT_HDL_SUB_SERVER_STATE},
 	{"SERVER_ADMIN",        EVENT_HDL_SUB_SERVER_ADMIN},
 	{"SERVER_CHECK",        EVENT_HDL_SUB_SERVER_CHECK},
+	{"SERVER_INETADDR",     EVENT_HDL_SUB_SERVER_INETADDR},
+	{"PAT_REF",             EVENT_HDL_SUB_PAT_REF},
+	{"PAT_REF_ADD",         EVENT_HDL_SUB_PAT_REF_ADD},
+	{"PAT_REF_DEL",         EVENT_HDL_SUB_PAT_REF_DEL},
+	{"PAT_REF_SET",         EVENT_HDL_SUB_PAT_REF_SET},
+	{"PAT_REF_COMMIT",      EVENT_HDL_SUB_PAT_REF_COMMIT},
+	{"PAT_REF_CLEAR",       EVENT_HDL_SUB_PAT_REF_CLEAR},
 };
 
 /* internal types (only used in this file) */
@@ -42,15 +58,13 @@ struct event_hdl_async_task_default_ctx
 };
 
 /* memory pools declarations */
-DECLARE_STATIC_POOL(pool_head_sub, "ehdl_sub", sizeof(struct event_hdl_sub));
-DECLARE_STATIC_POOL(pool_head_sub_event, "ehdl_sub_e", sizeof(struct event_hdl_async_event));
-DECLARE_STATIC_POOL(pool_head_sub_event_data, "ehdl_sub_ed", sizeof(struct event_hdl_async_event_data));
-DECLARE_STATIC_POOL(pool_head_sub_taskctx, "ehdl_sub_tctx", sizeof(struct event_hdl_async_task_default_ctx));
+DECLARE_STATIC_TYPED_POOL(pool_head_sub, "ehdl_sub", struct event_hdl_sub);
+DECLARE_STATIC_TYPED_POOL(pool_head_sub_event, "ehdl_sub_e", struct event_hdl_async_event);
+DECLARE_STATIC_TYPED_POOL(pool_head_sub_event_data, "ehdl_sub_ed", struct event_hdl_async_event_data);
+DECLARE_STATIC_TYPED_POOL(pool_head_sub_taskctx, "ehdl_sub_tctx", struct event_hdl_async_task_default_ctx);
 
-/* TODO: will become a config tunable
- * ie: tune.events.max-async-notif-at-once
- */
-static int event_hdl_async_max_notif_at_once = 10;
+/* global event_hdl tunables (public variable) */
+struct event_hdl_tune event_hdl_tune;
 
 /* global subscription list (implicit where NULL is used as sublist argument) */
 static event_hdl_sub_list global_event_hdl_sub_list;
@@ -63,14 +77,13 @@ static void _event_hdl_sub_list_destroy(event_hdl_sub_list *sub_list);
 static void event_hdl_deinit(struct sig_handler *sh)
 {
 	event_hdl_sub_list *cur_list;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 
 	/* destroy all known subscription lists */
-	mt_list_for_each_entry_safe(cur_list, &known_event_hdl_sub_list, known, elt1, elt2) {
-		/* remove cur elem from list */
-		MT_LIST_DELETE_SAFE(elt1);
-		/* then destroy it */
+	MT_LIST_FOR_EACH_ENTRY_UNLOCKED(cur_list, &known_event_hdl_sub_list, known, back) {
+		/* remove cur elem from list and free it */
 		_event_hdl_sub_list_destroy(cur_list);
+		cur_list = NULL;
 	}
 }
 
@@ -80,6 +93,9 @@ static void event_hdl_init(void)
 	event_hdl_sub_list_init(&global_event_hdl_sub_list);
 	/* register the deinit function, will be called on soft-stop */
 	signal_register_fct(0, event_hdl_deinit, 0);
+
+	/* set some default values */
+	event_hdl_tune.max_events_at_once = EVENT_HDL_MAX_AT_ONCE;
 }
 
 /* general purpose hashing function when you want to compute
@@ -127,7 +143,7 @@ struct event_hdl_sub_type event_hdl_string_to_sub_type(const char *name)
 	int it;
 
 	for (it = 0; it < (int)(sizeof(event_hdl_sub_type_map) / sizeof(event_hdl_sub_type_map[0])); it++) {
-		if (!strcmp(name, event_hdl_sub_type_map[it].name))
+		if (strcmp(name, event_hdl_sub_type_map[it].name) == 0)
 			return event_hdl_sub_type_map[it].type;
 	}
 	return EVENT_HDL_SUB_NONE;
@@ -241,7 +257,7 @@ static struct task *event_hdl_async_task_default(struct task *task, void *ctx, u
 	 * no more events to come (handler is unregistered)
 	 * so we must free task_ctx and stop task
 	 */
-	while (max_notif_at_once_it < event_hdl_async_max_notif_at_once &&
+	while (max_notif_at_once_it < event_hdl_tune.max_events_at_once &&
 	       (event = event_hdl_async_equeue_pop(&task_ctx->e_queue)))
 	{
 		if (event_hdl_sub_type_equal(event->type, EVENT_HDL_SUB_END)) {
@@ -288,11 +304,11 @@ static inline struct event_hdl_sub_type _event_hdl_getsub_async(struct event_hdl
 	struct mt_list lock;
 	struct event_hdl_sub_type type = EVENT_HDL_SUB_NONE;
 
-	lock = MT_LIST_LOCK_ELT(&cur_sub->mt_list);
+	lock = mt_list_lock_full(&cur_sub->mt_list);
 	if (lock.next != &cur_sub->mt_list)
 		type = _event_hdl_getsub(cur_sub);
 	// else already removed
-	MT_LIST_UNLOCK_ELT(&cur_sub->mt_list, lock);
+	mt_list_unlock_full(&cur_sub->mt_list, lock);
 	return type;
 }
 
@@ -309,11 +325,11 @@ static inline int _event_hdl_resub_async(struct event_hdl_sub *cur_sub, struct e
 	int status = 0;
 	struct mt_list lock;
 
-	lock = MT_LIST_LOCK_ELT(&cur_sub->mt_list);
+	lock = mt_list_lock_full(&cur_sub->mt_list);
 	if (lock.next != &cur_sub->mt_list)
 		status = _event_hdl_resub(cur_sub, type);
 	// else already removed
-	MT_LIST_UNLOCK_ELT(&cur_sub->mt_list, lock);
+	mt_list_unlock_full(&cur_sub->mt_list, lock);
 	return status;
 }
 
@@ -332,13 +348,14 @@ static inline void _event_hdl_unsubscribe(struct event_hdl_sub *del_sub)
 		 * kill themselves (ie: normal async mode) when they receive such event
 		 */
 		HA_ATOMIC_INC(&del_sub->hdl.async_equeue->size);
-		lock = MT_LIST_APPEND_LOCKED(&del_sub->hdl.async_equeue->head, &del_sub->async_end->mt_list);
+		mt_list_lock_elem(&del_sub->async_end->mt_list);
+		lock = mt_list_lock_prev(&del_sub->hdl.async_equeue->head);
 
 		/* wake up the task */
 		event_hdl_task_wakeup(del_sub->hdl.async_task);
 
 		/* unlock END EVENT (we're done, the task is now free to consume it) */
-		MT_LIST_UNLOCK_ELT(&del_sub->async_end->mt_list, lock);
+		mt_list_unlock_full(&del_sub->async_end->mt_list, lock);
 
 		/* we don't free sub here
 		* freeing will be performed by async task so it can safely rely
@@ -408,8 +425,7 @@ static void event_hdl_unsubscribe_sync(const struct event_hdl_sub_mgmt *mgmt)
 		return; /* already removed from sync ctx */
 
 	/* assuming that publish sync code will notice that mgmt->this is NULL
-	 * and will perform the list removal using MT_LIST_DELETE_SAFE and
-	 * _event_hdl_unsubscribe()
+	 * and will perform the list removal and _event_hdl_unsubscribe()
 	 * while still owning the lock
 	 */
 	((struct event_hdl_sub_mgmt *)mgmt)->this = NULL;
@@ -436,7 +452,7 @@ struct event_hdl_sub *event_hdl_subscribe_ptr(event_hdl_sub_list *sub_list,
                                               struct event_hdl_sub_type e_type, struct event_hdl hdl)
 {
 	struct event_hdl_sub *new_sub = NULL;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	struct event_hdl_async_task_default_ctx	*task_ctx = NULL;
 	struct mt_list lock;
 
@@ -512,14 +528,14 @@ struct event_hdl_sub *event_hdl_subscribe_ptr(event_hdl_sub_list *sub_list,
 	/* ready for registration */
 	MT_LIST_INIT(&new_sub->mt_list);
 
-	lock = MT_LIST_LOCK_ELT(&sub_list->known);
+	lock = mt_list_lock_full(&sub_list->known);
 
 	/* check if such identified hdl is not already registered */
 	if (hdl.id) {
 		struct event_hdl_sub *cur_sub;
 		uint8_t found = 0;
 
-		mt_list_for_each_entry_safe(cur_sub, &sub_list->head, mt_list, elt1, elt2) {
+		MT_LIST_FOR_EACH_ENTRY_LOCKED(cur_sub, &sub_list->head, mt_list, back) {
 			if (hdl.id == cur_sub->hdl.id) {
 				/* we found matching registered hdl */
 				found = 1;
@@ -528,7 +544,7 @@ struct event_hdl_sub *event_hdl_subscribe_ptr(event_hdl_sub_list *sub_list,
 		}
 		if (found) {
 			/* error already registered */
-			MT_LIST_UNLOCK_ELT(&sub_list->known, lock);
+			mt_list_unlock_full(&sub_list->known, lock);
 			event_hdl_report_hdl_state(ha_alert, &hdl, "SUB", "could not subscribe: subscription with this id already exists");
 			goto cleanup;
 		}
@@ -540,7 +556,7 @@ struct event_hdl_sub *event_hdl_subscribe_ptr(event_hdl_sub_list *sub_list,
 		 * it is a memory/IO error since it should not be long before haproxy
 		 * enters the deinit() function anyway
 		 */
-		MT_LIST_UNLOCK_ELT(&sub_list->known, lock);
+		mt_list_unlock_full(&sub_list->known, lock);
 		goto cleanup;
 	}
 
@@ -564,7 +580,7 @@ struct event_hdl_sub *event_hdl_subscribe_ptr(event_hdl_sub_list *sub_list,
 		MT_LIST_APPEND(&sub_list->head, &new_sub->mt_list);
 	}
 
-	MT_LIST_UNLOCK_ELT(&sub_list->known, lock);
+	mt_list_unlock_full(&sub_list->known, lock);
 
 	return new_sub;
 
@@ -618,11 +634,11 @@ void event_hdl_pause(struct event_hdl_sub *cur_sub)
 {
 	struct mt_list lock;
 
-	lock = MT_LIST_LOCK_ELT(&cur_sub->mt_list);
+	lock = mt_list_lock_full(&cur_sub->mt_list);
 	if (lock.next != &cur_sub->mt_list)
 		_event_hdl_pause(cur_sub);
 	// else already removed
-	MT_LIST_UNLOCK_ELT(&cur_sub->mt_list, lock);
+	mt_list_unlock_full(&cur_sub->mt_list, lock);
 }
 
 void _event_hdl_resume(struct event_hdl_sub *cur_sub)
@@ -634,11 +650,11 @@ void event_hdl_resume(struct event_hdl_sub *cur_sub)
 {
 	struct mt_list lock;
 
-	lock = MT_LIST_LOCK_ELT(&cur_sub->mt_list);
+	lock = mt_list_lock_full(&cur_sub->mt_list);
 	if (lock.next != &cur_sub->mt_list)
 		_event_hdl_resume(cur_sub);
 	// else already removed
-	MT_LIST_UNLOCK_ELT(&cur_sub->mt_list, lock);
+	mt_list_unlock_full(&cur_sub->mt_list, lock);
 }
 
 void event_hdl_unsubscribe(struct event_hdl_sub *del_sub)
@@ -667,17 +683,18 @@ int event_hdl_lookup_unsubscribe(event_hdl_sub_list *sub_list,
                                  uint64_t lookup_id)
 {
 	struct event_hdl_sub *del_sub = NULL;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	int found = 0;
 
 	if (!sub_list)
 		sub_list = &global_event_hdl_sub_list; /* fall back to global list */
 
-	mt_list_for_each_entry_safe(del_sub, &sub_list->head, mt_list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(del_sub, &sub_list->head, mt_list, back) {
 		if (lookup_id == del_sub->hdl.id) {
 			/* we found matching registered hdl */
-			MT_LIST_DELETE_SAFE(elt1);
+			mt_list_unlock_self(&del_sub->mt_list);
 			_event_hdl_unsubscribe(del_sub);
+			del_sub = NULL;
 			found = 1;
 			break; /* id is unique, stop searching */
 		}
@@ -689,13 +706,13 @@ int event_hdl_lookup_resubscribe(event_hdl_sub_list *sub_list,
                                  uint64_t lookup_id, struct event_hdl_sub_type type)
 {
 	struct event_hdl_sub *cur_sub = NULL;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	int status = 0;
 
 	if (!sub_list)
 		sub_list = &global_event_hdl_sub_list; /* fall back to global list */
 
-	mt_list_for_each_entry_safe(cur_sub, &sub_list->head, mt_list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(cur_sub, &sub_list->head, mt_list, back) {
 		if (lookup_id == cur_sub->hdl.id) {
 			/* we found matching registered hdl */
 			status = _event_hdl_resub(cur_sub, type);
@@ -709,13 +726,13 @@ int event_hdl_lookup_pause(event_hdl_sub_list *sub_list,
                            uint64_t lookup_id)
 {
 	struct event_hdl_sub *cur_sub = NULL;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	int found = 0;
 
 	if (!sub_list)
 		sub_list = &global_event_hdl_sub_list; /* fall back to global list */
 
-	mt_list_for_each_entry_safe(cur_sub, &sub_list->head, mt_list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(cur_sub, &sub_list->head, mt_list, back) {
 		if (lookup_id == cur_sub->hdl.id) {
 			/* we found matching registered hdl */
 			_event_hdl_pause(cur_sub);
@@ -730,13 +747,13 @@ int event_hdl_lookup_resume(event_hdl_sub_list *sub_list,
                             uint64_t lookup_id)
 {
 	struct event_hdl_sub *cur_sub = NULL;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	int found = 0;
 
 	if (!sub_list)
 		sub_list = &global_event_hdl_sub_list; /* fall back to global list */
 
-	mt_list_for_each_entry_safe(cur_sub, &sub_list->head, mt_list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(cur_sub, &sub_list->head, mt_list, back) {
 		if (lookup_id == cur_sub->hdl.id) {
 			/* we found matching registered hdl */
 			_event_hdl_resume(cur_sub);
@@ -751,13 +768,13 @@ struct event_hdl_sub *event_hdl_lookup_take(event_hdl_sub_list *sub_list,
                                             uint64_t lookup_id)
 {
 	struct event_hdl_sub *cur_sub = NULL;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	uint8_t found = 0;
 
 	if (!sub_list)
 		sub_list = &global_event_hdl_sub_list; /* fall back to global list */
 
-	mt_list_for_each_entry_safe(cur_sub, &sub_list->head, mt_list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(cur_sub, &sub_list->head, mt_list, back) {
 		if (lookup_id == cur_sub->hdl.id) {
 			/* we found matching registered hdl */
 			event_hdl_take(cur_sub);
@@ -776,11 +793,11 @@ static int _event_hdl_publish(event_hdl_sub_list *sub_list, struct event_hdl_sub
                               const struct event_hdl_cb_data *data)
 {
 	struct event_hdl_sub *cur_sub;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	struct event_hdl_async_event_data *async_data = NULL; /* reuse async data for multiple async hdls */
 	int error = 0;
 
-	mt_list_for_each_entry_safe(cur_sub, &sub_list->head, mt_list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(cur_sub, &sub_list->head, mt_list, back) {
 		/* notify each function that has subscribed to sub_family.type, unless paused */
 		if ((cur_sub->sub.family == e_type.family) &&
 		    ((cur_sub->sub.subtype & e_type.subtype) == e_type.subtype) &&
@@ -810,10 +827,11 @@ static int _event_hdl_publish(event_hdl_sub_list *sub_list, struct event_hdl_sub
 				if (!sub_mgmt.this) {
 					/* user has performed hdl unsub
 					 * we must remove it from the list
+					 * then free it.
 					 */
-					MT_LIST_DELETE_SAFE(elt1);
-					/* then free it */
+					mt_list_unlock_self(&cur_sub->mt_list);
 					_event_hdl_unsubscribe(cur_sub);
+					cur_sub = NULL;
 				}
 			} else {
 				/* async mode: here we need to prepare event data
@@ -872,8 +890,10 @@ static int _event_hdl_publish(event_hdl_sub_list *sub_list, struct event_hdl_sub
 					 * use the same async_data
 					 */
 					HA_ATOMIC_INC(&async_data->refcount);
-				} else
+				} else {
+					new_event->_data = NULL;
 					new_event->data = NULL;
+				}
 
 				/* appending new event to event hdl queue */
 				MT_LIST_INIT(&new_event->mt_list);
@@ -941,13 +961,12 @@ void event_hdl_sub_list_init(event_hdl_sub_list *sub_list)
 static void _event_hdl_sub_list_destroy(event_hdl_sub_list *sub_list)
 {
 	struct event_hdl_sub *cur_sub;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 
-	mt_list_for_each_entry_safe(cur_sub, &sub_list->head, mt_list, elt1, elt2) {
-		/* remove cur elem from list */
-		MT_LIST_DELETE_SAFE(elt1);
-		/* then free it */
+	MT_LIST_FOR_EACH_ENTRY_UNLOCKED(cur_sub, &sub_list->head, mt_list, back) {
+		/* remove cur elem from list and free it */
 		_event_hdl_unsubscribe(cur_sub);
+		cur_sub = NULL;
 	}
 }
 
@@ -962,5 +981,35 @@ void event_hdl_sub_list_destroy(event_hdl_sub_list *sub_list)
 		return; /* already destroyed */
 	_event_hdl_sub_list_destroy(sub_list);
 }
+
+/* config parser for global "tune.events.max-events-at-once" */
+static int event_hdl_parse_max_events_at_once(char **args, int section_type, struct proxy *curpx,
+                                              const struct proxy *defpx, const char *file, int line,
+                                              char **err)
+{
+	int arg = -1;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) != 0)
+		arg = atoi(args[1]);
+
+	if (arg < 1 || arg > 10000) {
+		memprintf(err, "'%s' expects an integer argument between 1 and 10000.", args[0]);
+		return -1;
+	}
+
+	event_hdl_tune.max_events_at_once = arg;
+	return 0;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.events.max-events-at-once", event_hdl_parse_max_events_at_once },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
 INITCALL0(STG_INIT, event_hdl_init);

@@ -34,6 +34,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/check.h>
 #include <haproxy/chunk.h>
+#include <haproxy/counters.h>
 #include <haproxy/dgram.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/extcheck.h>
@@ -189,18 +190,16 @@ static void check_trace(enum trace_level level, uint64_t mask,
 	if (!check || src->verbosity < CHK_VERB_CLEAN)
 		return;
 
-	if (srv) {
-		chunk_appendf(&trace_buf, " : [%c] SRV=%s",
-			      ((check->type == PR_O2_EXT_CHK) ? 'E' : (check->state & CHK_ST_AGENT ? 'A' : 'H')),
-			      srv->id);
+	BUG_ON(!srv);
+	chunk_appendf(&trace_buf, " : [%c] SRV=%s",
+		      ((check->type == PR_O2_EXT_CHK) ? 'E' : (check->state & CHK_ST_AGENT ? 'A' : 'H')),
+		      srv->id);
 
-		chunk_appendf(&trace_buf, " status=%d/%d %s",
-			      (check->health >= check->rise) ? check->health - check->rise + 1 : check->health,
-			      (check->health >= check->rise) ? check->fall : check->rise,
-			      (check->health >= check->rise) ? (srv->uweight ? "UP" : "DRAIN") : "DOWN");
-	}
-	else
-		chunk_appendf(&trace_buf, " : [EMAIL]");
+	chunk_appendf(&trace_buf, " status=%d/%d %s exp=%d",
+		      (check->health >= check->rise) ? check->health - check->rise + 1 : check->health,
+		      (check->health >= check->rise) ? check->fall : check->rise,
+		      (check->health >= check->rise) ? (srv->uweight ? "UP" : "DRAIN") : "DOWN",
+		      (check->task->expire ? TICKS_TO_MS(check->task->expire - now_ms) : 0));
 
 	switch (check->result) {
 	case CHK_RES_NEUTRAL: res = "-";     break;
@@ -514,7 +513,7 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		if ((!(check->state & CHK_ST_AGENT) ||
 		    (check->status >= HCHK_STATUS_L57DATA)) &&
 		    (check->health > 0)) {
-			_HA_ATOMIC_INC(&s->counters.failed_checks);
+			_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->failed_checks);
 			report = 1;
 			check->health--;
 			if (check->health < check->rise)
@@ -562,7 +561,6 @@ void set_server_check_status(struct check *check, short status, const char *desc
 
 		ha_warning("%s.\n", trash.area);
 		send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.area);
-		send_email_alert(s, LOG_INFO, "%s", trash.area);
 	}
 }
 
@@ -742,7 +740,7 @@ void __health_adjust(struct server *s, short status)
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
 	HA_ATOMIC_STORE(&s->consecutive_errors, 0);
-	_HA_ATOMIC_INC(&s->counters.failed_hana);
+	_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->failed_hana);
 
 	if (s->check.fastinter) {
 		/* timer might need to be advanced, it might also already be
@@ -823,9 +821,6 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 	if (conn && errno)
 		retrieve_errno_from_socket(conn);
 
-	if (conn && !(conn->flags & CO_FL_ERROR) && !sc_ep_test(sc, SE_FL_ERROR) && !expired)
-		return;
-
 	TRACE_ENTER(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check, 0, 0, (size_t[]){expired});
 
 	/* we'll try to build a meaningful error message depending on the
@@ -860,7 +855,9 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 					chunk_appendf(chk, " (expect string '%.*s')", (unsigned int)istlen(expect->data), istptr(expect->data));
 					break;
 				case TCPCHK_EXPECT_BINARY:
-					chunk_appendf(chk, " (expect binary '%.*s')", (unsigned int)istlen(expect->data), istptr(expect->data));
+					chunk_appendf(chk, " (expect binary '");
+					dump_binary(chk, istptr(expect->data), (int)istlen(expect->data));
+					chunk_appendf(chk, "')");
 					break;
 				case TCPCHK_EXPECT_STRING_REGEX:
 					chunk_appendf(chk, " (expect regex)");
@@ -976,6 +973,11 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 		set_server_check_status(check, tout, err_msg);
 	}
 
+	if (check->result == CHK_RES_UNKNOWN) {
+		/* No other reason found, report a socket error (may be an internal or a ressournce error) */
+		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
+	}
+
 	TRACE_LEAVE(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
 	return;
 }
@@ -992,6 +994,7 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
 				      "UP %d/%d", "UP",
 				      "NOLB %d/%d", "NOLB",
 				      "no check" };
+	unsigned long last_change = s->last_change;
 
 	if (!(s->check.state & CHK_ST_ENABLED))
 		sv_state = 6;
@@ -1025,13 +1028,13 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
 		      global.node,
 		      (s->cur_eweight * s->proxy->lbprm.wmult + s->proxy->lbprm.wdiv - 1) / s->proxy->lbprm.wdiv,
 		      (s->proxy->lbprm.tot_weight * s->proxy->lbprm.wmult + s->proxy->lbprm.wdiv - 1) / s->proxy->lbprm.wdiv,
-		      s->cur_sess, s->proxy->beconn - s->proxy->queue.length,
-		      s->queue.length);
+		      s->cur_sess, s->proxy->beconn - s->proxy->queueslength,
+		      s->queueslength);
 
 	if ((s->cur_state == SRV_ST_STARTING) &&
-	    ns_to_sec(now_ns) < s->last_change + s->slowstart &&
-	    ns_to_sec(now_ns) >= s->last_change) {
-		ratio = MAX(1, 100 * (ns_to_sec(now_ns) - s->last_change) / s->slowstart);
+	    ns_to_sec(now_ns) < last_change + s->slowstart &&
+	    ns_to_sec(now_ns) >= last_change) {
+		ratio = MAX(1, 100 * (ns_to_sec(now_ns) - last_change) / s->slowstart);
 		chunk_appendf(buf, "; throttle=%d%%", ratio);
 	}
 
@@ -1050,17 +1053,15 @@ int wake_srv_chk(struct stconn *sc)
 {
 	struct connection *conn;
 	struct check *check = __sc_check(sc);
-	struct email_alertq *q = container_of(check, typeof(*q), check);
 	int ret = 0;
+
+	BUG_ON(!check->server);
 
 	TRACE_ENTER(CHK_EV_HCHK_WAKE, check);
 	if (check->result != CHK_RES_UNKNOWN)
 		goto end;
 
-	if (check->server)
-		HA_SPIN_LOCK(SERVER_LOCK, &check->server->lock);
-	else
-		HA_SPIN_LOCK(EMAIL_ALERTS_LOCK, &q->lock);
+	HA_SPIN_LOCK(SERVER_LOCK, &check->server->lock);
 
 	/* we may have to make progress on the TCP checks */
 	ret = tcpcheck_main(check);
@@ -1086,11 +1087,13 @@ int wake_srv_chk(struct stconn *sc)
 		ret = -1;
 		task_wakeup(check->task, TASK_WOKEN_IO);
 	}
+	else {
+		/* Check in progress. Queue it to eventually handle timeout
+		 * update */
+		task_queue(check->task);
+	}
 
-	if (check->server)
-		HA_SPIN_UNLOCK(SERVER_LOCK, &check->server->lock);
-	else
-		HA_SPIN_UNLOCK(EMAIL_ALERTS_LOCK, &q->lock);
+	HA_SPIN_UNLOCK(SERVER_LOCK, &check->server->lock);
 
   end:
 	TRACE_LEAVE(CHK_EV_HCHK_WAKE, check);
@@ -1103,7 +1106,7 @@ struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state)
 	struct stconn *sc = ctx;
 
 	wake_srv_chk(sc);
-	return NULL;
+	return t;
 }
 
 /* returns <0, 0, >0 if check thread 1 is respectively less loaded than,
@@ -1277,7 +1280,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * was erased during the bounce.
 		 */
 		if (!tick_isset(t->expire)) {
-			t->expire = now_ms;
+			t->expire = tick_add(now_ms, 0);
 			expired = 0;
 		}
 	}
@@ -1380,7 +1383,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * as a failed response coupled with "observe layer7" caused the
 		 * server state to be suddenly changed.
 		 */
-		sc_conn_drain_and_shut(sc);
+		se_shutdown(sc->sedesc, SE_SHR_DRAIN|SE_SHW_SILENT);
 	}
 
 	if (sc) {
@@ -1413,8 +1416,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		}
 	}
 
-        if (LIST_INLIST(&check->buf_wait.list))
-                LIST_DEL_INIT(&check->buf_wait.list);
+	b_dequeue(&check->buf_wait);
 
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
@@ -1503,13 +1505,13 @@ int check_buf_available(void *target)
 
 	BUG_ON(!check->sc);
 
-	if ((check->state & CHK_ST_IN_ALLOC) && b_alloc(&check->bi)) {
+	if ((check->state & CHK_ST_IN_ALLOC) && b_alloc(&check->bi, DB_CHANNEL)) {
 		TRACE_STATE("unblocking check, input buffer allocated", CHK_EV_TCPCHK_EXP|CHK_EV_RX_BLK, check);
 		check->state &= ~CHK_ST_IN_ALLOC;
 		tasklet_wakeup(check->sc->wait_event.tasklet);
 		return 1;
 	}
-	if ((check->state & CHK_ST_OUT_ALLOC) && b_alloc(&check->bo)) {
+	if ((check->state & CHK_ST_OUT_ALLOC) && b_alloc(&check->bo, DB_CHANNEL)) {
 		TRACE_STATE("unblocking check, output buffer allocated", CHK_EV_TCPCHK_SND|CHK_EV_TX_BLK, check);
 		check->state &= ~CHK_ST_OUT_ALLOC;
 		tasklet_wakeup(check->sc->wait_event.tasklet);
@@ -1527,10 +1529,8 @@ struct buffer *check_get_buf(struct check *check, struct buffer *bptr)
 	struct buffer *buf = NULL;
 
 	if (likely(!LIST_INLIST(&check->buf_wait.list)) &&
-	    unlikely((buf = b_alloc(bptr)) == NULL)) {
-		check->buf_wait.target = check;
-		check->buf_wait.wakeup_cb = check_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &check->buf_wait.list);
+	    unlikely((buf = b_alloc(bptr, DB_CHANNEL)) == NULL)) {
+		b_queue(DB_CHANNEL, &check->buf_wait, check, check_buf_available);
 	}
 	return buf;
 }
@@ -1572,6 +1572,8 @@ void free_check(struct check *check)
 		free_tcpcheck_vars(&check->tcpcheck_rules->preset_vars);
 		ha_free(&check->tcpcheck_rules);
 	}
+
+	ha_free(&check->pool_conn_name);
 
 	task_destroy(check->task);
 
@@ -1663,12 +1665,15 @@ static int start_checks()
 
 	struct proxy *px;
 	struct server *s;
+	char *errmsg = NULL;
 	int nbcheck=0, mininter=0, srvpos=0;
 
 	/* 0- init the dummy frontend used to create all checks sessions */
-	init_new_proxy(&checks_fe);
-	checks_fe.id = strdup("CHECKS-FE");
-	checks_fe.cap = PR_CAP_FE | PR_CAP_BE;
+	if (!setup_new_proxy(&checks_fe, "CHECKS-FE", PR_CAP_FE | PR_CAP_BE | PR_CAP_INT, &errmsg)) {
+		ha_alert("error during checks frontend creation: %s\n", errmsg);
+		ha_free(&errmsg);
+		return ERR_ALERT | ERR_FATAL;
+	}
         checks_fe.mode = PR_MODE_TCP;
 	checks_fe.maxconn = 0;
 	checks_fe.conn_retries = CONN_RETRIES;
@@ -1742,6 +1747,12 @@ static int start_checks()
 	return ERR_NONE;
 }
 
+/* called during deinit */
+static void clear_checks()
+{
+	if (checks_fe.id)
+		deinit_proxy(&checks_fe);
+}
 
 /*
  * Return value:
@@ -1827,12 +1838,14 @@ int init_srv_check(struct server *srv)
 	 */
 	if (srv->mux_proto && !srv->check.mux_proto &&
 	    ((srv->mux_proto->mode == PROTO_MODE_HTTP && check_type == TCPCHK_RULES_HTTP_CHK) ||
+	     (srv->mux_proto->mode == PROTO_MODE_SPOP && check_type == TCPCHK_RULES_SPOP_CHK) ||
 	     (srv->mux_proto->mode == PROTO_MODE_TCP && check_type != TCPCHK_RULES_HTTP_CHK))) {
 		srv->check.mux_proto = srv->mux_proto;
 	}
 	/* test that check proto is valid if explicitly defined */
 	else if (srv->check.mux_proto &&
 	         ((srv->check.mux_proto->mode == PROTO_MODE_HTTP && check_type != TCPCHK_RULES_HTTP_CHK) ||
+		  (srv->check.mux_proto->mode == PROTO_MODE_SPOP && check_type != TCPCHK_RULES_SPOP_CHK) ||
 	          (srv->check.mux_proto->mode == PROTO_MODE_TCP && check_type == TCPCHK_RULES_HTTP_CHK))) {
 		ha_alert("config: %s '%s': server '%s' uses an incompatible MUX protocol for the selected check type\n",
 		         proxy_type_str(srv->proxy), srv->proxy->id, srv->id);
@@ -1992,8 +2005,9 @@ REGISTER_POST_CHECK(start_checks);
 
 REGISTER_SERVER_DEINIT(deinit_srv_check);
 REGISTER_SERVER_DEINIT(deinit_srv_agent_check);
+REGISTER_POST_DEINIT(clear_checks);
 
-/* perform minimal intializations */
+/* perform minimal initializations */
 static void init_checks()
 {
 	int i;
@@ -2031,7 +2045,7 @@ static int srv_parse_addr(char **args, int *cur_arg, struct proxy *curpx, struct
 		goto error;
 	}
 
-	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, errmsg, NULL, NULL,
+	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, NULL, errmsg, NULL, NULL, NULL,
 	                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_STREAM | PA_O_CONNECT);
 	if (!sk) {
 		memprintf(errmsg, "'%s' : %s", args[*cur_arg], *errmsg);
@@ -2189,6 +2203,12 @@ static int srv_parse_agent_inter(char **args, int *cur_arg, struct proxy *curpx,
 	}
 	srv->agent.inter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2334,6 +2354,15 @@ static int srv_parse_no_check(char **args, int *cur_arg, struct proxy *curpx, st
 	return 0;
 }
 
+/* Parse the "no-check-reuse-pool" server keyword */
+static int srv_parse_no_check_reuse_pool(char **args, int *cur_arg,
+                                         struct proxy *curpx, struct server *srv,
+                                         char **errmsg)
+{
+	srv->check.reuse_pool = 0;
+	return 0;
+}
+
 /* Parse the "no-check-send-proxy" server keyword */
 static int srv_parse_no_check_send_proxy(char **args, int *cur_arg, struct proxy *curpx, struct server *srv,
 					 char **errmsg)
@@ -2341,6 +2370,34 @@ static int srv_parse_no_check_send_proxy(char **args, int *cur_arg, struct proxy
 	srv->check.send_proxy = 0;
 	return 0;
 }
+
+/* parse the "check-pool-conn-name" server keyword */
+static int srv_parse_check_pool_conn_name(char **args, int *cur_arg,
+                                          struct proxy *px,
+                                          struct server *newsrv, char **err)
+{
+	int err_code = 0;
+
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' : missing value", args[*cur_arg]);
+		goto error;
+	}
+
+	ha_free(&newsrv->check.pool_conn_name);
+	newsrv->check.pool_conn_name = strdup(args[*cur_arg + 1]);
+	if (!newsrv->check.pool_conn_name) {
+		memprintf(err, "'%s' : out of memory", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+  out:
+	return err_code;
+
+  error:
+	err_code |= ERR_ALERT | ERR_FATAL;
+	goto out;
+}
+
 
 /* parse the "check-proto" server keyword */
 static int srv_parse_check_proto(char **args, int *cur_arg,
@@ -2364,6 +2421,15 @@ static int srv_parse_check_proto(char **args, int *cur_arg,
   error:
 	err_code |= ERR_ALERT | ERR_FATAL;
 	goto out;
+}
+
+/* Parse the "check-reuse-pool" server keyword */
+static int srv_parse_check_reuse_pool(char **args, int *cur_arg,
+                                      struct proxy *curpx, struct server *srv,
+                                      char **errmsg)
+{
+	srv->check.reuse_pool = 1;
+	return 0;
 }
 
 
@@ -2458,6 +2524,12 @@ static int srv_parse_check_inter(char **args, int *cur_arg, struct proxy *curpx,
 	}
 	srv->check.inter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2503,6 +2575,12 @@ static int srv_parse_check_fastinter(char **args, int *cur_arg, struct proxy *cu
 	}
 	srv->check.fastinter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2547,6 +2625,12 @@ static int srv_parse_check_downinter(char **args, int *cur_arg, struct proxy *cu
 		goto error;
 	}
 	srv->check.downinter = delay;
+
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
 
   out:
 	return err_code;
@@ -2615,11 +2699,14 @@ static struct srv_kw_list srv_kws = { "CHK", { }, {
 	{ "agent-port",          srv_parse_agent_port,          1,  1,  1 }, /* Set the TCP port used for agent checks. */
 	{ "agent-send",          srv_parse_agent_send,          1,  1,  1 }, /* Set string to send to agent. */
 	{ "check",               srv_parse_check,               0,  1,  1 }, /* Enable health checks */
+	{ "check-pool-conn-name", srv_parse_check_pool_conn_name, 1, 1, 1 }, /* */
 	{ "check-proto",         srv_parse_check_proto,         1,  1,  1 }, /* Set the mux protocol for health checks  */
+	{ "check-reuse-pool",    srv_parse_check_reuse_pool,    0,  1,  1 }, /* Allows to reuse idle connections for checks */
 	{ "check-send-proxy",    srv_parse_check_send_proxy,    0,  1,  1 }, /* Enable PROXY protocol for health checks */
 	{ "check-via-socks4",    srv_parse_check_via_socks4,    0,  1,  1 }, /* Enable socks4 proxy for health checks */
 	{ "no-agent-check",      srv_parse_no_agent_check,      0,  1,  0 }, /* Do not enable any auxiliary agent check */
 	{ "no-check",            srv_parse_no_check,            0,  1,  0 }, /* Disable health checks */
+	{ "no-check-reuse-pool", srv_parse_no_check_reuse_pool, 0,  1,  0 }, /* Disable PROXY protocol for health checks */
 	{ "no-check-send-proxy", srv_parse_no_check_send_proxy, 0,  1,  0 }, /* Disable PROXY protocol for health checks */
 	{ "rise",                srv_parse_check_rise,          1,  1,  1 }, /* Set rise value for health checks */
 	{ "fall",                srv_parse_check_fall,          1,  1,  1 }, /* Set fall value for health checks */

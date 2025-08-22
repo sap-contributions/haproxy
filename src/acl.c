@@ -546,6 +546,25 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 		 */
 		if (!pat_ref_add(ref, arg, NULL, err))
 			goto out_free_expr;
+
+		if (global.mode & MODE_DIAG) {
+			if (strcmp(arg, "&&") == 0 || strcmp(arg, "and") == 0 ||
+			    strcmp(arg, "||") == 0 ||  strcmp(arg, "or") == 0)
+				ha_diag_warning("parsing [%s:%d] : pattern '%s' looks like a failed attempt at using an operator inside a pattern list\n", file, line, arg);
+			else if (strcmp(arg, "#") == 0 || strcmp(arg, "//") == 0)
+				ha_diag_warning("parsing [%s:%d] : pattern '%s' looks like a failed attempt at commenting an end of line\n", file, line, arg);
+			else if (find_acl_kw(arg))
+				ha_diag_warning("parsing [%s:%d] : pattern '%s' suspiciously looks like a known acl keyword\n", file, line, arg);
+			else {
+				const char *begw = arg, *endw;
+
+				for (endw = begw; is_idchar(*endw); endw++)
+					;
+
+				if (endw != begw && find_sample_fetch(begw, endw - begw))
+					ha_diag_warning("parsing [%s:%d] : pattern '%s' suspiciously looks like a known sample fetch keyword\n", file, line, arg);
+			}
+		}
 		args++;
 	}
 
@@ -710,6 +729,7 @@ const struct {
 	{ .name = "HTTP_1.0",       .expr = {"req.ver","1.0",""}},
 	{ .name = "HTTP_1.1",       .expr = {"req.ver","1.1",""}},
 	{ .name = "HTTP_2.0",       .expr = {"req.ver","2.0",""}},
+	{ .name = "HTTP_3.0",       .expr = {"req.ver","3.0",""}},
 	{ .name = "METH_CONNECT",   .expr = {"method","CONNECT",""}},
 	{ .name = "METH_DELETE",    .expr = {"method","DELETE",""}},
 	{ .name = "METH_GET",       .expr = {"method","GET","HEAD",""}},
@@ -737,9 +757,9 @@ const struct {
  * to report missing dependencies. It may be NULL if such dependencies are not
  * allowed.
  */
-static struct acl *find_acl_default(const char *acl_name, struct list *known_acl,
-                                    char **err, struct arg_list *al,
-                                    const char *file, int line)
+struct acl *find_acl_default(const char *acl_name, struct list *known_acl,
+                             char **err, struct arg_list *al,
+                             const char *file, int line)
 {
 	__label__ out_return, out_free_acl_expr, out_free_name;
 	struct acl *cur_acl;
@@ -952,7 +972,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl,
  * condition is returned. NULL is returned in case of error or if the first
  * word is neither "if" nor "unless". It automatically sets the file name and
  * the line number in the condition for better error reporting, and sets the
- * HTTP intiailization requirements in the proxy. If <err> is not NULL, it will
+ * HTTP initialization requirements in the proxy. If <err> is not NULL, it will
  * be filled with a pointer to an error message in case of error, that the
  * caller is responsible for freeing. The initial location must either be
  * freeable or NULL.
@@ -1334,7 +1354,11 @@ int smp_fetch_acl_parse(struct arg *args, char **err_msg)
 			name++;
 		}
 
-		if (!(acl_sample->terms[i].acl = find_acl_by_name(name, &curproxy->acl))) {
+
+		if (
+			!(acl_sample->terms[i].acl = find_acl_by_name(name, &curproxy->acl)) &&
+			!(acl_sample->terms[i].acl = find_acl_default(name, &curproxy->acl, err_msg, NULL, NULL, 0))
+			) {
 			memprintf(err_msg, "ACL '%s' not found", name);
 			goto err;
 		}

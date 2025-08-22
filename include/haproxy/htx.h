@@ -673,10 +673,10 @@ static inline size_t buf_room_for_htx_data(const struct buffer *buf)
 	size_t room;
 
 	room = b_room(buf);
-	if (room <= sizeof(struct htx) + 2 * sizeof(struct htx_blk))
+	if (room <= HTX_BUF_OVERHEAD)
 		room = 0;
 	else
-		room -= sizeof(struct htx) + 2 * sizeof(struct htx_blk);
+		room -= HTX_BUF_OVERHEAD;
 
 	return room;
 }
@@ -700,6 +700,8 @@ static inline struct htx *htxbuf(const struct buffer *buf)
 		htx->size = buf->size - sizeof(*htx);
 		htx_reset(htx);
 	}
+	if (htx->flags & HTX_FL_ALTERED_PAYLOAD)
+		htx->extra = 0;
 	return htx;
 }
 

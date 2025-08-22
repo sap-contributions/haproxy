@@ -22,6 +22,8 @@
 #ifndef _HAPROXY_DEFAULTS_H
 #define _HAPROXY_DEFAULTS_H
 
+#include <haproxy/compat.h>
+
 /* MAX_THREADS defines the highest limit for the global nbthread value. It
  * defaults to the number of bits in a long integer when threads are enabled
  * but may be lowered to save resources on embedded systems.
@@ -42,7 +44,7 @@
  * doesn't engage us too far.
  */
 #ifndef MAX_TGROUPS
-#define MAX_TGROUPS 16
+#define MAX_TGROUPS 32
 #endif
 
 #define MAX_THREADS_PER_GROUP __WORDSIZE
@@ -51,7 +53,7 @@
  * long bits if more tgroups are enabled.
  */
 #ifndef MAX_THREADS
-#define MAX_THREADS ((((MAX_TGROUPS) > 1) ? 4 : 1) * (MAX_THREADS_PER_GROUP))
+#define MAX_THREADS ((((MAX_TGROUPS) > 1) ? 16 : 1) * (MAX_THREADS_PER_GROUP))
 #endif
 
 #endif // USE_THREAD
@@ -69,18 +71,13 @@
 #define BUFSIZE	        16384
 #endif
 
-/* certain buffers may only be allocated for responses in order to avoid
- * deadlocks caused by request queuing. 2 buffers is the absolute minimum
- * acceptable to ensure that a request gaining access to a server can get
- * a response buffer even if it doesn't completely flush the request buffer.
- * The worst case is an applet making use of a request buffer that cannot
- * completely be sent while the server starts to respond, and all unreserved
- * buffers are allocated by request buffers from pending connections in the
- * queue waiting for this one to flush. Both buffers reserved buffers may
- * thus be used at the same time.
- */
+#ifndef BUFSIZE_SMALL
+#define BUFSIZE_SMALL   1024
+#endif
+
+// number of per-thread emergency buffers for low-memory conditions
 #ifndef RESERVED_BUFS
-#define RESERVED_BUFS   2
+#define RESERVED_BUFS   4
 #endif
 
 // reserved buffer space for header rewriting
@@ -112,6 +109,15 @@
 #ifndef LINESIZE
 #define LINESIZE	2048
 #endif
+
+// maximum size of a configuration file that could be loaded in memory via
+// /dev/sdtin. This is needed to prevent from loading extremely large files
+// via standard input.
+#define MAX_CFG_SIZE	10485760
+
+// may be handy for some system config files, where we just need to find
+// some specific values (read with fgets)
+#define MAX_LINES_TO_READ 32
 
 // max # args on a configuration line
 #define MAX_LINE_ARGS   64
@@ -190,6 +196,15 @@
 // value will cause lots of calls, and too high a value may cause high latency.
 #ifndef MAX_POLL_EVENTS
 #define MAX_POLL_EVENTS 200
+#endif
+
+// the max number of rules evaluated in one call to rule handling function.
+// If the function is able to yield, a forced yield will be enforced when
+// reaching this value, else the evaluation will continue. Lowering this
+// value may help to fight against thread contention with cpu-intensive
+// rulesets
+#ifndef MAX_RULES_AT_ONCE
+#define MAX_RULES_AT_ONCE 50
 #endif
 
 /* eternity when exprimed in timeval */
@@ -277,6 +292,13 @@
 // X-Original-To header default
 #define DEF_XORIGINALTO_HDR	"X-Original-To"
 
+/* Max number of events that may be processed at once by
+ * an event_hdl API consumer to prevent thread contention.
+ */
+#ifndef EVENT_HDL_MAX_AT_ONCE
+#define EVENT_HDL_MAX_AT_ONCE 100
+#endif
+
 /* Default connections limit.
  *
  * A system limit can be enforced at build time in order to avoid using haproxy
@@ -295,11 +317,27 @@
 #define DEFAULT_MAXCONN 100
 #endif
 
-/* Define a maxconn which will be used in the master process once it re-exec to
- * the MODE_MWORKER_WAIT and won't change when SYSTEM_MAXCONN is set.
+/* Default file descriptor limit.
  *
- * 100 must be enough for the master since it only does communication between
- * the master and the workers, and the master CLI.
+ * DEFAULT_MAXFD explicitly reduces the hard RLIMIT_NOFILE, which is used by the
+ * process as the base value to calculate the default global.maxsock, if
+ * global.maxconn, global.rlimit_memmax are not defined. This is useful in the
+ * case, when hard nofile limit has been bumped to fs.nr_open (kernel max),
+ * which is extremely large on many modern distros. So, we will also finish with
+ * an extremely large default global.maxsock. The only way to override
+ * DEFAULT_MAXFD, if defined, is to set fd_hard_limit in the config global
+ * section. If DEFAULT_MAXFD is not set, a reasonable maximum of 1048576 will be
+ * used as the default value, which almost guarantees that a process will
+ * correctly start in any situation and will be not killed then by watchdog,
+ * when it will loop over the allocated fdtab.
+*/
+#ifndef DEFAULT_MAXFD
+#define DEFAULT_MAXFD 1048576
+#endif
+
+/* Define a maxconn which will be used in the master process and won't change
+ * when SYSTEM_MAXCONN is set. 100 must be enough for the master since it only
+ * does communication between the master and the workers, and the master CLI.
  */
 #ifndef MASTER_MAXCONN
 #define MASTER_MAXCONN 100
@@ -313,6 +351,11 @@
  */
 #ifndef SRV_CHK_INTER_THRES
 #define SRV_CHK_INTER_THRES 1000
+#endif
+
+/* INET6 connectivity caching interval (in ms) */
+#ifndef INET6_CONNECTIVITY_CACHE_TIME
+#define INET6_CONNECTIVITY_CACHE_TIME 30000
 #endif
 
 /* Specifies the string used to report the version and release date on the
@@ -471,6 +514,10 @@
 
 #define CONFIG_HAP_POOL_BUCKETS (1UL << (CONFIG_HAP_POOL_BUCKETS_BITS))
 
+#ifndef CONFIG_HAP_TBL_BUCKETS
+# define CONFIG_HAP_TBL_BUCKETS CONFIG_HAP_POOL_BUCKETS
+#endif
+
 /* Number of samples used to compute the times reported in stats. A power of
  * two is highly recommended, and this value multiplied by the largest response
  * time must not overflow and unsigned int. See freq_ctr.h for more information.
@@ -513,5 +560,111 @@
 
 /* system sysfs directory */
 #define NUMA_DETECT_SYSTEM_SYSFS_PATH "/sys/devices/system"
+
+/* Number of cache trees */
+#ifndef CACHE_TREE_NUM
+# if defined(USE_THREAD)
+#  define CACHE_TREE_NUM 8
+# else
+#  define CACHE_TREE_NUM 1
+# endif
+#endif
+
+/* number of ring wait queues depending on the number
+ * of threads.
+ */
+#ifndef RING_WAIT_QUEUES
+# if defined(USE_THREAD) && MAX_THREADS >= 32
+#  define RING_WAIT_QUEUES   16
+# elif defined(USE_THREAD)
+#  define RING_WAIT_QUEUES ((MAX_THREADS + 1) / 2)
+# else
+#  define RING_WAIT_QUEUES 1
+# endif
+#endif
+
+/* it has been found that 6 queues was optimal on various archs at various
+ * thread counts, so let's use that by default.
+ */
+#ifndef RING_DFLT_QUEUES
+# define RING_DFLT_QUEUES   6
+#endif
+
+/* Elements used by memory profiling. This determines the number of buckets to
+ * store stats.
+ */
+#ifndef MEMPROF_HASH_BITS
+# define MEMPROF_HASH_BITS 10
+#endif
+#define MEMPROF_HASH_BUCKETS (1U << MEMPROF_HASH_BITS)
+
+/* Let's make DEBUG_STRICT default to 1 to get rid of it in the makefile */
+#ifndef DEBUG_STRICT
+# define DEBUG_STRICT 1
+#endif
+
+/* Let's make DEBUG_THREAD default to 1, and make sure it has a value */
+#ifndef DEBUG_THREAD
+# if defined(USE_THREAD)
+#  define DEBUG_THREAD 1
+# else
+#  define DEBUG_THREAD 0
+# endif
+#endif
+
+/* Let's make DEBUG_COUNTERS default to 1 to have glitches counters by default */
+#ifndef DEBUG_COUNTERS
+# define DEBUG_COUNTERS 1
+#endif
+
+#if !defined(DEBUG_MEMORY_POOLS)
+# define DEBUG_MEMORY_POOLS 1
+#endif
+
+#ifndef MAX_SELF_USE_QUEUE
+#define MAX_SELF_USE_QUEUE 9
+#endif
+
+/*
+ * FWLC defines
+ */
+
+/*
+ * How many mt_lists we use per tree elements.
+ * The more lists we have, the less likely it
+ * will be that we'll have contention when
+ * inserting/removing an element, but the more
+ * costly it will be to look up servers.
+ */
+#ifndef FWLC_LISTS_NB
+#define FWLC_LISTS_NB   4
+#endif /* FWLC_LISTS_NB */
+
+/*
+ * How many entries we want to keep in the
+ * free list, before trying to use some.
+ * We want to keep some nodes in the tree,
+ * to avoid having to re-allocate one and
+ * modify the tree, which requires the
+ * write lock and is costly, but we
+ * don't want to have too much, to save
+ * memory.
+ */
+#ifndef FWLC_MIN_FREE_ENTRIES
+#define FWLC_MIN_FREE_ENTRIES 500
+#endif /* FWLC_MIN_FREE_ENTRIES */
+
+/*
+ * QUIC
+ */
+
+/* Memory usage in bytes on Tx side, 0 for unlimited. */
+#ifndef QUIC_MAX_TX_MEM
+#define QUIC_MAX_TX_MEM 0
+#endif
+
+#ifndef STKTABLE_MAX_UPDATES_AT_ONCE
+#define STKTABLE_MAX_UPDATES_AT_ONCE 100
+#endif /* STKTABLE_MAX_UPDATES_AT_ONCE */
 
 #endif /* _HAPROXY_DEFAULTS_H */

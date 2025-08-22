@@ -105,11 +105,9 @@ enum {
 };
 
 /* bind ocsp update mode */
-enum {
-	SSL_SOCK_OCSP_UPDATE_DFLT     = 0,
-	SSL_SOCK_OCSP_UPDATE_OFF      = 1,
-	SSL_SOCK_OCSP_UPDATE_ON       = 2,
-};
+#define	SSL_SOCK_OCSP_UPDATE_OFF   -1
+#define	SSL_SOCK_OCSP_UPDATE_DFLT   0
+#define	SSL_SOCK_OCSP_UPDATE_ON     1
 
 /* states of the CLI IO handler for 'set ssl cert' */
 enum {
@@ -221,6 +219,10 @@ struct ssl_capture {
 	uint ec_offset;
 	uint ec_formats_offset;
 	uchar ec_formats_len;
+	uchar supver_len;
+	uint supver_offset;
+	ushort sigalgs_len;
+	uint sigalgs_offset;
 	char data[VAR_ARRAY];
 };
 
@@ -244,6 +246,15 @@ struct ssl_keylog {
 };
 #endif
 
+/*
+ * ssl_sock_ctx flags
+ */
+#define SSL_SOCK_F_EARLY_ENABLED	(1 << 0) /* We did not start the handshake yet so we can send early data */
+#define SSL_SOCK_F_KTLS_ENABLED         (1 << 1) /* We can use KTLS on that socket */
+#define SSL_SOCK_F_KTLS_SEND            (1 << 2) /* kTLS send is configured on that socket */
+#define SSL_SOCK_F_KTLS_RECV            (1 << 3) /* kTLS receive is configure on that socket */
+#define SSL_SOCK_F_CTRL_SEND            (1 << 4) /* We want to send a kTLS control message for that socket */
+
 struct ssl_sock_ctx {
 	struct connection *conn;
 	SSL *ssl;
@@ -256,6 +267,10 @@ struct ssl_sock_ctx {
 	unsigned long error_code;     /* last error code of the error stack */
 	struct buffer early_buf;      /* buffer to store the early data received */
 	int sent_early_data;          /* Amount of early data we sent so far */
+	int flags;                    /* Various flags for the ssl_sock_ctx */
+#ifdef HA_USE_KTLS
+	char record_type;             /* Record type to use if not just sending application data */
+#endif
 
 #ifdef USE_QUIC
 	struct quic_conn *qc;
@@ -264,6 +279,7 @@ struct ssl_sock_ctx {
 
 struct global_ssl {
 	char *crt_base;             /* base directory path for certificates */
+	char *key_base;             /* base directory path for private keys */
 	char *ca_base;              /* base directory path for CAs and CRLs */
 	char *issuers_chain_path;   /* from "issuers-chain-path" */
 	int  skip_self_issued_ca;
@@ -303,13 +319,22 @@ struct global_ssl {
 	int keylog; /* activate keylog  */
 	int extra_files; /* which files not defined in the configuration file are we looking for */
 	int extra_files_noext; /* whether we remove the extension when looking up a extra file */
+	int security_level;    /* configure the openssl security level */
 
 #ifndef OPENSSL_NO_OCSP
 	struct {
 		unsigned int delay_max;
 		unsigned int delay_min;
+		int mode; /* default mode used for ocsp auto-update (off, on) */
+		int disable;
 	} ocsp_update;
 #endif
+
+#ifdef HAVE_ACME
+	int acme_scheduler;
+#endif
+
+	int renegotiate; /* Renegotiate mode (SSL_RENEGOTIATE_ flag) */
 };
 
 /* The order here matters for picking a default context,
@@ -318,6 +343,16 @@ struct global_ssl {
 extern const char *SSL_SOCK_KEYTYPE_NAMES[];
 
 #define SSL_SOCK_NUM_KEYTYPES 3
+
+extern struct pool_head *ssl_sock_client_sni_pool;
+
+struct ssl_counters {
+	long long sess;
+	long long reused_sess;
+	long long failed_handshake;
+	long long ocsp_staple;
+	long long failed_ocsp_staple;
+};
 
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_SOCK_T_H */

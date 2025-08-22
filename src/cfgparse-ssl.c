@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <import/ebsttree.h>
+
 #include <haproxy/api.h>
 #include <haproxy/base64.h>
 #include <haproxy/cfgparse.h>
@@ -40,7 +42,9 @@
 #include <haproxy/ssl_utils.h>
 #include <haproxy/tools.h>
 #include <haproxy/ssl_ckch.h>
+#include <haproxy/ssl_crtlist.h>
 #include <haproxy/ssl_ocsp.h>
+#include <haproxy/ssl_sock.h>
 
 
 /****************** Global Section Parsing ********************************************/
@@ -563,6 +567,8 @@ static int ssl_parse_global_dh_param_file(char **args, int section_type, struct 
 	return 0;
 }
 
+#endif
+
 /* parse "ssl.default-dh-param".
  * Returns <0 on alert, >0 on warning, 0 on success.
  */
@@ -570,6 +576,8 @@ static int ssl_parse_global_default_dh(char **args, int section_type, struct pro
                                        const struct proxy *defpx, const char *file, int line,
                                        char **err)
 {
+#ifndef OPENSSL_NO_DH
+
 	if (too_many_args(1, args, err, NULL))
 		return -1;
 
@@ -584,8 +592,12 @@ static int ssl_parse_global_default_dh(char **args, int section_type, struct pro
 		return -1;
 	}
 	return 0;
-}
+#else
+	memprintf(err, "'%s' is not supported by %s, keyword ignored", args[0], OpenSSL_version(OPENSSL_VERSION));
+	return ERR_WARN;
 #endif
+
+}
 
 
 /*
@@ -674,7 +686,7 @@ static int ssl_bind_parse_ca_file_common(char **args, int cur_arg, char **ca_fil
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[cur_arg + 1] != '/') && (*args[cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(ca_file_p, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
 	else
 		memprintf(ca_file_p, "%s", args[cur_arg + 1]);
@@ -714,7 +726,7 @@ static int bind_parse_ca_sign_file(char **args, int cur_arg, struct proxy *px, s
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[cur_arg + 1] != '/') && (*args[cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&conf->ca_sign_file, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
 	else
 		memprintf(&conf->ca_sign_file, "%s", args[cur_arg + 1]);
@@ -777,22 +789,23 @@ static int bind_parse_ciphersuites(char **args, int cur_arg, struct proxy *px, s
 static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	char path[MAXPATHLEN];
+	int default_crt = *args[cur_arg] == 'd' ? 1 : 0;
 
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/' ) && global_ssl.crt_base) {
+	if ((*args[cur_arg + 1] != '@') && (*args[cur_arg + 1] != '/' ) && global_ssl.crt_base) {
 		if ((strlen(global_ssl.crt_base) + 1 + strlen(args[cur_arg + 1]) + 1) > sizeof(path) ||
 		    snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, args[cur_arg + 1]) > sizeof(path)) {
 			memprintf(err, "'%s' : path too long", args[cur_arg]);
 			return ERR_ALERT | ERR_FATAL;
 		}
-		return ssl_sock_load_cert(path, conf, err);
+		return ssl_sock_load_cert(path, conf, default_crt, err);
 	}
 
-	return ssl_sock_load_cert(args[cur_arg + 1], conf, err);
+	return ssl_sock_load_cert(args[cur_arg + 1], conf, default_crt, err);
 }
 
 /* parse the "crt-list" bind keyword. Returns a set of ERR_* flags possibly with an error in <err>. */
@@ -824,7 +837,7 @@ static int ssl_bind_parse_crl_file(char **args, int cur_arg, struct proxy *px, s
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[cur_arg + 1] != '/') && (*args[cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&conf->crl_file, "%s/%s", global_ssl.ca_base, args[cur_arg + 1]);
 	else
 		memprintf(&conf->crl_file, "%s", args[cur_arg + 1]);
@@ -859,6 +872,36 @@ static int ssl_bind_parse_curves(char **args, int cur_arg, struct proxy *px, str
 static int bind_parse_curves(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	return ssl_bind_parse_curves(args, cur_arg, px, &conf->ssl_conf, 0, err);
+}
+
+/* parse the "ktls" bind keyword */
+static int ssl_bind_parse_ktls(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
+{
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument.",
+			  args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	if (!experimental_directives_allowed) {
+		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directive'", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	if (!strcasecmp(args[cur_arg + 1], "on")) {
+		conf->ktls = 1;
+	} else if (!strcasecmp(args[cur_arg + 1], "off")) {
+		conf->ktls = 0;
+	} else {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument, got '%s'.",
+			  args[cur_arg], args[cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+
+}
+
+static int bind_parse_ktls(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_ktls(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
 
 /* parse the "sigalgs" bind keyword */
@@ -1081,10 +1124,13 @@ static int srv_parse_tls_method_minmax(char **args, int *cur_arg, struct proxy *
 	return parse_tls_method_minmax(args, *cur_arg, &newsrv->ssl_ctx.methods, err);
 }
 
-/* parse the "no-tls-tickets" bind keyword */
+/* parse the "no-tls-tickets" and "tls-tickets" bind keywords */
 static int bind_parse_no_tls_tickets(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->ssl_options |= BC_SSL_O_NO_TLS_TICKETS;
+	if (strncmp(args[cur_arg], "no-", 3) == 0)
+		conf->ssl_options |= BC_SSL_O_NO_TLS_TICKETS;
+	else
+		conf->ssl_options &= ~BC_SSL_O_NO_TLS_TICKETS;
 	return 0;
 }
 
@@ -1294,10 +1340,13 @@ static int bind_parse_generate_certs(char **args, int cur_arg, struct proxy *px,
 	return 0;
 }
 
-/* parse the "strict-sni" bind keyword */
+/* parse the "strict-sni" and "no-strict-sni" bind keywords */
 static int bind_parse_strict_sni(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->strict_sni = 1;
+	if (strncmp(args[cur_arg], "no-", 3) != 0)
+		conf->ssl_options |= BC_SSL_O_STRICT_SNI;
+	else
+		conf->ssl_options &= ~BC_SSL_O_STRICT_SNI;
 	return 0;
 }
 
@@ -1472,35 +1521,6 @@ static int bind_parse_no_ca_names(char **args, int cur_arg, struct proxy *px, st
 	return ssl_bind_parse_no_ca_names(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
 
-
-static int ssl_bind_parse_ocsp_update(char **args, int cur_arg, struct proxy *px,
-                                      struct ssl_bind_conf *ssl_conf, int from_cli, char **err)
-{
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : expecting <on|off>", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (strcmp(args[cur_arg + 1], "on") == 0)
-		ssl_conf->ocsp_update = SSL_SOCK_OCSP_UPDATE_ON;
-	else if (strcmp(args[cur_arg + 1], "off") == 0)
-		ssl_conf->ocsp_update = SSL_SOCK_OCSP_UPDATE_OFF;
-	else {
-		memprintf(err, "'%s' : expecting <on|off>", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (ssl_conf->ocsp_update == SSL_SOCK_OCSP_UPDATE_ON) {
-		/* We might need to create the main ocsp update task */
-		int ret = ssl_create_ocsp_update_task(err);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-
 /***************************** "server" keywords Parsing ********************************************/
 
 /* parse the "npn" bind keyword */
@@ -1610,7 +1630,7 @@ static int srv_parse_ca_file(char **args, int *cur_arg, struct proxy *px, struct
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[*cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[*cur_arg + 1] != '/') && (*args[*cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&newsrv->ssl_ctx.ca_file, "%s/%s", global_ssl.ca_base, args[*cur_arg + 1]);
 	else
 		memprintf(&newsrv->ssl_ctx.ca_file, "%s", args[*cur_arg + 1]);
@@ -1638,6 +1658,25 @@ static int srv_parse_check_sni(char **args, int *cur_arg, struct proxy *px, stru
 	}
 	return 0;
 
+}
+
+/* parse the "renegotiate" server keyword */
+static int srv_parse_renegotiate(char **args, int *cur_arg, struct proxy *px,
+                                 struct server *newsrv, char **err)
+{
+
+#if !defined(OPENSSL_IS_AWSLC) && !defined(SSL_OP_NO_RENEGOTIATION)
+	memprintf(err, "'%s' not supported for your SSL library (%s), either SSL_OP_NO_RENEGOTIATION or SSL_set_renegotiate_mode() must be defined.",
+	          args[0], OPENSSL_VERSION_TEXT);
+	return -1;
+#endif
+
+	if (strncmp(*args, "no-", 3) == 0)
+		newsrv->ssl_ctx.renegotiate = SSL_RENEGOTIATE_OFF;
+	else
+		newsrv->ssl_ctx.renegotiate = SSL_RENEGOTIATE_ON;
+
+	return 0;
 }
 
 /* common function to init ssl_ctx */
@@ -1684,6 +1723,9 @@ static int ssl_sock_init_srv(struct server *s)
 			return 1;
 	}
 #endif
+
+	if (global_ssl.renegotiate && !s->ssl_ctx.renegotiate)
+		s->ssl_ctx.renegotiate = global_ssl.renegotiate;
 
 	return 0;
 }
@@ -1782,7 +1824,7 @@ static int srv_parse_crl_file(char **args, int *cur_arg, struct proxy *px, struc
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[*cur_arg + 1] != '/') && global_ssl.ca_base)
+	if ((*args[*cur_arg + 1] != '/') && (*args[*cur_arg + 1] != '@') && global_ssl.ca_base)
 		memprintf(&newsrv->ssl_ctx.crl_file, "%s/%s", global_ssl.ca_base, args[*cur_arg + 1]);
 	else
 		memprintf(&newsrv->ssl_ctx.crl_file, "%s", args[*cur_arg + 1]);
@@ -1827,7 +1869,7 @@ static int srv_parse_crt(char **args, int *cur_arg, struct proxy *px, struct ser
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[*cur_arg + 1] != '/') && global_ssl.crt_base)
+	if ((*args[*cur_arg + 1] != '@') && (*args[*cur_arg + 1] != '/') && global_ssl.crt_base)
 		memprintf(&newsrv->ssl_ctx.client_crt, "%s/%s", global_ssl.crt_base, args[*cur_arg + 1]);
 	else
 		memprintf(&newsrv->ssl_ctx.client_crt, "%s", args[*cur_arg + 1]);
@@ -1875,6 +1917,32 @@ static int srv_parse_no_ssl(char **args, int *cur_arg, struct proxy *px, struct 
 		ha_free(&newsrv->ssl_ctx.ciphers);
 	}
 	newsrv->use_ssl = -1;
+	return 0;
+}
+
+/* parse the "ktls" server keywod */
+static int srv_parse_ktls(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument.",
+			  args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (!experimental_directives_allowed) {
+		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directive'", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (!strcasecmp(args[*cur_arg + 1], "on")) {
+		newsrv->ssl_ctx.options |= SRV_SSL_O_KTLS;
+	} else if (!strcasecmp(args[*cur_arg + 1], "off")) {
+		newsrv->ssl_ctx.options &= ~SRV_SSL_O_KTLS;
+	} else {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument, got '%s'.",
+			  args[*cur_arg], args[*cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 	return 0;
 }
 
@@ -2043,8 +2111,14 @@ static int ssl_parse_default_bind_options(char **args, int section_type, struct 
 	while (*(args[i])) {
 		if (strcmp(args[i], "no-tls-tickets") == 0)
 			global_ssl.listen_default_ssloptions |= BC_SSL_O_NO_TLS_TICKETS;
+		else if (strcmp(args[i], "tls-tickets") == 0)
+			global_ssl.listen_default_ssloptions &= ~BC_SSL_O_NO_TLS_TICKETS;
 		else if (strcmp(args[i], "prefer-client-ciphers") == 0)
 			global_ssl.listen_default_ssloptions |= BC_SSL_O_PREF_CLIE_CIPH;
+		else if (strcmp(args[i], "strict-sni") == 0)
+			global_ssl.listen_default_ssloptions |= BC_SSL_O_STRICT_SNI;
+		else if (strcmp(args[i], "no-strict-sni") == 0)
+			global_ssl.listen_default_ssloptions &= ~BC_SSL_O_STRICT_SNI;
 		else if (strcmp(args[i], "ssl-min-ver") == 0 || strcmp(args[i], "ssl-max-ver") == 0) {
 			if (!parse_tls_method_minmax(args, i, &global_ssl.listen_default_sslmethods, err))
 				i++;
@@ -2083,6 +2157,15 @@ static int ssl_parse_default_server_options(char **args, int section_type, struc
 				return -1;
 			}
 		}
+		else if (strcmp(args[i], "renegotiate") == 0 || strcmp(args[i], "no-renegotiate") == 0) {
+#if !defined(OPENSSL_IS_AWSLC) && !defined(SSL_OP_NO_RENEGOTIATION)
+			memprintf(err, "'%s' not supported for your SSL library (%s), either SSL_OP_NO_RENEGOTIATION or SSL_set_renegotiate_mode() must be defined.",
+				  args[i], OPENSSL_VERSION_TEXT);
+			return -1;
+#else
+			global_ssl.renegotiate = (*args[i] == 'n') ? SSL_RENEGOTIATE_OFF : SSL_RENEGOTIATE_ON;
+#endif
+		}
 		else if (parse_tls_method_options(args[i], &global_ssl.connect_default_sslmethods, err)) {
 			memprintf(err, "unknown option '%s' on global statement '%s'.", args[i], args[0]);
 			return -1;
@@ -2092,16 +2175,23 @@ static int ssl_parse_default_server_options(char **args, int section_type, struc
 	return 0;
 }
 
-/* parse the "ca-base" / "crt-base" keywords in global section.
+/* parse the "ca-base" / "crt-base" / "key-base" keywords in global section.
  * Returns <0 on alert, >0 on warning, 0 on success.
  */
-static int ssl_parse_global_ca_crt_base(char **args, int section_type, struct proxy *curpx,
+static int ssl_parse_global_path_base(char **args, int section_type, struct proxy *curpx,
                                         const struct proxy *defpx, const char *file, int line,
                                         char **err)
 {
 	char **target;
 
-	target = (args[0][1] == 'a') ? &global_ssl.ca_base : &global_ssl.crt_base;
+	if (args[0][1] == 'a')
+		target = &global_ssl.ca_base;
+	else if (args[0][1] == 'r')
+		target = &global_ssl.crt_base;
+	else if (args[0][1] == 'e')
+		target = &global_ssl.key_base;
+	else
+		return -1;
 
 	if (too_many_args(1, args, err, NULL))
 		return -1;
@@ -2119,6 +2209,39 @@ static int ssl_parse_global_ca_crt_base(char **args, int section_type, struct pr
 	return 0;
 }
 
+/* parse the "ssl-security-level" keyword in global section.  */
+static int ssl_parse_security_level(char **args, int section_type, struct proxy *curpx,
+					 const struct proxy *defpx, const char *file, int linenum,
+					 char **err)
+{
+#ifndef HAVE_SSL_SET_SECURITY_LEVEL
+	memprintf(err, "global statement '%s' requires at least OpenSSL 1.1.1.", args[0]);
+	return -1;
+#else
+	char *endptr;
+
+	if (!*args[1]) {
+		ha_alert("parsing [%s:%d] : '%s' : missing value\n", file, linenum, args[0]);
+		return -1;
+	}
+
+	global_ssl.security_level = strtol(args[1], &endptr, 10);
+	if (*endptr != '\0') {
+		ha_alert("parsing [%s:%d] : '%s' : expects an integer argument, found '%s'\n",
+			 file, linenum, args[0], args[1]);
+		return -1;
+	}
+
+	if (global_ssl.security_level < 0 || global_ssl.security_level > 5) {
+		ha_alert("parsing [%s:%d] : '%s' : expects a value between 0 and 5\n",
+			 file, linenum, args[0]);
+		return -1;
+	}
+#endif
+
+	return 0;
+}
+
 /* parse the "ssl-skip-self-issued-ca" keyword in global section.  */
 static int ssl_parse_skip_self_issued_ca(char **args, int section_type, struct proxy *curpx,
 					 const struct proxy *defpx, const char *file, int line,
@@ -2133,61 +2256,226 @@ static int ssl_parse_skip_self_issued_ca(char **args, int section_type, struct p
 #endif
 }
 
+struct cfg_crt_node {
+	int linenum;
+	char *filename;
+	struct ssl_bind_conf *ssl_conf;
+	struct ckch_conf *ckch_conf;
+	struct list list;
+};
 
-static int ssl_parse_global_ocsp_maxdelay(char **args, int section_type, struct proxy *curpx,
-                                          const struct proxy *defpx, const char *file, int line,
-                                          char **err)
+/* list used for inline crt-list initialization */
+static struct list cur_crtlist = LIST_HEAD_INIT(cur_crtlist);
+/*
+ * Parse a "ssl-f-use" line in a frontend.
+ */
+static int proxy_parse_ssl_f_use(char **args, int section_type, struct proxy *curpx,
+                                 const struct proxy *defpx, const char *file, int linenum,
+                                 char **err)
 {
-	int value = 0;
+	int cfgerr = 0;
+	struct ssl_bind_conf *ssl_conf = NULL;
+	struct ckch_conf *ckch_conf = NULL;
+	struct cfg_crt_node *cfg_crt_node = NULL;
+	int cur_arg = 1;
+	int i;
 
-	if (*(args[1]) == 0) {
-		memprintf(err, "'%s' expects an integer argument.", args[0]);
-		return -1;
+	cfg_crt_node = calloc(1, sizeof *cfg_crt_node);
+	if (!cfg_crt_node) {
+		memprintf(err, "not enough memory!");
+		goto error;
+	}
+	cfg_crt_node->filename = strdup(file);
+	if (!cfg_crt_node->filename) {
+		memprintf(err, "not enough memory!");
+		goto error;
+	}
+	cfg_crt_node->linenum = linenum;
+
+
+	ckch_conf = calloc(1, sizeof *ckch_conf);
+	if (!ckch_conf) {
+		memprintf(err, "not enough memory!");
+		goto error;
 	}
 
-	value = atoi(args[1]);
-	if (value < 0) {
-		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
-		return -1;
+	while (*args[cur_arg]) {
+		int foundcrtstore = 0; /* found a crt-store keyword */
+		int found = 0;         /* found a crt-list or crt-store keyword */
+
+		if (strcmp("crt", args[cur_arg]) == 0) {
+			char path[MAXPATHLEN+1];
+			const char *arg = args[cur_arg+1];
+
+			if (ckch_conf->crt) {
+				memprintf(err, "'%s' already specified, aborting.", "crt");
+				goto error;
+			}
+			if (*arg != '@' && *arg != '/' && global_ssl.crt_base) {
+				if ((strlen(global_ssl.crt_base) + 1 + strlen(arg)) > sizeof(path) ||
+				     snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, arg) > sizeof(path)) {
+					memprintf(err, "parsing [%s:%d]: '%s' : path too long",
+					          file, linenum, arg);
+					cfgerr |= ERR_ALERT | ERR_FATAL;
+					goto error;
+				}
+				arg = path;
+			}
+			free(ckch_conf->crt);
+			ckch_conf->crt = strdup(arg);
+			cur_arg += 2;
+			found = 1;
+			goto next;
+		}
+
+		/* first look for crt-list keywords */
+		for (i = 0; ssl_crtlist_kws[i].kw != NULL; i++) {
+			if (strcmp(ssl_crtlist_kws[i].kw, args[cur_arg]) == 0) {
+
+				if (!ssl_conf)
+					ssl_conf = calloc(1, sizeof *ssl_conf);
+				if (!ssl_conf) {
+					memprintf(err, "not enough memory!");
+					goto error;
+				}
+
+				cfgerr |= ssl_crtlist_kws[i].parse(args, cur_arg, NULL, ssl_conf, 0, err);
+				if (cfgerr & ERR_CODE)
+					goto error;
+				cur_arg += 1 + ssl_crtlist_kws[i].skip;
+				found = 1;
+				goto next;
+			}
+		}
+
+		/* then look for ckch_conf keywords */
+		cfgerr |= ckch_conf_parse(args, cur_arg, ckch_conf, &foundcrtstore, file, linenum, err);
+		if (cfgerr & ERR_CODE)
+			goto error;
+		if (foundcrtstore) {
+			found = 1;
+			cur_arg += 2;  /* skip 2 words if the keyword was found */
+			ckch_conf->used = CKCH_CONF_SET_CRTLIST; /* if they are options they must be used everywhere */
+			goto next;
+		}
+
+next:
+		if (!found) {
+			memprintf(err, "unknown crt keyword '%s'", args[cur_arg]);
+			goto error;
+		}
 	}
 
-	if (global_ssl.ocsp_update.delay_min > value) {
-		memprintf(err, "'%s' can not be lower than tune.ssl.ocsp-update.mindelay.", args[0]);
-		return -1;
-	}
-
-	global_ssl.ocsp_update.delay_max = value;
+	cfg_crt_node->ssl_conf = ssl_conf;
+	cfg_crt_node->ckch_conf = ckch_conf;
+	LIST_INSERT(&cur_crtlist, &cfg_crt_node->list);
 
 	return 0;
+error:
+	ckch_conf_clean(ckch_conf);
+	ha_free(&ckch_conf);
+	ssl_sock_free_ssl_conf(ssl_conf);
+	ha_free(&ssl_conf);
+	ha_free(&cfg_crt_node);
+	return -1;
 }
 
-static int ssl_parse_global_ocsp_mindelay(char **args, int section_type, struct proxy *curpx,
-                                          const struct proxy *defpx, const char *file, int line,
-                                          char **err)
+/*
+ * After parsing the ssl-f-use keywords in a frontend/listen section, create the corresponding crt-list and initialize the
+ * certificates
+ */
+
+static int post_section_frontend_crt_init()
 {
-	int value = 0;
+	struct crtlist *newlist = NULL;
+	struct crtlist_entry *entry = NULL;
+	int err_code = 0;
+	struct cfg_crt_node *n, *r;
+	struct bind_conf *b;
+	char *crtlist_name = NULL;
+	char *err = NULL;
 
-	if (*(args[1]) == 0) {
-		memprintf(err, "'%s' expects an integer argument.", args[0]);
-		return -1;
+	list_for_each_entry_safe(n, r, &cur_crtlist, list) {
+
+		/* create a new crt-list with the frontend name or a specified name */
+		if (!crtlist_name)
+			memprintf(&crtlist_name, "@%s", curproxy->id);
+		if (!crtlist_name) {
+			memprintf(&err, "Not enough memory!");
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto error;
+		}
+
+		if (!newlist)
+			newlist = crtlist_new(crtlist_name, 0);
+		if (!newlist) {
+			memprintf(&err, "Not enough memory!");
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto error;
+		}
+
+		entry = crtlist_entry_new();
+		if (entry == NULL) {
+			memprintf(&err, "Not enough memory!");
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto error;
+		}
+
+		/* must set the ssl_conf in case of duplication of the crtlist_entry */
+		entry->ssl_conf = n->ssl_conf;
+
+		err_code |= crtlist_load_crt(n->ckch_conf->crt, n->ckch_conf, newlist, entry, n->filename, n->linenum, &err);
+		if (err_code & ERR_CODE)
+			goto error;
+
+		LIST_DELETE(&n->list);
+		/* n->ssl_conf is reused so we don't free them here */
+		free(n->ckch_conf);
+		free(n);
 	}
 
-	value = atoi(args[1]);
-	if (value < 0) {
-		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
-		return -1;
+	if (newlist) {
+
+		if (ebst_insert(&crtlists_tree, &newlist->node) != &newlist->node) {
+			memprintf(&err, "Couldn't create the crt-list '%s', this name is already used by another crt-list!", crtlist_name);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto error;
+		}
+
+		/* look for "ssl" bind lines */
+		list_for_each_entry(b, &curproxy->conf.bind, by_fe) {
+			if (b->options & BC_O_USE_SSL) {
+				err_code |= ssl_sock_load_cert_list_file(crtlist_name, 0, b, curproxy, &err);
+				if (err_code & ERR_CODE)
+					goto error;
+			}
+		}
 	}
 
-	if (value > global_ssl.ocsp_update.delay_max) {
-		memprintf(err, "'%s' can not be higher than tune.ssl.ocsp-update.maxdelay.", args[0]);
-		return -1;
+	return err_code;
+error:
+
+	if (err)
+		ha_alert("%s.\n", err);
+	free(err);
+
+	list_for_each_entry_safe(n, r, &cur_crtlist, list) {
+		ckch_conf_clean(n->ckch_conf);
+		ha_free(&n->ckch_conf);
+		ssl_sock_free_ssl_conf(n->ssl_conf);
+		ha_free(&n->ssl_conf);
+		LIST_DELETE(&n->list);
+		ha_free(&n);
 	}
 
-	global_ssl.ocsp_update.delay_min = value;
-
-	return 0;
+	ha_free(&crtlist_name);
+	crtlist_entry_free(entry);
+	crtlist_free(newlist);
+	return err_code;
 }
 
+REGISTER_CONFIG_POST_SECTION("listen",   post_section_frontend_crt_init);
+REGISTER_CONFIG_POST_SECTION("frontend", post_section_frontend_crt_init);
 
 
 /* Note: must not be declared <const> as its list will be overwritten.
@@ -2199,7 +2487,12 @@ static int ssl_parse_global_ocsp_mindelay(char **args, int section_type, struct 
  */
 
 /* the <ssl_crtlist_kws> keywords are used for crt-list parsing, they *MUST* be safe
- * with their proxy argument NULL and must only fill the ssl_bind_conf */
+ * with their proxy argument NULL and must only fill the ssl_bind_conf
+ *
+ * /!\ Please update configuration.txt at the crt-list option of the Bind options
+ * section when adding a keyword in ssl_crtlist_kws. /!\
+ *
+ */
 struct ssl_crtlist_kw ssl_crtlist_kws[] = {
 	{ "allow-0rtt",            ssl_bind_parse_allow_0rtt,       0 }, /* allow 0-RTT */
 	{ "alpn",                  ssl_bind_parse_alpn,             1 }, /* set ALPN supported protocols */
@@ -2211,6 +2504,7 @@ struct ssl_crtlist_kw ssl_crtlist_kws[] = {
 	{ "crl-file",              ssl_bind_parse_crl_file,         1 }, /* set certificate revocation list file use on client cert verify */
 	{ "curves",                ssl_bind_parse_curves,           1 }, /* set SSL curve suite */
 	{ "ecdhe",                 ssl_bind_parse_ecdhe,            1 }, /* defines named curve for elliptic curve Diffie-Hellman */
+	{ "ktls",                  ssl_bind_parse_ktls,             1 }, /* enables or disables kTLS */
 	{ "no-alpn",               ssl_bind_parse_no_alpn,          0 }, /* disable sending ALPN */
 	{ "no-ca-names",           ssl_bind_parse_no_ca_names,      0 }, /* do not send ca names to clients (ca_file related) */
 	{ "npn",                   ssl_bind_parse_npn,              1 }, /* set NPN supported protocols */
@@ -2218,7 +2512,6 @@ struct ssl_crtlist_kw ssl_crtlist_kws[] = {
 	{ "ssl-min-ver",           ssl_bind_parse_tls_method_minmax,1 }, /* minimum version */
 	{ "ssl-max-ver",           ssl_bind_parse_tls_method_minmax,1 }, /* maximum version */
 	{ "verify",                ssl_bind_parse_verify,           1 }, /* set SSL verify method */
-	{ "ocsp-update",           ssl_bind_parse_ocsp_update,      1 }, /* ocsp update mode (on or off) */
 	{ NULL, NULL, 0 },
 };
 
@@ -2240,6 +2533,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "crt-ignore-err",        bind_parse_ignore_err,         1 }, /* set error IDs to ignore on verify depth == 0 */
 	{ "crt-list",              bind_parse_crt_list,           1 }, /* load a list of crt from this location */
 	{ "curves",                bind_parse_curves,             1 }, /* set SSL curve suite */
+	{ "default-crt",           bind_parse_crt,                1 }, /* load SSL certificates from this location */
 	{ "ecdhe",                 bind_parse_ecdhe,              1 }, /* defines named curve for elliptic curve Diffie-Hellman */
 	{ "force-sslv3",           bind_parse_tls_method_options, 0 }, /* force SSLv3 */
 	{ "force-tlsv10",          bind_parse_tls_method_options, 0 }, /* force TLSv10 */
@@ -2247,9 +2541,11 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "force-tlsv12",          bind_parse_tls_method_options, 0 }, /* force TLSv12 */
 	{ "force-tlsv13",          bind_parse_tls_method_options, 0 }, /* force TLSv13 */
 	{ "generate-certificates", bind_parse_generate_certs,     0 }, /* enable the server certificates generation */
+	{ "ktls",                  bind_parse_ktls,               1 }, /* enable or disable kTLS */
 	{ "no-alpn",               bind_parse_no_alpn,            0 }, /* disable sending ALPN */
 	{ "no-ca-names",           bind_parse_no_ca_names,        0 }, /* do not send ca names to clients (ca_file related) */
 	{ "no-sslv3",              bind_parse_tls_method_options, 0 }, /* disable SSLv3 */
+	{ "no-strict-sni",         bind_parse_strict_sni,         0 }, /* do not refuse negotiation if sni doesn't match a certificate */
 	{ "no-tlsv10",             bind_parse_tls_method_options, 0 }, /* disable TLSv10 */
 	{ "no-tlsv11",             bind_parse_tls_method_options, 0 }, /* disable TLSv11 */
 	{ "no-tlsv12",             bind_parse_tls_method_options, 0 }, /* disable TLSv12 */
@@ -2260,6 +2556,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "ssl-min-ver",           bind_parse_tls_method_minmax,  1 }, /* minimum version */
 	{ "ssl-max-ver",           bind_parse_tls_method_minmax,  1 }, /* maximum version */
 	{ "strict-sni",            bind_parse_strict_sni,         0 }, /* refuse negotiation if sni doesn't match a certificate */
+	{ "tls-tickets",           bind_parse_no_tls_tickets,     0 }, /* enable session resumption tickets */
 	{ "tls-ticket-keys",       bind_parse_tls_ticket_keys,    1 }, /* set file to load TLS ticket keys from */
 	{ "verify",                bind_parse_verify,             1 }, /* set SSL verify method */
 	{ "npn",                   bind_parse_npn,                1 }, /* set NPN supported protocols */
@@ -2294,7 +2591,9 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "force-tlsv11",            srv_parse_tls_method_options, 0, 1, 1 }, /* force TLSv11 */
 	{ "force-tlsv12",            srv_parse_tls_method_options, 0, 1, 1 }, /* force TLSv12 */
 	{ "force-tlsv13",            srv_parse_tls_method_options, 0, 1, 1 }, /* force TLSv13 */
+	{ "ktls",                    srv_parse_ktls,               1, 1, 1 }, /* enable or disable kTLS */
 	{ "no-check-ssl",            srv_parse_no_check_ssl,       0, 1, 0 }, /* disable SSL for health checks */
+	{ "no-renegotiate",          srv_parse_renegotiate,        0, 1, 1 }, /* Disable renegotiation */
 	{ "no-send-proxy-v2-ssl",    srv_parse_no_send_proxy_ssl,  0, 1, 0 }, /* do not send PROXY protocol header v2 with SSL info */
 	{ "no-send-proxy-v2-ssl-cn", srv_parse_no_send_proxy_cn,   0, 1, 0 }, /* do not send PROXY protocol header v2 with CN */
 	{ "no-ssl",                  srv_parse_no_ssl,             0, 1, 0 }, /* disable SSL processing */
@@ -2306,6 +2605,7 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "no-tlsv13",               srv_parse_tls_method_options, 0, 0, 1 }, /* disable TLSv13 */
 	{ "no-tls-tickets",          srv_parse_no_tls_tickets,     0, 1, 1 }, /* disable session resumption tickets */
 	{ "npn",                     srv_parse_npn,                1, 1, 1 }, /* Set NPN supported protocols */
+	{ "renegotiate",             srv_parse_renegotiate,        0, 1, 1 }, /* Allow secure renegotiation */
 	{ "send-proxy-v2-ssl",       srv_parse_send_proxy_ssl,     0, 1, 1 }, /* send PROXY protocol header v2 with SSL info */
 	{ "send-proxy-v2-ssl-cn",    srv_parse_send_proxy_cn,      0, 1, 1 }, /* send PROXY protocol header v2 with CN */
 	{ "sigalgs",                 srv_parse_sigalgs,            1, 1, 1 }, /* signature algorithms */
@@ -2323,8 +2623,9 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 INITCALL1(STG_REGISTER, srv_register_keywords, &srv_kws);
 
 static struct cfg_kw_list cfg_kws = {ILH, {
-	{ CFG_GLOBAL, "ca-base",  ssl_parse_global_ca_crt_base },
-	{ CFG_GLOBAL, "crt-base", ssl_parse_global_ca_crt_base },
+	{ CFG_GLOBAL, "ca-base",  ssl_parse_global_path_base },
+	{ CFG_GLOBAL, "crt-base", ssl_parse_global_path_base },
+	{ CFG_GLOBAL, "key-base", ssl_parse_global_path_base },
 	{ CFG_GLOBAL, "issuers-chain-path", ssl_load_global_issuers_from_path },
 	{ CFG_GLOBAL, "maxsslconn", ssl_parse_global_int },
 	{ CFG_GLOBAL, "ssl-default-bind-options", ssl_parse_default_bind_options },
@@ -2341,11 +2642,10 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ssl-provider",  ssl_parse_global_ssl_provider },
 	{ CFG_GLOBAL, "ssl-provider-path",  ssl_parse_global_ssl_provider_path },
 #endif
+	{ CFG_GLOBAL, "ssl-security-level", ssl_parse_security_level },
 	{ CFG_GLOBAL, "ssl-skip-self-issued-ca", ssl_parse_skip_self_issued_ca },
 	{ CFG_GLOBAL, "tune.ssl.cachesize", ssl_parse_global_int },
-#ifndef OPENSSL_NO_DH
 	{ CFG_GLOBAL, "tune.ssl.default-dh-param", ssl_parse_global_default_dh },
-#endif
 	{ CFG_GLOBAL, "tune.ssl.force-private-cache",  ssl_parse_global_private_cache },
 	{ CFG_GLOBAL, "tune.ssl.lifetime", ssl_parse_global_lifetime },
 	{ CFG_GLOBAL, "tune.ssl.maxrecord", ssl_parse_global_int },
@@ -2372,10 +2672,9 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ssl-default-server-ciphersuites", ssl_parse_global_ciphersuites },
 	{ CFG_GLOBAL, "ssl-load-extra-files", ssl_parse_global_extra_files },
 	{ CFG_GLOBAL, "ssl-load-extra-del-ext", ssl_parse_global_extra_noext },
-#ifndef OPENSSL_NO_OCSP
-	{ CFG_GLOBAL, "tune.ssl.ocsp-update.maxdelay", ssl_parse_global_ocsp_maxdelay },
-	{ CFG_GLOBAL, "tune.ssl.ocsp-update.mindelay", ssl_parse_global_ocsp_mindelay },
-#endif
+
+	{ CFG_LISTEN, "ssl-f-use", proxy_parse_ssl_f_use },
+
 	{ 0, NULL, NULL },
 }};
 

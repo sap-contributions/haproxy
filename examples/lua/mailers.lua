@@ -3,7 +3,7 @@
 -- Provides a pure lua alternative to tcpcheck mailers.
 --
 -- To be loaded using "lua-load" from haproxy configuration to handle
--- email-alerts directly from lua and disable legacy tcpcheck implementation.
+-- email-alerts directly from lua
 
 local SYSLOG_LEVEL = {
 	["EMERG"] = 0,
@@ -43,7 +43,7 @@ function smtp_send_email(server, timeout, domain, from, to, data)
                         -- read line
                         ret = tcp:receive("*l")
                         if ret == nil then
-                                return false, "Connection unexpectly closed"
+                                return false, "Connection unexpectedly closed"
                         end
                         -- expected code
                         if string.match(ret, code) ~= nil then
@@ -73,7 +73,7 @@ function smtp_send_email(server, timeout, domain, from, to, data)
 
         if tcp:send("HELO " .. domain .. "\r\n") == nil then
                 tcp:close()
-                return false, "Connection unexpectly closed"
+                return false, "Connection unexpectedly closed"
         end
 
         ret, reason = smtp_wait_code(tcp, '^250 ')
@@ -84,7 +84,7 @@ function smtp_send_email(server, timeout, domain, from, to, data)
 
         if tcp:send("MAIL FROM: <" .. from .. ">\r\n") == nil then
                 tcp:close()
-                return false, "Connection unexpectly closed"
+                return false, "Connection unexpectedly closed"
         end
 
         ret, reason = smtp_wait_code(tcp, '^250 ')
@@ -95,7 +95,7 @@ function smtp_send_email(server, timeout, domain, from, to, data)
 
         if tcp:send("RCPT TO: <" .. to .. ">\r\n") == nil then
                 tcp:close()
-                return false, "Connection unexpectly closed"
+                return false, "Connection unexpectedly closed"
         end
 
         ret, reason = smtp_wait_code(tcp, '^250 ')
@@ -106,7 +106,7 @@ function smtp_send_email(server, timeout, domain, from, to, data)
 
         if tcp:send("DATA\r\n") == nil then
                 tcp:close()
-                return false, "Connection unexpectly closed"
+                return false, "Connection unexpectedly closed"
         end
 
         ret, reason = smtp_wait_code(tcp, '^354 ')
@@ -117,7 +117,7 @@ function smtp_send_email(server, timeout, domain, from, to, data)
 
         if tcp:send(data .. "\r\n.\r\n") == nil then
                 tcp:close()
-                return false, "Connection unexpectly closed"
+                return false, "Connection unexpectedly closed"
         end
 
         ret, reason = smtp_wait_code(tcp, '^250 ')
@@ -128,7 +128,7 @@ function smtp_send_email(server, timeout, domain, from, to, data)
 
         if tcp:send("QUIT\r\n") == nil then
                 tcp:close()
-                return false, "Connection unexpectly closed"
+                return false, "Connection unexpectedly closed"
         end
 
         ret, reason = smtp_wait_code(tcp, '^221 ')
@@ -364,9 +364,9 @@ local function srv_event_add(event, data)
 	mailers_track_server_events(data.reference)
 end
 
-
--- disable legacy email-alerts since email-alerts will be sent from lua directly
-core.disable_legacy_mailers()
+-- tell haproxy that we do use the legacy native "mailers" config section
+-- which allows us to retrieve mailers configuration using Proxy:get_mailers()
+core.use_native_mailers_config()
 
 -- event subscriptions are purposely performed in an init function to prevent
 -- email alerts from being generated too early (when process is starting up)

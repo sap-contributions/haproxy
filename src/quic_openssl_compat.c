@@ -7,7 +7,7 @@
 #endif
 
 #include <haproxy/openssl-compat.h>
-/* Highly inspired from nginx QUIC TLS compatibilty code */
+/* Highly inspired from nginx QUIC TLS compatibility code */
 #include <openssl/kdf.h>
 
 #include <haproxy/quic_conn.h>
@@ -58,10 +58,15 @@ static int qc_ssl_compat_add_tps_cb(SSL *ssl, unsigned int ext_type, unsigned in
 int quic_tls_compat_init(struct bind_conf *bind_conf, SSL_CTX *ctx)
 {
 	/* Ignore non-QUIC connections */
-	if (bind_conf->xprt != xprt_get(XPRT_QUIC))
+	if (bind_conf && bind_conf->xprt != xprt_get(XPRT_QUIC))
 		return 1;
 
-	SSL_CTX_set_keylog_callback(ctx, quic_tls_compat_keylog_callback);
+	/* This callback is already registered if the TLS keylog is activated for
+	 * traffic decryption analysis.
+	 */
+	if (!global_ssl.keylog)
+		SSL_CTX_set_keylog_callback(ctx, quic_tls_compat_keylog_callback);
+
 	if (SSL_CTX_has_client_custom_ext(ctx, QUIC_OPENSSL_COMPAT_SSL_TP_EXT))
 		return 1;
 
@@ -145,22 +150,22 @@ void quic_tls_compat_keylog_callback(const SSL *ssl, const char *line)
 	if (sizeof(QUIC_OPENSSL_COMPAT_CLIENT_HANDSHAKE) - 1 == n &&
 	    !strncmp(start, QUIC_OPENSSL_COMPAT_CLIENT_HANDSHAKE, n)) {
 		level = ssl_encryption_handshake;
-		write = 0;
+		write = !qc_is_back(qc) ? 0 : 1;
 	}
 	else if (sizeof(QUIC_OPENSSL_COMPAT_SERVER_HANDSHAKE) - 1 == n &&
 	         !strncmp(start, QUIC_OPENSSL_COMPAT_SERVER_HANDSHAKE, n)) {
 		level = ssl_encryption_handshake;
-		write = 1;
+		write = !qc_is_back(qc) ? 1 : 0;
 	}
 	else if (sizeof(QUIC_OPENSSL_COMPAT_CLIENT_APPLICATION) - 1 == n &&
 	         !strncmp(start, QUIC_OPENSSL_COMPAT_CLIENT_APPLICATION, n)) {
 		level = ssl_encryption_application;
-		write = 0;
+		write = !qc_is_back(qc) ? 0 : 1;
 	}
 	else if (sizeof(QUIC_OPENSSL_COMPAT_SERVER_APPLICATION) - 1 == n &&
 	         !strncmp(start, QUIC_OPENSSL_COMPAT_SERVER_APPLICATION, n)) {
 		level = ssl_encryption_application;
-		write = 1;
+		write = !qc_is_back(qc) ? 1 : 0;
 	}
 	else
 		goto leave;
@@ -347,26 +352,29 @@ static int quic_tls_compat_create_record(struct quic_conn *qc,
 	                       nonce, rec->payload, rec->payload_len, ad, adlen))
 		goto leave;
 
-	ret = adlen + outlen;
+	ret = outlen;
 leave:
 	TRACE_LEAVE(QUIC_EV_CONN_SSL_COMPAT, qc);
 	return ret;
 }
 
 /* Callback use to parse TLS messages for <ssl> TLS session. */
-static void quic_tls_compat_msg_callback(int write_p, int version, int content_type,
-                                         const void *buf, size_t len, SSL *ssl, void *arg)
+void quic_tls_compat_msg_callback(struct connection *conn,
+                                  int write_p, int version, int content_type,
+                                  const void *buf, size_t len, SSL *ssl)
 {
 	unsigned int alert;
 	enum ssl_encryption_level_t   level;
 	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
-	struct quic_openssl_compat *com = &qc->openssl_compat;
+	struct quic_openssl_compat *com;
 
-	TRACE_ENTER(QUIC_EV_CONN_SSL_COMPAT, qc);
-	if (!write_p)
+	if (!write_p || !qc)
 		goto leave;
 
-	level = qc->openssl_compat.write_level;
+	TRACE_ENTER(QUIC_EV_CONN_SSL_COMPAT, qc);
+
+	com = &qc->openssl_compat;
+	level = com->write_level;
 	switch (content_type) {
 	case SSL3_RT_HANDSHAKE:
 		com->method->add_handshake_data(ssl, level, buf, len);
@@ -400,7 +408,6 @@ int SSL_set_quic_method(SSL *ssl, const SSL_QUIC_METHOD *quic_method)
 		goto err;
 
 	SSL_set_bio(ssl, rbio, wbio);
-	SSL_set_msg_callback(ssl, quic_tls_compat_msg_callback);
 	/* No ealy data support */
 	SSL_set_max_early_data(ssl, 0);
 

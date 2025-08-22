@@ -38,6 +38,14 @@ struct enc_debug_info {
 	uint64_t pn;
 };
 
+/* Structure to store enough information about the RX CRYPTO frames. */
+struct quic_rx_crypto_frm {
+	struct eb64_node offset_node;
+	uint64_t len;
+	const unsigned char *data;
+	struct quic_rx_packet *pkt;
+};
+
 #define           QUIC_EV_CONN_NEW       (1ULL << 0)
 #define           QUIC_EV_CONN_INIT      (1ULL << 1)
 #define           QUIC_EV_CONN_ISEC      (1ULL << 2)
@@ -90,6 +98,7 @@ struct enc_debug_info {
 #define           QUIC_EV_CONN_KILL      (1ULL << 49)
 #define           QUIC_EV_CONN_KP        (1ULL << 50)
 #define           QUIC_EV_CONN_SSL_COMPAT (1ULL << 51)
-#define           QUIC_EV_CONN_SET_AFFINITY (1ULL << 52)
+#define           QUIC_EV_CONN_BIND_TID  (1ULL << 52)
+#define           QUIC_EV_CONN_RELEASE_RCD (1ULL << 53)
 
 #endif /* _HAPROXY_QUIC_TRACE_T_H */

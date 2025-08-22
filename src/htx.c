@@ -229,7 +229,7 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
  *
  *  1: the expansion must be performed in place, there is enough space after
  *      the block's payload to handle it. This is especially true if it is a
- *      compression and not an expension.
+ *      compression and not an expansion.
  *
  *  2: the block's payload must be moved at the new block address before doing
  *     the expansion.
@@ -675,10 +675,10 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 	return blk;
 }
 
-/* Transfer HTX blocks from <src> to <dst>, stopping on the first block of the
- * type <mark> (typically EOH or EOT) or when <count> bytes were moved
- * (including payload and meta-data). It returns the number of bytes moved and
- * the last HTX block inserted in <dst>.
+/* Transfer HTX blocks from <src> to <dst>, stopping once the first block of the
+ * type <mark> is transferred (typically EOH or EOT) or when <count> bytes were
+ * moved (including payload and meta-data). It returns the number of bytes moved
+ * and the last HTX block inserted in <dst>.
  */
 struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 			     enum htx_blk_type mark)
@@ -722,17 +722,11 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 		dstblk->info = info;
 		htx_memcpy(htx_get_blk_ptr(dst, dstblk), htx_get_blk_ptr(src, blk), sz);
 
-		count -= sizeof(dstblk) + sz;
+		count -= sizeof(*dstblk) + sz;
 		if (blk->info != info) {
 			/* Partial xfer: don't remove <blk> from <src> but
 			 * resize its content */
 			htx_cut_data_blk(src, blk, sz);
-			break;
-		}
-
-		if (type == mark) {
-			blk = htx_get_next_blk(src, blk);
-			srcref = dstref = NULL;
 			break;
 		}
 
@@ -748,6 +742,12 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 		}
 		else if (type == HTX_BLK_EOH || type == HTX_BLK_EOT)
 			srcref = dstref = NULL;
+
+		/* <mark> allows a copy of the block which matched, then stop */
+		if (type == mark) {
+			blk = htx_get_next_blk(src, blk);
+			break;
+		}
 	}
 
 	if (unlikely(dstref)) {
@@ -887,59 +887,59 @@ struct htx_sl *htx_replace_stline(struct htx *htx, struct htx_blk *blk, const st
  */
 struct htx_ret htx_reserve_max_data(struct htx *htx)
 {
-       struct htx_blk *blk, *tailblk;
-       uint32_t sz, room;
-       int32_t len = htx_free_data_space(htx);
+	struct htx_blk *blk, *tailblk;
+	uint32_t sz, room;
+	int32_t len = htx_free_data_space(htx);
 
-       if (htx->head == -1)
-               goto rsv_new_block;
+	if (htx->head == -1)
+		goto rsv_new_block;
 
-       if (!len)
-               return (struct htx_ret){.ret = 0, .blk = NULL};
+	if (!len)
+		return (struct htx_ret){.ret = 0, .blk = NULL};
 
-       /* get the tail and head block */
-       tailblk = htx_get_tail_blk(htx);
-       if (tailblk == NULL)
-               goto rsv_new_block;
-       sz = htx_get_blksz(tailblk);
+	/* get the tail and head block */
+	tailblk = htx_get_tail_blk(htx);
+	if (tailblk == NULL)
+		goto rsv_new_block;
+	sz = htx_get_blksz(tailblk);
 
-       /* Don't try to append data if the last inserted block is not of the
-        * same type */
-       if (htx_get_blk_type(tailblk) != HTX_BLK_DATA)
-               goto rsv_new_block;
+	/* Don't try to append data if the last inserted block is not of the
+	 * same type */
+	if (htx_get_blk_type(tailblk) != HTX_BLK_DATA)
+		goto rsv_new_block;
 
-       /*
-        * Same type and enough space: append data
-        */
-       if (!htx->head_addr) {
-               if (tailblk->addr+sz != htx->tail_addr)
-                       goto rsv_new_block;
-               room = (htx_pos_to_addr(htx, htx->tail) - htx->tail_addr);
-       }
-       else {
-               if (tailblk->addr+sz != htx->head_addr)
-                       goto rsv_new_block;
-               room = (htx->end_addr - htx->head_addr);
-       }
-       BUG_ON((int32_t)room < 0);
-       if (room < len)
-               len = room;
+	/*
+	 * Same type and enough space: append data
+	 */
+	if (!htx->head_addr) {
+		if (tailblk->addr+sz != htx->tail_addr)
+			goto rsv_new_block;
+		room = (htx_pos_to_addr(htx, htx->tail) - htx->tail_addr);
+	}
+	else {
+		if (tailblk->addr+sz != htx->head_addr)
+			goto rsv_new_block;
+		room = (htx->end_addr - htx->head_addr);
+	}
+	BUG_ON((int32_t)room < 0);
+	if (room < len)
+		len = room;
 
-  append_data:
-       htx_change_blk_value_len(htx, tailblk, sz+len);
+append_data:
+	htx_change_blk_value_len(htx, tailblk, sz+len);
 
-       BUG_ON((int32_t)htx->tail_addr < 0);
-       BUG_ON((int32_t)htx->head_addr < 0);
-       BUG_ON(htx->end_addr > htx->tail_addr);
-       BUG_ON(htx->head_addr > htx->end_addr);
-       return (struct htx_ret){.ret = sz, .blk = tailblk};
+	BUG_ON((int32_t)htx->tail_addr < 0);
+	BUG_ON((int32_t)htx->head_addr < 0);
+	BUG_ON(htx->end_addr > htx->tail_addr);
+	BUG_ON(htx->head_addr > htx->end_addr);
+	return (struct htx_ret){.ret = sz, .blk = tailblk};
 
-  rsv_new_block:
-       blk = htx_add_blk(htx, HTX_BLK_DATA, len);
-       if (!blk)
-               return (struct htx_ret){.ret = 0, .blk = NULL};
-       blk->info += len;
-       return (struct htx_ret){.ret = 0, .blk = blk};
+rsv_new_block:
+	blk = htx_add_blk(htx, HTX_BLK_DATA, len);
+	if (!blk)
+		return (struct htx_ret){.ret = 0, .blk = NULL};
+	blk->info += len;
+	return (struct htx_ret){.ret = 0, .blk = blk};
 }
 
 /* Adds an HTX block of type DATA in <htx>. It first tries to append data if

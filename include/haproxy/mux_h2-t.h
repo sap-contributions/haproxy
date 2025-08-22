@@ -41,19 +41,19 @@
  */
 #define H2_CF_DEM_DALLOC        0x00000004  // demux blocked on lack of connection's demux buffer
 #define H2_CF_DEM_DFULL         0x00000008  // demux blocked on connection's demux buffer full
-
-/* 0x00000010  unused */
+#define H2_CF_DEM_RXBUF         0x00000010  // demux blocked on missing rxbuf slots
 #define H2_CF_DEM_MROOM         0x00000020  // demux blocked on lack of room in mux buffer
 #define H2_CF_DEM_SALLOC        0x00000040  // demux blocked on lack of stream's request buffer
 #define H2_CF_DEM_SFULL         0x00000080  // demux blocked on stream request buffer full
 #define H2_CF_DEM_TOOMANY       0x00000100  // demux blocked waiting for some stream connectors to leave
-#define H2_CF_DEM_BLOCK_ANY     0x000001E0  // aggregate of the demux flags above except DALLOC/DFULL
+#define H2_CF_DEM_BLOCK_ANY     0x000001F0  // aggregate of the demux flags above except DALLOC/DFULL
                                             // (SHORT_READ is also excluded)
 
 #define H2_CF_DEM_SHORT_READ    0x00000200  // demux blocked on incomplete frame
 #define H2_CF_DEM_IN_PROGRESS   0x00000400  // demux in progress (dsi,dfl,dft are valid)
 
 /* other flags */
+#define H2_CF_MBUF_HAS_DATA     0x00000800  // some stream data (data, headers) still in mbuf
 #define H2_CF_GOAWAY_SENT       0x00001000  // a GOAWAY frame was successfully sent
 #define H2_CF_GOAWAY_FAILED     0x00002000  // a GOAWAY frame failed to be sent
 #define H2_CF_WAIT_FOR_HS       0x00004000  // We did check that at least a stream was waiting for handshake
@@ -68,6 +68,10 @@
 
 #define H2_CF_ERR_PENDING       0x00800000  // A write error was detected (block sends but not reads)
 #define H2_CF_ERROR             0x01000000  //A read error was detected (handled has an abort)
+#define H2_CF_WAIT_INLIST       0x02000000  // there is at least one stream blocked by another stream in send_list/fctl_list
+
+#define H2_CF_IDL_PING          0x04000000  // timer task scheduled for a PING emission
+#define H2_CF_IDL_PING_SENT     0x08000000  // PING emitted, or will be on next tasklet run, waiting for ACK
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -80,13 +84,13 @@ static forceinline char *h2c_show_flags(char *buf, size_t len, const char *delim
 	_(0);
 	/* flags */
 	_(H2_CF_MUX_MALLOC, _(H2_CF_MUX_MFULL, _(H2_CF_DEM_DALLOC,
-	_(H2_CF_DEM_DFULL, _(H2_CF_DEM_MROOM,
+	_(H2_CF_DEM_DFULL, _(H2_CF_WAIT_INLIST, _(H2_CF_DEM_RXBUF, _(H2_CF_DEM_MROOM,
 	_(H2_CF_DEM_SALLOC, _(H2_CF_DEM_SFULL, _(H2_CF_DEM_TOOMANY,
-	_(H2_CF_DEM_SHORT_READ, _(H2_CF_DEM_IN_PROGRESS, _(H2_CF_GOAWAY_SENT,
-	_(H2_CF_GOAWAY_FAILED, _(H2_CF_WAIT_FOR_HS, _(H2_CF_IS_BACK,
+	_(H2_CF_DEM_SHORT_READ, _(H2_CF_DEM_IN_PROGRESS, _(H2_CF_MBUF_HAS_DATA,
+	_(H2_CF_GOAWAY_SENT, _(H2_CF_GOAWAY_FAILED, _(H2_CF_WAIT_FOR_HS, _(H2_CF_IS_BACK,
 	_(H2_CF_WINDOW_OPENED, _(H2_CF_RCVD_SHUT, _(H2_CF_END_REACHED,
 	_(H2_CF_RCVD_RFC8441, _(H2_CF_SHTS_UPDATED, _(H2_CF_DTSU_EMITTED,
-	_(H2_CF_ERR_PENDING, _(H2_CF_ERROR))))))))))))))))))))));
+	_(H2_CF_ERR_PENDING, _(H2_CF_ERROR)))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -129,6 +133,8 @@ static forceinline char *h2c_show_flags(char *buf, size_t len, const char *delim
 
 #define H2_SF_TUNNEL_ABRT       0x00100000  // A tunnel attempt was aborted
 #define H2_SF_MORE_HTX_DATA     0x00200000  // more data expected from HTX
+#define H2_SF_EXPECT_RXDATA     0x00400000  // more data expected from the peer
+
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -146,7 +152,7 @@ static forceinline char *h2s_show_flags(char *buf, size_t len, const char *delim
 	_(H2_SF_BODY_TUNNEL, _(H2_SF_NOTIFIED, _(H2_SF_HEADERS_SENT,
 	_(H2_SF_OUTGOING_DATA, _(H2_SF_HEADERS_RCVD, _(H2_SF_WANT_SHUTR,
 	_(H2_SF_WANT_SHUTW, _(H2_SF_EXT_CONNECT_SENT, _(H2_SF_EXT_CONNECT_RCVD,
-	_(H2_SF_TUNNEL_ABRT, _(H2_SF_MORE_HTX_DATA)))))))))))))))))))));
+	_(H2_SF_TUNNEL_ABRT, _(H2_SF_MORE_HTX_DATA, _(H2_SF_EXPECT_RXDATA))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;

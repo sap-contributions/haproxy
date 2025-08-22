@@ -170,6 +170,34 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 	return 1;
 }
 
+/* try to match input sample against map entries, returns matched entry's key
+ * on success
+ */
+static int sample_conv_map_key(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct map_descriptor *desc;
+	struct pattern *pat;
+
+	/* get config */
+	desc = arg_p[0].data.map;
+
+	/* Execute the match function. */
+	pat = pattern_exec_match(&desc->pat, smp, 1);
+
+	/* Match case. */
+	if (pat) {
+		smp->data.type = SMP_T_STR;
+		smp->flags |= SMP_F_CONST;
+		smp->data.u.str.area = (char *)pat->ref->pattern;
+		smp->data.u.str.data = strlen(pat->ref->pattern);
+		return 1;
+	}
+	return 0;
+}
+
+/* try to match input sample against map entries, returns matched entry's value
+ * on success
+ */
 static int sample_conv_map(const struct arg *arg_p, struct sample *smp, void *private)
 {
 	struct map_descriptor *desc;
@@ -345,21 +373,7 @@ struct show_map_ctx {
 static int cli_io_handler_pat_list(struct appctx *appctx)
 {
 	struct show_map_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
 	struct pat_ref_elt *elt;
-
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE)) {
-		/* If we're forced to shut down, we might have to remove our
-		 * reference to the last ref_elt being dumped.
-		 */
-		if (!LIST_ISEMPTY(&ctx->bref.users)) {
-			HA_RWLOCK_WRLOCK(PATREF_LOCK, &ctx->ref->lock);
-			LIST_DEL_INIT(&ctx->bref.users);
-			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ctx->ref->lock);
-		}
-		return 1;
-	}
 
 	switch (ctx->state) {
 	case STATE_INIT:
@@ -546,13 +560,13 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 
 				/* display pattern */
 				if (ctx->display_flags == PAT_REF_MAP) {
-					if (pat->ref && pat->ref->pattern)
+					if (pat->ref)
 						chunk_appendf(&trash, ", key=\"%s\"", pat->ref->pattern);
 					else
 						chunk_appendf(&trash, ", key=unknown");
 				}
 				else {
-					if (pat->ref && pat->ref->pattern)
+					if (pat->ref)
 						chunk_appendf(&trash, ", pattern=\"%s\"", pat->ref->pattern);
 					else
 						chunk_appendf(&trash, ", pattern=unknown");
@@ -701,7 +715,7 @@ static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx,
 
 		/* no parameter: display all map available */
 		if (!*args[2]) {
-			appctx->io_handler = cli_io_handler_pats_list;
+			appctx->cli_ctx.io_handler = cli_io_handler_pats_list;
 			return 0;
 		}
 
@@ -731,8 +745,8 @@ static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx,
 			ctx->curr_gen = ctx->ref->curr_gen;
 
 		LIST_INIT(&ctx->bref.users);
-		appctx->io_handler = cli_io_handler_pat_list;
-		appctx->io_release = cli_release_show_map;
+		appctx->cli_ctx.io_handler = cli_io_handler_pat_list;
+		appctx->cli_ctx.io_release = cli_release_show_map;
 		return 0;
 	}
 
@@ -794,7 +808,7 @@ static int cli_parse_set_map(char **args, char *payload, struct appctx *appctx, 
 			 */
 			err = NULL;
 			HA_RWLOCK_WRLOCK(PATREF_LOCK, &ctx->ref->lock);
-			if (!pat_ref_set(ctx->ref, args[3], args[4], &err, NULL)) {
+			if (!pat_ref_set(ctx->ref, args[3], args[4], &err)) {
 				HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ctx->ref->lock);
 				if (err)
 					return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
@@ -1027,6 +1041,8 @@ static int cli_io_handler_clear_map(struct appctx *appctx)
 		applet_have_more_data(appctx);
 		return 0;
 	}
+
+	trim_all_pools();
 	return 1;
 }
 
@@ -1223,6 +1239,16 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "map_reg_ip",  sample_conv_map, ARG2(1,STR,STR), sample_load_map, SMP_T_STR,  SMP_T_ADDR, (void *)PAT_MATCH_REG },
 	{ "map_int_ip",  sample_conv_map, ARG2(1,STR,STR), sample_load_map, SMP_T_SINT, SMP_T_ADDR, (void *)PAT_MATCH_INT },
 	{ "map_ip_ip",   sample_conv_map, ARG2(1,STR,STR), sample_load_map, SMP_T_ADDR, SMP_T_ADDR, (void *)PAT_MATCH_IP  },
+
+	{ "map_str_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_STR,  SMP_T_STR, (void *)PAT_MATCH_STR },
+	{ "map_beg_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_STR,  SMP_T_STR, (void *)PAT_MATCH_BEG },
+	{ "map_sub_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_STR,  SMP_T_STR, (void *)PAT_MATCH_SUB },
+	{ "map_dir_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_STR,  SMP_T_STR, (void *)PAT_MATCH_DIR },
+	{ "map_dom_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_STR,  SMP_T_STR, (void *)PAT_MATCH_DOM },
+	{ "map_end_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_STR,  SMP_T_STR, (void *)PAT_MATCH_END },
+	{ "map_reg_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_STR,  SMP_T_STR, (void *)PAT_MATCH_REG },
+	{ "map_int_key",  sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_SINT, SMP_T_STR, (void *)PAT_MATCH_INT },
+	{ "map_ip_key",   sample_conv_map_key, ARG1(1,STR), sample_load_map, SMP_T_ADDR, SMP_T_STR, (void *)PAT_MATCH_IP  },
 
 	{ /* END */ },
 }};

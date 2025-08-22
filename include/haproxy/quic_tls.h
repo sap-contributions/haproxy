@@ -59,25 +59,26 @@ int quic_tls_derive_initial_secrets(const EVP_MD *md,
 
 int quic_tls_encrypt(unsigned char *buf, size_t len,
                      const unsigned char *aad, size_t aad_len,
-                     EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
+                     QUIC_AEAD_CTX *ctx, const QUIC_AEAD *aead,
                      const unsigned char *iv);
 
 int quic_tls_decrypt2(unsigned char *out,
                       unsigned char *in, size_t ilen,
                       unsigned char *aad, size_t aad_len,
-                      EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
+                      QUIC_AEAD_CTX *ctx, const QUIC_AEAD *aead,
                       const unsigned char *key, const unsigned char *iv);
 
 int quic_tls_decrypt(unsigned char *buf, size_t len,
                      unsigned char *aad, size_t aad_len,
-                     EVP_CIPHER_CTX *tls_ctx, const EVP_CIPHER *aead,
+                     QUIC_AEAD_CTX *tls_ctx, const QUIC_AEAD *aead,
                      const unsigned char *key, const unsigned char *iv);
 
 int quic_tls_generate_retry_integrity_tag(unsigned char *odcid, unsigned char odcid_len,
-                                          unsigned char *buf, size_t len,
+                                          const unsigned char *buf, size_t len,
+                                          unsigned char *tag,
                                           const struct quic_version *qv);
 
-int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
+int quic_tls_derive_keys(const QUIC_AEAD *aead, const EVP_CIPHER *hp,
                          const EVP_MD *md, const struct quic_version *qv,
                          unsigned char *key, size_t keylen,
                          unsigned char *iv, size_t ivlen,
@@ -89,6 +90,12 @@ int quic_tls_derive_retry_token_secret(const EVP_MD *md,
                                        unsigned char *iv, size_t ivlen,
                                        const unsigned char *salt, size_t saltlen,
                                        const unsigned char *secret, size_t secretlen);
+
+int quic_tls_derive_token_secret(const EVP_MD *md,
+                                 unsigned char *key, size_t keylen,
+                                 unsigned char *iv, size_t ivlen,
+                                 const unsigned char *salt, size_t saltlen,
+                                 const unsigned char *secret, size_t secretlen);
 
 int quic_hkdf_expand(const EVP_MD *md,
                      unsigned char *buf, size_t buflen,
@@ -106,10 +113,10 @@ int quic_hkdf_extract_and_expand(const EVP_MD *md,
                                  const unsigned char *salt, size_t saltlen,
                                  const unsigned char *label, size_t labellen);
 
-int quic_tls_rx_ctx_init(EVP_CIPHER_CTX **rx_ctx,
-                         const EVP_CIPHER *aead, unsigned char *key);
-int quic_tls_tx_ctx_init(EVP_CIPHER_CTX **tx_ctx,
-                         const EVP_CIPHER *aead, unsigned char *key);
+int quic_tls_rx_ctx_init(QUIC_AEAD_CTX **rx_ctx,
+                         const QUIC_AEAD *aead, unsigned char *key);
+int quic_tls_tx_ctx_init(QUIC_AEAD_CTX **tx_ctx,
+                         const QUIC_AEAD *aead, unsigned char *key);
 
 int quic_tls_sec_update(const EVP_MD *md, const struct quic_version *qv,
                         unsigned char *new_sec, size_t new_seclen,
@@ -119,30 +126,52 @@ void quic_aead_iv_build(unsigned char *iv, size_t ivlen,
                         unsigned char *aead_iv, size_t aead_ivlen, uint64_t pn);
 
 /* HP protection (AES) */
-int quic_tls_dec_aes_ctx_init(EVP_CIPHER_CTX **aes_ctx,
+int quic_tls_dec_hp_ctx_init(EVP_CIPHER_CTX **aes_ctx,
                               const EVP_CIPHER *aes, unsigned char *key);
-int quic_tls_enc_aes_ctx_init(EVP_CIPHER_CTX **aes_ctx,
+int quic_tls_enc_hp_ctx_init(EVP_CIPHER_CTX **aes_ctx,
                               const EVP_CIPHER *aes, unsigned char *key);
-int quic_tls_aes_decrypt(unsigned char *out,
+int quic_tls_hp_decrypt(unsigned char *out,
                          const unsigned char *in, size_t inlen,
-                         EVP_CIPHER_CTX *ctx);
-int quic_tls_aes_encrypt(unsigned char *out,
+                         EVP_CIPHER_CTX *ctx, unsigned char *key);
+int quic_tls_hp_encrypt(unsigned char *out,
                          const unsigned char *in, size_t inlen,
-                         EVP_CIPHER_CTX *ctx);
+                         EVP_CIPHER_CTX *ctx, unsigned char *key);
 
 int quic_tls_key_update(struct quic_conn *qc);
 void quic_tls_rotate_keys(struct quic_conn *qc);
 
-static inline const EVP_CIPHER *tls_aead(const SSL_CIPHER *cipher)
+static inline const QUIC_AEAD *tls_aead(const SSL_CIPHER *cipher)
 {
 	switch (SSL_CIPHER_get_id(cipher)) {
 	case TLS1_3_CK_AES_128_GCM_SHA256:
+#ifdef QUIC_AEAD_API
+		return EVP_aead_aes_128_gcm();
+#else
 		return EVP_aes_128_gcm();
+#endif
+
 	case TLS1_3_CK_AES_256_GCM_SHA384:
+#ifdef QUIC_AEAD_API
+		return EVP_aead_aes_256_gcm();
+#else
 		return EVP_aes_256_gcm();
-#if !defined(OPENSSL_IS_AWSLC)
+#endif
+
+#if (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x4000000fL)
+	/* WT: LibreSSL has an issue with CHACHA20 running in-place till 3.9.2
+	 *     included, but the fix is already identified and will be merged
+	 *     into next major version. Given that on machines without AES-NI
+	 *     CHACHA20 is selected by default, this makes connections freeze
+	 *     on non-x86 machines, so we prefer to break them so that the
+	 *     client falls back to TCP. See GH issue #2569 for the context.
+	 *     Thanks to Theo Buehler for his help!
+	 */
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
+# ifdef QUIC_AEAD_API
+		return EVP_aead_chacha20_poly1305();
+# else
 		return EVP_chacha20_poly1305();
+# endif
 #endif
 #if !defined(USE_OPENSSL_WOLFSSL) && !defined(OPENSSL_IS_AWSLC)
 	case TLS1_3_CK_AES_128_CCM_SHA256:
@@ -170,8 +199,10 @@ static inline const EVP_MD *tls_md(const SSL_CIPHER *cipher)
 static inline const EVP_CIPHER *tls_hp(const SSL_CIPHER *cipher)
 {
 	switch (SSL_CIPHER_get_id(cipher)) {
-#if !defined(OPENSSL_IS_AWSLC)
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
+#ifdef QUIC_AEAD_API
+		return EVP_CIPHER_CHACHA20;
+#else
 		return EVP_chacha20();
 #endif
 	case TLS1_3_CK_AES_128_CCM_SHA256:
@@ -222,7 +253,7 @@ static inline struct quic_pktns **qel_to_quic_pktns(struct quic_conn *qc,
 }
 
 /* Map <level> TLS stack encryption level to our internal QUIC TLS encryption level
- * if succeded, or -1 if failed.
+ * if succeeded, or -1 if failed.
  */
 static inline enum quic_tls_enc_level ssl_to_quic_enc_level(enum ssl_encryption_level_t level)
 {
@@ -260,6 +291,29 @@ static inline struct quic_enc_level **ssl_to_qel_addr(struct quic_conn *qc,
 		return NULL;
 	}
 }
+
+#ifdef HAVE_OPENSSL_QUIC
+/* Simple helper function which translate an OpenSSL SSL protection level
+ * to a quictls SSL encryption. This way the code which use the OpenSSL QUIC API
+ * may use the code which uses the quictls API.
+ */
+static inline enum ssl_encryption_level_t ssl_prot_level_to_enc_level(struct quic_conn *qc,
+                                                                      uint32_t prot_level)
+{
+	switch (prot_level) {
+	case OSSL_RECORD_PROTECTION_LEVEL_NONE:
+		return ssl_encryption_initial;
+	case OSSL_RECORD_PROTECTION_LEVEL_EARLY:
+		return ssl_encryption_early_data;
+	case OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE:
+		return ssl_encryption_handshake;
+	case OSSL_RECORD_PROTECTION_LEVEL_APPLICATION:
+		return ssl_encryption_application;
+	default:
+		return -1;
+	}
+}
+#endif
 
 /* Return the address of the QUIC TLS encryption level associated to <level> internal
  * encryption level and attached to <qc> QUIC connection if succeeded, or
@@ -483,7 +537,8 @@ static inline int quic_pktns_init(struct quic_conn *qc, struct quic_pktns **p)
 	return 1;
 }
 
-static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct quic_conn *qc)
+static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns,
+                                              struct quic_conn *qc, int resend)
 {
 	struct eb64_node *node;
 
@@ -504,7 +559,11 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct q
 			qc_frm_unref(frm, qc);
 			LIST_DEL_INIT(&frm->list);
 			quic_tx_packet_refdec(frm->pkt);
-			qc_frm_free(qc, &frm);
+			if (!resend)
+				qc_frm_free(qc, &frm);
+			else
+				LIST_APPEND(&pktns->tx.frms, &frm->list);
+
 		}
 		eb64_delete(&pkt->pn_node);
 		quic_tx_packet_refdec(pkt);
@@ -519,9 +578,12 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct q
  * connection.
  * Note that all the non acknowledged TX packets and their frames are freed.
  * Always succeeds.
+ * <resend> boolean must be 1 to resend the frames which are in flight.
+ * This is only used to resend the Initial packet frames upon a RETRY
+ * packet receipt (backend only option).
  */
 static inline void quic_pktns_discard(struct quic_pktns *pktns,
-                                      struct quic_conn *qc)
+                                      struct quic_conn *qc, int resend)
 {
 	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
 
@@ -537,7 +599,7 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 	pktns->tx.loss_time = TICK_ETERNITY;
 	pktns->tx.pto_probe = 0;
 	pktns->tx.in_flight = 0;
-	quic_pktns_tx_pkts_release(pktns, qc);
+	quic_pktns_tx_pkts_release(pktns, qc, resend);
 
 	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
 }
@@ -685,8 +747,11 @@ static inline void quic_tls_ctx_reset(struct quic_tls_ctx *ctx)
 	ctx->rx.hp_ctx = NULL;
 	ctx->rx.hp = NULL;
 	ctx->rx.secret = NULL;
+	ctx->rx.secretlen = 0;
 	ctx->rx.iv = NULL;
+	ctx->rx.ivlen = 0;
 	ctx->rx.key = NULL;
+	ctx->rx.keylen = 0;
 	ctx->rx.pn = 0;
 
 	ctx->tx.ctx = NULL;
@@ -695,8 +760,11 @@ static inline void quic_tls_ctx_reset(struct quic_tls_ctx *ctx)
 	ctx->tx.hp_ctx = NULL;
 	ctx->tx.hp = NULL;
 	ctx->tx.secret = NULL;
+	ctx->tx.secretlen = 0;
 	ctx->tx.iv = NULL;
+	ctx->tx.ivlen = 0;
 	ctx->tx.key = NULL;
+	ctx->tx.keylen = 0;
 	/* Not used on the TX path. */
 	ctx->tx.pn = 0;
 
@@ -730,16 +798,26 @@ static inline void quic_tls_ctx_secs_free(struct quic_tls_ctx *ctx)
 	}
 
 	/* RX HP protection */
+#ifdef QUIC_AEAD_API
+	if (ctx->rx.hp_ctx != EVP_CIPHER_CTX_CHACHA20)
+		EVP_CIPHER_CTX_free(ctx->rx.hp_ctx);
+#else
 	EVP_CIPHER_CTX_free(ctx->rx.hp_ctx);
+#endif
 	/* RX AEAD decryption */
-	EVP_CIPHER_CTX_free(ctx->rx.ctx);
+	QUIC_AEAD_CTX_free(ctx->rx.ctx);
 	pool_free(pool_head_quic_tls_iv,  ctx->rx.iv);
 	pool_free(pool_head_quic_tls_key, ctx->rx.key);
 
 	/* TX HP protection */
+#ifdef QUIC_AEAD_API
+	if (ctx->tx.hp_ctx != EVP_CIPHER_CTX_CHACHA20)
+		EVP_CIPHER_CTX_free(ctx->tx.hp_ctx);
+#else
 	EVP_CIPHER_CTX_free(ctx->tx.hp_ctx);
+#endif
 	/* TX AEAD encryption */
-	EVP_CIPHER_CTX_free(ctx->tx.ctx);
+	QUIC_AEAD_CTX_free(ctx->tx.ctx);
 	pool_free(pool_head_quic_tls_iv,  ctx->tx.iv);
 	pool_free(pool_head_quic_tls_key, ctx->tx.key);
 
@@ -792,7 +870,7 @@ static inline void quic_tls_secrets_keys_free(struct quic_tls_secrets *secs)
 	/* HP protection */
 	EVP_CIPHER_CTX_free(secs->hp_ctx);
 	/* AEAD decryption */
-	EVP_CIPHER_CTX_free(secs->ctx);
+	QUIC_AEAD_CTX_free(secs->ctx);
 	pool_free(pool_head_quic_tls_iv,  secs->iv);
 	pool_free(pool_head_quic_tls_key, secs->key);
 
@@ -831,9 +909,27 @@ static inline void quic_nictx_free(struct quic_conn *qc)
 /* Initialize a TLS cryptographic context for the Initial encryption level. */
 static inline int quic_initial_tls_ctx_init(struct quic_tls_ctx *ctx)
 {
+#ifdef QUIC_AEAD_API
+	ctx->rx.aead = ctx->tx.aead = EVP_aead_aes_128_gcm();
+#else
 	ctx->rx.aead = ctx->tx.aead = EVP_aes_128_gcm();
+#endif
 	ctx->rx.md   = ctx->tx.md   = EVP_sha256();
 	ctx->rx.hp   = ctx->tx.hp   = EVP_aes_128_ctr();
+
+	ctx->rx.iv   = NULL;
+	ctx->rx.ivlen = 0;
+	ctx->rx.key  = NULL;
+	ctx->rx.keylen = 0;
+	ctx->rx.secret = NULL;
+	ctx->rx.secretlen = 0;
+
+	ctx->tx.iv   = NULL;
+	ctx->tx.ivlen = 0;
+	ctx->tx.key  = NULL;
+	ctx->tx.keylen = 0;
+	ctx->tx.secret = NULL;
+	ctx->tx.secretlen = 0;
 
 	return quic_tls_ctx_keys_alloc(ctx);
 }
@@ -917,7 +1013,7 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	if (!quic_tls_rx_ctx_init(&rx_ctx->ctx, rx_ctx->aead, rx_ctx->key))
 		goto err;
 
-	if (!quic_tls_enc_aes_ctx_init(&rx_ctx->hp_ctx, rx_ctx->hp, rx_ctx->hp_key))
+	if (!quic_tls_enc_hp_ctx_init(&rx_ctx->hp_ctx, rx_ctx->hp, rx_ctx->hp_key))
 		goto err;
 
 	if (!quic_tls_derive_keys(ctx->tx.aead, ctx->tx.hp, ctx->tx.md, ver,
@@ -930,7 +1026,7 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	if (!quic_tls_tx_ctx_init(&tx_ctx->ctx, tx_ctx->aead, tx_ctx->key))
 		goto err;
 
-	if (!quic_tls_enc_aes_ctx_init(&tx_ctx->hp_ctx, tx_ctx->hp, tx_ctx->hp_key))
+	if (!quic_tls_enc_hp_ctx_init(&tx_ctx->hp_ctx, tx_ctx->hp, tx_ctx->hp_key))
 		goto err;
 
 	TRACE_LEAVE(QUIC_EV_CONN_ISEC, qc, rx_init_sec, tx_init_sec);
@@ -957,17 +1053,17 @@ static inline void quic_tls_ku_reset(struct quic_tls_kp *tls_kp)
  */
 static inline void quic_tls_ku_free(struct quic_conn *qc)
 {
-	EVP_CIPHER_CTX_free(qc->ku.prv_rx.ctx);
+	QUIC_AEAD_CTX_free(qc->ku.prv_rx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.prv_rx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.prv_rx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.prv_rx.key);
 	quic_tls_ku_reset(&qc->ku.prv_rx);
-	EVP_CIPHER_CTX_free(qc->ku.nxt_rx.ctx);
+	QUIC_AEAD_CTX_free(qc->ku.nxt_rx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_rx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_rx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_rx.key);
 	quic_tls_ku_reset(&qc->ku.nxt_rx);
-	EVP_CIPHER_CTX_free(qc->ku.nxt_tx.ctx);
+	QUIC_AEAD_CTX_free(qc->ku.nxt_tx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_tx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_tx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_tx.key);
@@ -1028,6 +1124,68 @@ static inline int quic_tls_has_tx_sec(const struct quic_enc_level *qel)
 {
 	return qel && !!qel->tls_ctx.tx.key;
 }
+
+/* Return 1 if there is RX packets for <qel> QUIC encryption level, 0 if not */
+static inline int qc_el_rx_pkts(struct quic_enc_level *qel)
+{
+	int ret;
+
+	ret = !eb_is_empty(&qel->rx.pkts);
+
+	return ret;
+}
+
+/* Delete all RX packets for <qel> QUIC encryption level */
+static inline void qc_el_rx_pkts_del(struct quic_enc_level *qel)
+{
+	struct eb64_node *node;
+
+	node = eb64_first(&qel->rx.pkts);
+	while (node) {
+		struct quic_rx_packet *pkt =
+			eb64_entry(node, struct quic_rx_packet, pn_node);
+
+		node = eb64_next(node);
+		eb64_delete(&pkt->pn_node);
+		quic_rx_packet_refdec(pkt);
+	}
+}
+
+static inline void qc_list_qel_rx_pkts(struct quic_enc_level *qel)
+{
+	struct eb64_node *node;
+
+	node = eb64_first(&qel->rx.pkts);
+	while (node) {
+		struct quic_rx_packet *pkt;
+
+		pkt = eb64_entry(node, struct quic_rx_packet, pn_node);
+		fprintf(stderr, "pkt@%p type=%d pn=%llu\n",
+		        pkt, pkt->type, (ull)pkt->pn_node.key);
+		node = eb64_next(node);
+	}
+}
+
+/* Returns a boolean if <qc> needs to emit frames for <qel> encryption level. */
+static inline int qc_need_sending(struct quic_conn *qc, struct quic_enc_level *qel)
+{
+	return (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) ||
+	       (qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED) ||
+	       qel->pktns->tx.pto_probe ||
+	       !LIST_ISEMPTY(&qel->pktns->tx.frms);
+}
+
+/* Return 1 if <qc> connection may probe the Initial packet number space, 0 if not.
+ * This is not the case if the remote peer address is not validated and if
+ * it cannot send at least QUIC_INITIAL_PACKET_MINLEN bytes.
+ */
+static inline int qc_may_probe_ipktns(struct quic_conn *qc)
+{
+	return quic_peer_validated_addr(qc) ||
+		quic_may_send_bytes(qc) >= QUIC_INITIAL_PACKET_MINLEN;
+}
+
+
 
 #endif /* USE_QUIC */
 #endif /* _PROTO_QUIC_TLS_H */

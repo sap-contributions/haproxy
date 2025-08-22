@@ -3,11 +3,19 @@
  *
  * Copyright 2022 HAProxy Technologies
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2.1 of the License, or (at your option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
 #include <haproxy/sample.h>
@@ -106,7 +114,11 @@ static inline int http_7239_extract_ipv4(struct ist *input, struct in_addr *ip)
 {
 	char ip4[INET_ADDRSTRLEN];
 	unsigned char buf[sizeof(struct in_addr)];
+	void *dst = buf;
 	int it = 0;
+
+	if (ip)
+		dst = ip;
 
 	/* extract ipv4 addr */
 	while (it < istlen(*input) && it < (sizeof(ip4) - 1)) {
@@ -117,11 +129,9 @@ static inline int http_7239_extract_ipv4(struct ist *input, struct in_addr *ip)
 		it += 1;
 	}
 	ip4[it] = 0;
-	if (inet_pton(AF_INET, ip4, buf) != 1)
+	if (inet_pton(AF_INET, ip4, dst) != 1)
 		return 0; /* invalid ip4 addr */
 	/* ok */
-	if (ip)
-		memcpy(ip, buf, sizeof(buf));
 	*input = istadv(*input, it);
 	return 1;
 }
@@ -138,7 +148,11 @@ static inline int http_7239_extract_ipv6(struct ist *input, struct in6_addr *ip)
 {
 	char ip6[INET6_ADDRSTRLEN];
 	unsigned char buf[sizeof(struct in6_addr)];
+	void *dst = buf;
 	int it = 0;
+
+	if (ip)
+		dst = ip;
 
 	*input = istnext(*input); /* skip '[' leading char */
 	/* extract ipv6 addr */
@@ -154,11 +168,9 @@ static inline int http_7239_extract_ipv6(struct ist *input, struct in6_addr *ip)
 	if ((istlen(*input)-it) < 1 || istptr(*input)[it] != ']')
 		return 0; /* missing ending "]" char */
 	it += 1;
-	if (inet_pton(AF_INET6, ip6, buf) != 1)
+	if (inet_pton(AF_INET6, ip6, dst) != 1)
 		return 0; /* invalid ip6 addr */
 	/* ok */
-	if (ip)
-		memcpy(ip, buf, sizeof(buf));
 	*input = istadv(*input, it);
 	return 1;
 }
@@ -858,7 +870,6 @@ int http_handle_xot_header(struct stream *s, struct channel *req)
 	}
 	if (s->be->http_ext && s->be->http_ext->xot) {
 		/* backend */
-		BUG_ON(!s->be->http_ext);
 		b_xot = s->be->http_ext->xot;
 	}
 
@@ -1869,12 +1880,118 @@ static int sample_conv_7239_n2np(const struct arg *args, struct sample *smp, voi
 	return 1;
 }
 
+/*
+ * input: ipv4 address, ipv6 address or str (empty string will result in
+ * "unknown" identifier, else string will be translated to _obfs
+ * identifier, prefixed by '_'. Must comply with RFC7239 charset)
+ *
+ * output: rfc7239-compliant forwarded header nodename
+ */
+static int sample_conv_7239_nn(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+
+	switch (smp->data.type) {
+		case SMP_T_IPV4:
+		{
+			unsigned char *pn = (unsigned char *)&(smp->data.u.ipv4);
+
+			chunk_printf(trash, "%d.%d.%d.%d", pn[0], pn[1], pn[2], pn[3]);
+			break;
+		}
+		case SMP_T_IPV6:
+			_7239_print_ip6(trash, &smp->data.u.ipv6, 1);
+			break;
+		case SMP_T_STR:
+ case_str:
+		{
+			struct ist validate_n = ist2(smp->data.u.str.area, smp->data.u.str.data);
+
+			if (!istlen(validate_n)) {
+				// empty -> unknown
+				chunk_printf(trash, "unknown");
+				break;
+			}
+
+			if (!(http_7239_extract_obfs(&validate_n, NULL) && !istlen(validate_n)))
+				return 0; /* invalid input */
+			// output with '_' prefix
+			chunk_printf(trash, "_%.*s", (int)smp->data.u.str.data, smp->data.u.str.area);
+			break;
+		}
+		default:
+		{
+			if (sample_casts[smp->data.type][SMP_T_STR] &&
+                            sample_casts[smp->data.type][SMP_T_STR](smp))
+				goto case_str;
+			return 0; /* unexpected */
+		}
+
+	}
+
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_STR;
+	smp->flags &= ~SMP_F_CONST;
+
+	return 1;
+}
+
+/*
+ * input: unsigned integer or str (string will be translated to _obfs
+ * identifier, prefixed by '_'. Must comply with RFC7239 charset)
+ *
+ * output: rfc7239-compliant forwarded header nodeport
+ */
+static int sample_conv_7239_np(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+
+	switch (smp->data.type) {
+		case SMP_T_SINT:
+		{
+			chunk_printf(trash, "%u", (unsigned int)smp->data.u.sint);
+			break;
+		}
+		case SMP_T_STR:
+ case_str:
+		{
+			struct ist validate_n = ist2(smp->data.u.str.area, smp->data.u.str.data);
+
+			if (!istlen(validate_n))
+				return 0;
+
+			if (!(http_7239_extract_obfs(&validate_n, NULL) && !istlen(validate_n)))
+				return 0; /* invalid input */
+			// output with '_' prefix
+			chunk_printf(trash, "_%.*s", (int)smp->data.u.str.data, smp->data.u.str.area);
+			break;
+		}
+		default:
+		{
+			if (sample_casts[smp->data.type][SMP_T_STR] &&
+                            sample_casts[smp->data.type][SMP_T_STR](smp))
+				goto case_str;
+			return 0; /* unexpected */
+		}
+
+	}
+
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_STR;
+	smp->flags &= ~SMP_F_CONST;
+
+	return 1;
+
+}
+
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "rfc7239_is_valid",  sample_conv_7239_valid,   0,                NULL,   SMP_T_STR,  SMP_T_BOOL},
 	{ "rfc7239_field",     sample_conv_7239_field,   ARG1(1,STR),      NULL,   SMP_T_STR,  SMP_T_STR},
 	{ "rfc7239_n2nn",      sample_conv_7239_n2nn,    0,                NULL,   SMP_T_STR,  SMP_T_ANY},
 	{ "rfc7239_n2np",      sample_conv_7239_n2np,    0,                NULL,   SMP_T_STR,  SMP_T_ANY},
+	{ "rfc7239_nn",        sample_conv_7239_nn,      0,                NULL,   SMP_T_ANY,  SMP_T_STR},
+	{ "rfc7239_np",        sample_conv_7239_np,      0,                NULL,   SMP_T_ANY,  SMP_T_STR},
 	{ NULL, NULL, 0, 0, 0 },
 }};
 

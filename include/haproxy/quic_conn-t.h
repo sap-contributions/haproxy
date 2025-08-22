@@ -28,20 +28,22 @@
 
 #include <sys/socket.h>
 
-#include <haproxy/cbuf-t.h>
-#include <haproxy/list.h>
+#include <import/ebtree-t.h>
 
+#include <haproxy/api-t.h>
+#include <haproxy/buf-t.h>
+#include <haproxy/listener-t.h>
 #include <haproxy/openssl-compat.h>
-#include <haproxy/mux_quic-t.h>
+#include <haproxy/quic_cid-t.h>
 #include <haproxy/quic_cc-t.h>
-#include <haproxy/quic_loss-t.h>
+#include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_openssl_compat-t.h>
 #include <haproxy/quic_stats-t.h>
 #include <haproxy/quic_tls-t.h>
 #include <haproxy/quic_tp-t.h>
-#include <haproxy/task.h>
-
-#include <import/ebtree-t.h>
+#include <haproxy/show_flags-t.h>
+#include <haproxy/ssl_sock-t.h>
+#include <haproxy/task-t.h>
 
 typedef unsigned long long ull;
 
@@ -61,8 +63,6 @@ typedef unsigned long long ull;
 #define QUIC_HAP_CID_LEN               8
 
 /* Common definitions for short and long QUIC packet headers. */
-/* QUIC connection ID maximum length for version 1. */
-#define QUIC_CID_MAXLEN               20 /* bytes */
 /* QUIC original destination connection ID minial length */
 #define QUIC_ODCID_MINLEN              8 /* bytes */
 /*
@@ -89,14 +89,19 @@ typedef unsigned long long ull;
 #define QUIC_TOKEN_FMT_RETRY 0x9c
 /* Format for token sent for new connections after a Retry token was sent */
 #define  QUIC_TOKEN_FMT_NEW  0xb7
-/* Salt length used to derive retry token secret */
-#define QUIC_RETRY_TOKEN_SALTLEN       16 /* bytes */
 /* Retry token duration */
 #define QUIC_RETRY_DURATION_SEC       10
 /* Default Retry threshold */
 #define QUIC_DFLT_RETRY_THRESHOLD     100 /* in connection openings */
+/* Default ratio value applied to a dynamic Packet reorder threshold. */
+#define QUIC_DFLT_REORDER_RATIO        50 /* in percent */
 /* Default limit of loss detection on a single frame. If exceeded, connection is closed. */
 #define QUIC_DFLT_MAX_FRAME_LOSS       10
+/* Default congestion window size. 480 kB, equivalent to the legacy value which was 30*bufsize */
+#define QUIC_DFLT_MAX_WINDOW_SIZE  491520
+
+/* Default ratio applied for max-stream-data-bidi-remote derived from max-data */
+#define QUIC_DFLT_FRONT_STREAM_DATA_RATIO 90
 
 /*
  *  0                   1                   2                   3
@@ -177,8 +182,15 @@ enum quic_pkt_type {
  */
 #define QUIC_CONN_MAX_PACKET  64
 
-#define QUIC_STATELESS_RESET_PACKET_HEADER_LEN 5
-#define QUIC_STATELESS_RESET_PACKET_MINLEN     (22 + QUIC_HAP_CID_LEN)
+/* RFC 9000 10.3. Stateless Reset
+ *
+ * To entities other than its intended recipient, a Stateless Reset will
+ * appear to be a packet with a short header. For the Stateless Reset to
+ * appear as a valid QUIC packet, the Unpredictable Bits field needs to
+ * include at least 38 bits of data (or 5 bytes, less the two fixed
+ * bits).
+ */
+#define QUIC_STATELESS_RESET_PACKET_MINLEN     (5 + QUIC_STATELESS_RESET_TOKEN_LEN)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -195,8 +207,6 @@ enum quic_pkt_type {
 
 /* Size of the QUIC RX buffer for the connections */
 #define QUIC_CONN_RX_BUFSZ (1UL << 16)
-
-extern struct pool_head *pool_head_quic_crypto_buf;
 
 struct quic_version {
 	uint32_t num;
@@ -218,37 +228,11 @@ struct quic_version {
 extern const struct quic_version quic_versions[];
 extern const size_t quic_versions_nb;
 extern const struct quic_version *preferred_version;
+extern const struct quic_version *quic_version_draft_29;
+extern const struct quic_version *quic_version_1;
+extern const struct quic_version *quic_version_2;
 
-/* QUIC connection id data.
- *
- * This struct is used by ebmb_node structs as last member of flexible arrays.
- * So do not change the order of the member of quic_cid struct.
- * <data> member must be the first one.
- */
-struct quic_cid {
-	unsigned char data[QUIC_CID_MAXLEN];
-	unsigned char len; /* size of QUIC CID */
-};
-
-/* QUIC connection id attached to a QUIC connection.
- *
- * This structure is used to match received packets DCIDs with the
- * corresponding QUIC connection.
- */
-struct quic_connection_id {
-	struct eb64_node seq_num;
-	uint64_t retire_prior_to;
-	unsigned char stateless_reset_token[QUIC_STATELESS_RESET_TOKEN_LEN];
-
-	struct ebmb_node node; /* node for receiver tree, cid.data as key */
-	struct quic_cid cid;   /* CID data */
-
-	struct quic_conn *qc;  /* QUIC connection using this CID */
-	uint tid;              /* Attached Thread ID for the connection. */
-};
-
-/* Flag the packet number space as having received a packet */
-#define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << 0)
+/* unused: 0x01 */
 /* Flag the packet number space as requiring an ACK frame to be sent. */
 #define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << 1)
 /* Flag the packet number space as needing probing */
@@ -261,92 +245,13 @@ struct quic_connection_id {
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
 
-/* QUIC datagram */
-struct quic_dgram {
-	void *owner;
-	unsigned char *buf;
-	size_t len;
-	unsigned char *dcid;
-	size_t dcid_len;
-	struct sockaddr_storage saddr;
-	struct sockaddr_storage daddr;
-	struct quic_conn *qc;
-
-	struct list recv_list; /* elemt to quic_receiver_buf <dgram_list>. */
-	struct mt_list handler_list; /* elem to quic_dghdlr <dgrams>. */
-};
-
 /* The QUIC packet numbers are 62-bits integers */
 #define QUIC_MAX_PACKET_NUM      ((1ULL << 62) - 1)
-
-/* QUIC datagram handler */
-struct quic_dghdlr {
-	struct mt_list dgrams;
-	struct tasklet *task;
-};
-
-/* Structure to store enough information about the RX CRYPTO frames. */
-struct quic_rx_crypto_frm {
-	struct eb64_node offset_node;
-	uint64_t len;
-	const unsigned char *data;
-	struct quic_rx_packet *pkt;
-};
-
-#define QUIC_CRYPTO_BUF_SHIFT  10
-#define QUIC_CRYPTO_BUF_MASK   ((1UL << QUIC_CRYPTO_BUF_SHIFT) - 1)
-/* The maximum allowed size of CRYPTO data buffer provided by the TLS stack. */
-#define QUIC_CRYPTO_BUF_SZ    (1UL << QUIC_CRYPTO_BUF_SHIFT) /* 1 KB */
 
 /* The maximum number of bytes of CRYPTO data in flight during handshakes. */
 #define QUIC_CRYPTO_IN_FLIGHT_MAX 4096
 
-/*
- * CRYPTO buffer struct.
- * Such buffers are used to send CRYPTO data.
- */
-struct quic_crypto_buf {
-	unsigned char data[QUIC_CRYPTO_BUF_SZ];
-	size_t sz;
-};
-
-/* Crypto data stream (one by encryption level) */
-struct quic_cstream {
-	struct {
-		uint64_t offset;       /* absolute current base offset of ncbuf */
-		struct ncbuf ncbuf;    /* receive buffer - can handle out-of-order offset frames */
-	} rx;
-	struct {
-		uint64_t offset;      /* last offset of data ready to be sent */
-		uint64_t sent_offset; /* last offset sent by transport layer */
-		struct buffer buf;    /* transmit buffer before sending via xprt */
-	} tx;
-
-	struct qc_stream_desc *desc;
-};
-
-struct quic_path {
-	/* Control congestion. */
-	struct quic_cc cc;
-	/* Packet loss detection information. */
-	struct quic_loss loss;
-
-	/* MTU. */
-	size_t mtu;
-	/* Congestion window. */
-	uint64_t cwnd;
-	uint64_t mcwnd;
-	/* Minimum congestion window. */
-	uint64_t min_cwnd;
-	/* Prepared data to be sent (in bytes). */
-	uint64_t prep_in_flight;
-	/* Outstanding data (in bytes). */
-	uint64_t in_flight;
-	/* Number of in flight ack-eliciting packets. */
-	uint64_t ifae_pkts;
-};
-
-/* Status of the connection/mux layer. This defines how to handle app data.
+/* Status of the MUX layer. This defines how to handle app data.
  *
  * During a standard quic_conn lifetime it transitions like this :
  * QC_MUX_NULL -> QC_MUX_READY -> QC_MUX_RELEASED
@@ -365,6 +270,8 @@ struct quic_conn_cntrs {
 	long long socket_full;           /* total number of EAGAIN errors on sendto() calls */
 	long long sendto_err;            /* total number of errors on sendto() calls, EAGAIN excepted */
 	long long sendto_err_unknown;    /* total number of errors on sendto() calls which are currently not supported */
+	long long sent_bytes;            /* total number of sent bytes, with or without GSO */
+	long long sent_bytes_gso;        /* total number of sent bytes using GSO */
 	long long sent_pkt;              /* total number of sent packets */
 	long long lost_pkt;              /* total number of lost packets */
 	long long conn_migration_done;   /* total number of connection migration handled */
@@ -375,34 +282,9 @@ struct quic_conn_cntrs {
 	long long streams_blocked_uni;       /* total number of times STREAMS_BLOCKED_UNI frame was received */
 };
 
-/* Flags at connection level */
-#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
-#define QUIC_FL_CONN_SPIN_BIT                    (1U << 1) /* Spin bit set by remote peer */
-#define QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS    (1U << 2) /* HANDSHAKE_DONE must be sent */
-#define QUIC_FL_CONN_LISTENER                    (1U << 3)
-#define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
-#define QUIC_FL_CONN_TX_MUX_CONTEXT              (1U << 5) /* sending in progress from the MUX layer */
-#define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
-#define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
-#define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8) /* retransmission in progress for probing with already sent data */
-#define QUIC_FL_CONN_TLS_ALERT                   (1U << 9)
-#define QUIC_FL_CONN_AFFINITY_CHANGED            (1U << 10) /* qc_finalize_affinity_rebind() must be called to finalize affinity rebind */
-/* gap here */
-#define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
-#define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
-#define QUIC_FL_CONN_ACK_TIMER_FIRED             (1U << 13) /* idle timer triggered for acknowledgements */
-#define QUIC_FL_CONN_IO_TO_REQUEUE               (1U << 14) /* IO handler must be requeued on new thread after connection migration */
-#define QUIC_FL_CONN_IPKTNS_DCD                  (1U << 15) /* Initial packet number space discarded  */
-#define QUIC_FL_CONN_HPKTNS_DCD                  (1U << 16) /* Handshake packet number space discarded  */
-#define QUIC_FL_CONN_PEER_VALIDATED_ADDR         (1U << 17) /* Connection with peer validated address */
-#define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
-#define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
-#define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
-/* gap here */
-#define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
-#define QUIC_FL_CONN_CLOSING                     (1U << 29) /* closing state, entered on CONNECTION_CLOSE emission */
-#define QUIC_FL_CONN_DRAINING                    (1U << 30) /* draining state, entered on CONNECTION_CLOSE reception */
-#define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31) /* A CONNECTION_CLOSE must be sent */
+struct connection;
+struct qcc;
+struct qcc_app_ops;
 
 #define QUIC_CONN_COMMON                               \
     struct {                                           \
@@ -426,6 +308,7 @@ struct quic_conn_cntrs {
             /* Number of received bytes. */            \
             uint64_t rx;                               \
         } bytes;                                       \
+        size_t max_udp_payload;                        \
         /* First DCID used by client on its Initial packet. */                 \
         struct quic_cid odcid;                                                 \
         /* DCID of our endpoint - not updated when a new DCID is used */       \
@@ -436,14 +319,10 @@ struct quic_conn_cntrs {
          * with a connection                                                   \
          */                                                                    \
         struct eb_root *cids;                                                  \
-        struct listener *li; /* only valid for frontend connections */         \
+        enum obj_type *target;                                                 \
         /* Idle timer task */                                                  \
         struct task *idle_timer_task;                                          \
         unsigned int idle_expire;                                              \
-        struct ssl_sock_ctx *xprt_ctx;                                         \
-        /* Used only to reach the tasklet for the I/O handler from this        \
-         * quic_conn object.                                                   \
-         */                                                                    \
         /* QUIC connection level counters */                                   \
         struct quic_conn_cntrs cntrs;                                          \
         struct connection *conn;                                               \
@@ -451,6 +330,10 @@ struct quic_conn_cntrs {
 
 struct quic_conn {
 	QUIC_CONN_COMMON;
+	/* Used only to reach the tasklet for the I/O handler from this
+	 * quic_conn object.
+	 */
+	struct ssl_sock_ctx *xprt_ctx;
 	const struct quic_version *original_version;
 	const struct quic_version *negotiated_version;
 	/* Negotiated version Initial TLS context */
@@ -459,7 +342,10 @@ struct quic_conn {
 	int tps_tls_ext;
 	int state;
 	enum qc_mux_state mux_state; /* status of the connection/mux layer */
-#ifdef USE_QUIC_OPENSSL_COMPAT
+#ifdef HAVE_OPENSSL_QUIC
+	uint32_t prot_level;
+#endif
+#if defined(USE_QUIC_OPENSSL_COMPAT) || defined(HAVE_OPENSSL_QUIC)
 	unsigned char enc_params[QUIC_TP_MAX_ENCLEN]; /* encoded QUIC transport parameters */
 	size_t enc_params_len;
 #endif
@@ -469,6 +355,10 @@ struct quic_conn {
 	 * it could be reused to derive extra CIDs from the same hash
 	 */
 	uint64_t hash64;
+
+	/* QUIC client only retry token received from servers RETRY packet */
+	unsigned char *retry_token;
+	size_t retry_token_len;
 
 	/* Initial encryption level */
 	struct quic_enc_level *iel;
@@ -508,10 +398,10 @@ struct quic_conn {
 		/* RX buffer */
 		struct buffer buf;
 		struct list pkt_list;
-		struct {
-			/* Number of open or closed streams */
-			uint64_t nb_streams;
-		} strms[QCS_MAX_TYPES];
+
+		/* first unhandled streams ID, set by MUX after release */
+		uint64_t stream_max_uni;
+		uint64_t stream_max_bidi;
 	} rx;
 	struct {
 		struct quic_tls_kp prv_rx;
@@ -520,19 +410,20 @@ struct quic_conn {
 	} ku;
 	unsigned int max_ack_delay;
 	unsigned int max_idle_timeout;
-	struct quic_path paths[1];
-	struct quic_path *path;
+	struct quic_cc_path paths[1];
+	struct quic_cc_path *path;
 
 	struct mt_list accept_list; /* chaining element used for accept, only valid for frontend connections */
 
 	struct eb_root streams_by_id; /* qc_stream_desc tree */
-	int stream_buf_count; /* total count of allocated stream buffers for this connection */
 
 	/* MUX */
 	struct qcc *qcc;
 	struct task *timer_task;
 	unsigned int timer;
 	unsigned int ack_expire;
+	/* Handshake expiration date */
+	unsigned int hs_expire;
 
 	const struct qcc_app_ops *app_ops;
 	/* Proxy counters */
@@ -544,7 +435,7 @@ struct quic_conn {
 };
 
 /* QUIC connection in "connection close" state. */
-struct quic_cc_conn {
+struct quic_conn_closed {
 	QUIC_CONN_COMMON;
 	char *cc_buf_area;
 	/* Length of the "connection close" datagram. */
@@ -552,4 +443,77 @@ struct quic_cc_conn {
 };
 
 #endif /* USE_QUIC */
+
+/* Flags at connection level */
+#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
+#define QUIC_FL_CONN_SPIN_BIT                    (1U << 1) /* Spin bit set by remote peer */
+#define QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS    (1U << 2) /* HANDSHAKE_DONE must be sent */
+#define QUIC_FL_CONN_IS_BACK                     (1U << 3) /* conn used on backend side */
+#define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
+#define QUIC_FL_CONN_UDP_GSO_EIO                 (1U << 5) /* GSO disabled due to a EIO occured on same listener */
+#define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
+#define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
+#define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8) /* retransmission in progress for probing with already sent data */
+#define QUIC_FL_CONN_TLS_ALERT                   (1U << 9)
+#define QUIC_FL_CONN_TID_REBIND                  (1U << 10) /* TID rebind in progress, requires qc_finalize_tid_rebind() call */
+#define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
+#define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
+#define QUIC_FL_CONN_ACK_TIMER_FIRED             (1U << 13) /* idle timer triggered for acknowledgements */
+#define QUIC_FL_CONN_IO_TO_REQUEUE               (1U << 14) /* IO handler must be requeued on new thread after connection migration */
+#define QUIC_FL_CONN_IPKTNS_DCD                  (1U << 15) /* Initial packet number space discarded  */
+#define QUIC_FL_CONN_HPKTNS_DCD                  (1U << 16) /* Handshake packet number space discarded  */
+#define QUIC_FL_CONN_PEER_VALIDATED_ADDR         (1U << 17) /* Peer address is considered as validated for this connection. */
+#define QUIC_FL_CONN_NO_TOKEN_RCVD               (1U << 18) /* Client dit not send any token */
+#define QUIC_FL_CONN_SCID_RECEIVED               (1U << 19) /* (client only: first Initial received. */
+/* gap here */
+#define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
+#define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
+#define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
+/* gap here */
+#define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
+#define QUIC_FL_CONN_CLOSING                     (1U << 29) /* closing state, entered on CONNECTION_CLOSE emission */
+#define QUIC_FL_CONN_DRAINING                    (1U << 30) /* draining state, entered on CONNECTION_CLOSE reception */
+#define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31) /* A CONNECTION_CLOSE must be sent */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *qc_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED,
+	_(QUIC_FL_CONN_SPIN_BIT,
+	_(QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS,
+	_(QUIC_FL_CONN_IS_BACK,
+	_(QUIC_FL_CONN_ACCEPT_REGISTERED,
+	_(QUIC_FL_CONN_UDP_GSO_EIO,
+	_(QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ,
+	_(QUIC_FL_CONN_RETRANS_NEEDED,
+	_(QUIC_FL_CONN_RETRANS_OLD_DATA,
+	_(QUIC_FL_CONN_TLS_ALERT,
+	_(QUIC_FL_CONN_TID_REBIND,
+	_(QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED,
+	_(QUIC_FL_CONN_HANDSHAKE_SPEED_UP,
+	_(QUIC_FL_CONN_ACK_TIMER_FIRED,
+	_(QUIC_FL_CONN_IO_TO_REQUEUE,
+	_(QUIC_FL_CONN_IPKTNS_DCD,
+	_(QUIC_FL_CONN_HPKTNS_DCD,
+	_(QUIC_FL_CONN_PEER_VALIDATED_ADDR,
+	_(QUIC_FL_CONN_TO_KILL,
+	_(QUIC_FL_CONN_TX_TP_RECEIVED,
+	_(QUIC_FL_CONN_FINALIZED,
+	_(QUIC_FL_CONN_EXP_TIMER,
+	_(QUIC_FL_CONN_CLOSING,
+	_(QUIC_FL_CONN_DRAINING,
+	_(QUIC_FL_CONN_IMMEDIATE_CLOSE)))))))))))))))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
 #endif /* _HAPROXY_QUIC_CONN_T_H */

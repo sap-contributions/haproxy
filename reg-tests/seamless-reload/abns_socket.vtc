@@ -16,19 +16,23 @@
 
 varnishtest "Seamless reload issue with abns sockets"
 feature ignore_unknown_macro
+feature cmd "command -v socat"
+feature cmd "command -v grep"
 
 # abns@ sockets are not available on freebsd
 #EXCLUDE_TARGETS=freebsd,osx,generic
-#REGTEST_TYPE=broken
+#REGTEST_TYPE=devel
 
-haproxy h1 -W -conf {
+haproxy h1 -Ws -S -conf {
   global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     stats socket "${tmpdir}/h1/stats" level admin expose-fd listeners
 
   defaults
     mode http
-    log global
-    option httplog
     timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
@@ -43,7 +47,8 @@ haproxy h1 -W -conf {
 } -start
 
 shell {
-  kill -USR2 $(cat "${tmpdir}/h1/pid")
+    sleep 0.1  ;# let the master process fully start and bind
+    echo "reload" | socat -t1000 TCP:${h1_mcli_addr}:${h1_mcli_port} - | grep 'Success=1'
 }
 
 client c1 -connect ${h1_testme_sock} {

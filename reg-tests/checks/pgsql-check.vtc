@@ -1,5 +1,4 @@
 varnishtest "Health-checks: PostgreSQL health-check"
-#REQUIRE_VERSION=2.2
 #REGTEST_TYPE=slow
 feature ignore_unknown_macro
 
@@ -49,6 +48,11 @@ syslog S4 -level notice {
 } -start
 
 haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         mode tcp
         timeout client "${HAPROXY_TEST_TIMEOUT-5s}"

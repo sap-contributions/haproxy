@@ -159,6 +159,13 @@ Core class
    The "core" class is static, it is not possible to create a new object of this
    type.
 
+.. js:attribute:: core.silent
+
+  :returns: integer
+
+  This attribute is an integer, it contains the value -1. It is a special value
+  used to disable logging.
+
 .. js:attribute:: core.emerg
 
   :returns: integer
@@ -267,8 +274,10 @@ Core class
   **context**: body, init, task, action, sample-fetch, converter
 
   This function sends a log. The log is sent, according with the HAProxy
-  configuration file, on the default syslog server if it is configured and on
-  the stderr if it is allowed.
+  configuration file, to the loggers relevant to the current context and/or
+  to stderr if it is allowed.
+
+  The exact behaviour depends on tune.lua.log.loggers and tune.lua.log.stderr.
 
   :param integer loglevel: Is the log level associated with the message. It is a
    number between 0 and 7.
@@ -339,34 +348,62 @@ Core class
   end
 ..
 
-.. js:function:: core.add_acl(filename, key)
+.. js:function:: core.get_patref(name)
 
   **context**: init, task, action, sample-fetch, converter
 
-  Add the ACL *key* in the ACLs list referenced by the file *filename*.
+  Find the pattern object *name* used by HAProxy. It corresponds to the
+  generic pattern reference used to handle both ACL ands Maps.
 
-  :param string filename: the filename that reference the ACL entries.
+  :param string name: reference name
+  :returns: A :ref:`patref_class` object.
+
+.. js:function:: core.add_acl(name, key)
+
+  **LEGACY**
+
+  **context**: init, task, action, sample-fetch, converter
+
+  Add the ACL *key* in the ACLs list referenced by *name*.
+
+  :param string name: the name that reference the ACL entries.
   :param string key: the key which will be added.
 
-.. js:function:: core.del_acl(filename, key)
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.add()` instead.
+
+.. js:function:: core.del_acl(name, key)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
   Delete the ACL entry referenced by the key *key* in the list of ACLs
-  referenced by *filename*.
+  referenced by *name*.
 
-  :param string filename: the filename that reference the ACL entries.
+  :param string name: the name that reference the ACL entries.
   :param string key: the key which will be deleted.
 
-.. js:function:: core.del_map(filename, key)
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.del()` instead.
+
+.. js:function:: core.del_map(name, key)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
   Delete the map entry indexed with the specified key in the list of maps
-  referenced by his filename.
+  referenced by his name.
 
-  :param string filename: the filename that reference the map entries.
+  :param string name: the name that reference the map entries.
   :param string key: the key which will be deleted.
+
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.del()` instead.
 
 .. js:function:: core.get_info()
 
@@ -476,7 +513,7 @@ Core class
 
 .. js:function:: core.msleep(milliseconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.msleep()` stops the Lua execution between specified milliseconds.
 
@@ -819,20 +856,26 @@ Core class
 
   :param integer nice: the nice value, it must be between -1024 and 1024.
 
-.. js:function:: core.set_map(filename, key, value)
+.. js:function:: core.set_map(name, key, value)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
   Set the value *value* associated to the key *key* in the map referenced by
-  *filename*.
+  *name*.
 
-  :param string filename: the Map reference
+  :param string name: the Map reference
   :param string key: the key to set or replace
   :param string value: the associated value
 
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.set()` instead.
+
 .. js:function:: core.sleep(int seconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.sleep()` functions stop the Lua execution between specified seconds.
 
@@ -850,7 +893,9 @@ Core class
 
   **context**: init, task, action
 
-  This function returns a new object of a *httpclient* class.
+  This function returns a new object of a *httpclient* class. An *httpclient*
+  object must be used to process one and only one request. It must never be
+  reused to process several requests.
 
   :returns: A :ref:`httpclient_class` object.
 
@@ -883,12 +928,25 @@ Core class
   its work and wants to give back the control to HAProxy without executing the
   remaining code. It can be seen as a multi-level "return".
 
+.. js:function:: core.wait([milliseconds])
+
+  **context**: task, action
+
+  Give back the hand at the HAProxy scheduler. Unlike :js:func:`core.yield`
+  the task will not be woken up automatically to resume as fast as possible.
+  Instead, it will wait for an event to wake the task. If milliseconds argument
+  is provided then the Lua execution will be automatically resumed passed this
+  delay even if no event caused the task to wake itself up.
+
+  :param integer milliseconds: automatic wakeup passed this delay. (optional)
+
 .. js:function:: core.yield()
 
-  **context**: task, action, sample-fetch, converter
+  **context**: task, action
 
   Give back the hand at the HAProxy scheduler. It is used when the LUA
-  processing consumes a lot of processing time.
+  processing consumes a lot of processing time. Lua execution will be resumed
+  automatically (automatic reschedule).
 
 .. js:function:: core.parse_addr(address)
 
@@ -1031,18 +1089,13 @@ Core class
     perform the heavy job in a dedicated task and allow remaining events to be
     processed more quickly.
 
-.. js:function:: core.disable_legacy_mailers()
+.. js:function:: core.use_native_mailers_config()
 
-  **LEGACY**
+  **context**: body
 
-  **context**: body, init
-
-  Disable the sending of email alerts through the legacy email sending
-  function when mailers are used in the configuration.
-
-  Use this when sending email alerts directly from lua.
-
-  :see: :js:func:`Proxy.get_mailers()`
+  Inform haproxy that the script will make use of the native "mailers"
+  config section (although legacy). In other words, inform haproxy that
+  :js:func:`Proxy.get_mailers()` will be used later in the program.
 
 .. _proxy_class:
 
@@ -1085,7 +1138,8 @@ Proxy class
 
 .. js:attribute:: Proxy.stktable
 
-  Contains a stick table object attached to the proxy.
+  Contains a stick table object of type :ref:`sticktable_class` attached to the
+  proxy.
 
 .. js:attribute:: Proxy.listeners
 
@@ -1137,7 +1191,7 @@ Proxy class
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
    proxy.
-  :returns: a string "tcp", "http", "health" or "unknown"
+  :returns: a string "tcp", "http", "syslog" or "unknown"
 
 .. js:function:: Proxy.get_srv_act(px)
 
@@ -1170,8 +1224,14 @@ Proxy class
 
   **LEGACY**
 
-  Returns a table containing mailers config for the current proxy or nil
-  if mailers are not available for the proxy.
+  Returns a table containing legacy mailers config (from haproxy configuration
+  file) for the current proxy or nil if mailers are not available for the proxy.
+
+  .. warning::
+    When relying on :js:func:`Proxy.get_mailers()` to retrieve mailers
+    configuration, :js:func:`core.use_native_mailers_config()` must be called
+    first from body or init context to inform haproxy that Lua makes use of the
+    legacy mailers config.
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
    proxy.
@@ -1187,10 +1247,6 @@ ProxyMailers class
 .. js:class:: ProxyMailers
 
   This class provides mailers config for a given proxy.
-
-  If sending emails directly from lua, please consider
-  :js:func:`core.disable_legacy_mailers()` to disable the email sending from
-  haproxy. (Or email alerts will be sent twice...)
 
 .. js:attribute:: ProxyMailers.track_server_health
 
@@ -1824,6 +1880,17 @@ Queue class
   Of course, queue may also be used as a local storage mechanism.
 
   Use :js:func:`core.queue` to get a new Queue object.
+
+.. js:function:: Queue.alarm()
+
+  **context**: task, action, service
+
+  Sets a wakeup alarm on the current Lua context so that when new data
+  becomes available on the Queue, the current Lua context is woken up
+  automatically. It can be combined with :js:func:`core.wait` to wait
+  for Queue events.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
 
 .. js:function:: Queue.size(queue)
 
@@ -2513,7 +2580,9 @@ HTTPClient class
 .. js:class:: HTTPClient
 
    The httpclient class allows issue of outbound HTTP requests through a simple
-   API without the knowledge of HAProxy internals.
+   API without the knowledge of HAProxy internals. Any instance must be used to
+   process one and only one request. It must never be reused to process several
+   requests.
 
 .. js:function:: HTTPClient.get(httpclient, request)
 .. js:function:: HTTPClient.head(httpclient, request)
@@ -2648,8 +2717,10 @@ TXN class
 .. js:function:: TXN.log(TXN, loglevel, msg)
 
   This function sends a log. The log is sent, according with the HAProxy
-  configuration file, on the default syslog server if it is configured and on
-  the stderr if it is allowed.
+  configuration file, to the loggers relevant to the current context and/or
+  to stderr if it is allowed.
+
+  The exact behaviour depends on tune.lua.log.loggers and tune.lua.log.stderr.
 
   :param class_txn txn: The class txn object containing the data.
   :param integer loglevel: Is the log level associated with the message. It is
@@ -2865,18 +2936,7 @@ TXN class
 
   :see: :js:func:`TXN.reply`, :js:class:`Reply`
 
-.. js:function:: TXN.set_loglevel(txn, loglevel)
-
-  Is used to change the log level of the current request. The "loglevel" must
-  be an integer between 0 and 7.
-
-  :param class_txn txn: The class txn object containing the data.
-  :param integer loglevel: The required log level. This variable can be one of
-  :see: :js:attr:`core.emerg`, :js:attr:`core.alert`, :js:attr:`core.crit`,
-    :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
-    :js:attr:`core.info`, :js:attr:`core.debug` (log level definitions)
-
-.. js:function:: TXN.set_tos(txn, tos)
+.. js:function:: TXN.set_fc_tos(txn, tos)
 
   Is used to set the TOS or DSCP field value of packets sent to the client to
   the value passed in "tos" on platforms which support this.
@@ -2884,13 +2944,40 @@ TXN class
   :param class_txn txn: The class txn object containing the data.
   :param integer tos: The new TOS os DSCP.
 
-.. js:function:: TXN.set_mark(txn, mark)
+.. js:function:: TXN.set_fc_mark(txn, mark)
 
   Is used to set the Netfilter MARK on all packets sent to the client to the
   value passed in "mark" on platforms which support it.
 
   :param class_txn txn: The class txn object containing the data.
   :param integer mark: The mark value.
+
+.. js:function:: TXN.set_loglevel(txn, loglevel)
+
+  Is used to change the log level of the current request. The "loglevel" must
+  be an integer between 0 and 7 or the special value -1 to disable logging.
+
+  :param class_txn txn: The class txn object containing the data.
+  :param integer loglevel: The required log level. This variable can be one of
+  :see: :js:attr:`core.silent`, :js:attr:`core.emerg`, :js:attr:`core.alert`,
+    :js:attr:`core.crit`, :js:attr:`core.err`, :js:attr:`core.warning`, :js:attr:`core.notice`,
+    :js:attr:`core.info`, :js:attr:`core.debug` (log level definitions)
+
+.. js:function:: TXN.set_mark(txn, mark)
+
+  Alias for :js:func:`TXN.set_fc_mark()`.
+
+  .. warning::
+     This function is deprecated. :js:func:`TXN.set_fc_mark()` must be used
+     instead.
+
+.. js:function:: TXN.set_tos(txn, tos)
+
+  Alias for :js:func:`TXN.set_fc_tos()`.
+
+  .. warning::
+     This function is deprecated. :js:func:`TXN.set_fc_tos()` must be used
+     instead.
 
 .. js:function:: TXN.set_priority_class(txn, prio)
 
@@ -3355,11 +3442,11 @@ Map class
   Note that :js:attr:`Map.reg` is also available for compatibility.
 
 
-.. js:function:: Map.new(file, method)
+.. js:function:: Map.new(name, method)
 
   Creates and load a map.
 
-  :param string file: Is the file containing the map.
+  :param string name: Is the name referencing the map.
   :param integer method: Is the map pattern matching method. See the attributes
    of the Map class.
   :returns: a class Map object.
@@ -3383,6 +3470,178 @@ Map class
   :param class_map map: Is the class Map object.
   :param string str: Is the string used as key.
   :returns: a string containing the result or empty string if no match.
+
+.. _patref_class:
+
+Patref class
+=================
+
+.. js:class:: Patref
+
+  Patref object corresponds to the internal HAProxy pat_ref element which
+  is used to store ACL and MAP elements. It is identified by its name
+  (reference) which often is a filename, unless it is prefixed by 'virt@'
+  for virtual references or 'opt@' for references that don't necessarily
+  point to real file. From Lua, :ref:`patref_class` object may be used to
+  directly manipulate existing pattern reference storage. For convenience,
+  Patref objects may be directly accessed and listed as a table thanks to
+  index and pairs metamethods. Note however that for the index metamethod,
+  in case of duplicated entries, only the first matching entry is returned.
+
+  .. Warning::
+     Not meant to be shared between multiple contexts. If multiple contexts
+     need to work on the same pattern reference, each context should have
+     its own patref object.
+
+  Patref object is obtained using the :js:func:`core.get_patref()`
+  function
+
+.. js:function:: Patref.get_name(ref)
+
+  :returns: the name of the pattern reference object.
+
+.. js:function:: Patref.is_map(ref)
+
+  :returns: true if the pattern reference is used to handle maps instead
+   of acl, false otherwise.
+
+.. js:function:: Patref.purge(ref)
+
+  Completely prune all pattern reference entries pointed to by Patref object.
+  This special operation doesn't require committing.
+
+.. js:function:: Patref.prepare(ref)
+
+  Create a new empty version for Patref Object. It can be used to manipulate
+  the Patref object with update methods without applying the updates until the
+  commit() method is called.
+
+.. js:function:: Patref.commit(ref)
+
+  Tries to commit pending Patref object updates, that is updates made to the
+  local object will be committed to the underlying pattern reference storage
+  in an atomic manner upon success. Upon failure, local pending updates are
+  lost. Upon success, all other pending updates on the pattern reference
+  (e.g.: "prepare" from the cli or from other Patref Lua objects) started
+  before the new one will be pruned.
+
+  :returns: true on success and nil on failure (followed by an error message).
+
+  See :js:func:`Patref.prepare()` and :js:func:`Patref.giveup()`
+
+.. js:function:: Patref.giveup(ref)
+
+  Drop the pending patref version created using Patref:prepare(): get back to
+  live dataset.
+
+.. js:function:: Patref.add(ref, key[, value])
+
+  Add a new key to the pattern reference, with associated value for maps.
+
+  :param string key: the string used as a key
+  :param string value: the string used as value to be associated with the key
+   (only relevant for maps)
+  :returns: true on success and nil on failure (followed by an error message).
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: patref.add_bulk(ref, table)
+
+  Adds multiple entries at once to the Pattern reference. It is recommended
+  to use this one over :js:func:`Patref.prepare()` to add a lot of entries
+  at once because this one is more efficient.
+
+  :param table table: For ACL, a table of keys strings: t[0] = "key1",
+   t[1] = "key2"...
+
+   For Maps, a table of key:value string pairs: t["key"] = "value"
+  :returns: true on success and nil on failure (followed by an error message).
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still pending (waiting for commit or giveup)
+
+.. js:function:: Patref.del(ref, key)
+
+  Delete all entries matching the input key in the pattern reference. In
+  case of duplicate keys, all keys are removed.
+
+  :param string key: the string used as a key
+  :returns: true on success and false on failure.
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: Patref.set(ref, key, value[, force])
+
+  Only relevant for maps. Set existing entries matching key to the provided
+  value. In case of duplicate keys, all matching keys will be set to the new
+  value.
+
+  :param string key: the string used as a key
+  :param string value: the string used as value
+  :param boolean force: create the entry if it doesn't exist (optional,
+   defaults to false)
+  :returns: true on success and nil on failure (followed by an error message)
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: Patref.event_sub(ref, event_types, func)
+
+  Register a function that will be called on specific PAT_REF events.
+  See :js:func:`core.event_sub()` for generalities. Please note however that
+  for performance reasons pattern reference events can only be subscribed
+  per pattern reference (not globally). What this means is that the provided
+  callback function will only be called for events affecting the pattern
+  reference pointed by the Patref object (ref) passed as parameter.
+
+  If you want to be notified for events on a given set of pattern references, it
+  is still possible to perform as many per-patref subscriptions as needed.
+
+  Also, for PAT_REF events, no event data is provided (known as "event_data" in
+  callback function's prototype from :js:func:`core.event_sub()`)
+
+  The list of the available event types for the PAT_REF family are:
+
+    * **PAT_REF_ADD**: element was added to the current version of the pattern
+      reference
+    * **PAT_REF_DEL**: element was deleted from the current version of the
+      pattern reference
+    * **PAT_REF_SET**: element was modified in the current version of the
+      pattern reference
+    * **PAT_REF_CLEAR**: all elements were cleared from the current version of
+      the pattern reference
+    * **PAT_REF_COMMIT**: pending element(s) was/were committed in the current
+      version of the pattern reference
+
+   .. Note::
+     Use **PAT_REF** in **event_types** to subscribe to all pattern reference
+     events types at once.
+
+  Here is a working example showing how to trigger a callback function for the
+  pattern reference associated to file "test.map":
+
+.. code-block:: lua
+
+  core.register_init(function()
+    -- We assume that "test.map" is a map file referenced in haproxy config
+    -- file, thus it is loaded during config parsing and is expected to be
+    -- available at init Lua stage. Indeed, the below code wouldn't work if
+    -- used directly within body context, as at that time the config is not
+    -- fully parsed.
+    local map_patref = core.get_patref("test.map")
+    map_patref:event_sub({"PAT_REF_ADD"}, function(event, data, sub)
+      -- in the patref event handler
+      print("entry added!")
+    end)
+  end)
+
+..
 
 .. _applethttp_class:
 
@@ -3652,16 +3911,31 @@ AppletTCP class
   :param class_AppletTCP applet: An :ref:`applettcp_class`
   :returns: a string. The string can be empty if we reach the end of the stream.
 
-.. js:function:: AppletTCP.receive(applet, [size])
+.. js:function:: AppletTCP.receive(applet, [size, [timeout]])
 
   Reads data from the TCP stream, according to the specified read *size*. If the
   *size* is missing, the function tries to read all the content of the stream
-  until the end.
+  until the end. An optional timeout may be specified in milliseconds. In this
+  case the function will return no longer than this delay, with the amount of
+  available data, or nil if there is no data. An empty string is returned if the
+  connection is closed.
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
   :param integer size: the required read size.
-  :returns: always return a string, the string can be empty if the connection is
-   closed.
+  :returns: return nil if the timeout has expired and no data was available but
+   can still be received. Otherwise, a string is returned, possibly an empty
+   string if the connection is closed.
+
+.. js:function:: AppletTCP.try_receive(applet)
+
+  Reads available data from the TCP stream and returns immediately. Returns a
+  string containing read bytes or nil if no bytes are available at that time. An
+  empty string is returned if the connection is closed.
+
+  :param class_AppletTCP applet: An :ref:`applettcp_class`
+  :returns: return nil if no data was available but can still be
+   received. Otherwise, a string is returned, possibly an empty string if the
+   connection is closed.
 
 .. js:function:: AppletTCP.send(appletmsg)
 
@@ -3725,6 +3999,8 @@ AppletTCP class
    syntax.
   :see: :js:func:`AppletTCP.unset_var`
   :see: :js:func:`AppletTCP.set_var`
+
+.. _sticktable_class:
 
 StickTable class
 ================
@@ -3899,7 +4175,7 @@ Filter class
 
   This class contains return codes some filter callback functions may return. It
   also contains configuration flags and some helper functions. To understand how
-  the filter API works, see `doc/internal/filters.txt` documentation.
+  the filter API works, see `doc/internals/api/filters.txt` documentation.
 
 .. js:attribute:: filter.CONTINUE
 
@@ -4336,6 +4612,27 @@ HTTPMessage class
    data by default.
   :returns: an integer containing the amount of bytes copied or -1.
 
+.. js:function:: HTTPMessage.set_body_len(http_msg, length)
+
+  This function changes the expected payload length of the HTTP message
+  **http_msg**. **length** can be an integer value. In that case, a
+  "Content-Length" header is added with the given value. It is also possible to
+  pass the **"chunked"** string instead of an integer value to force the HTTP
+  message to be chunk-encoded. In that case, a "Transfer-Encoding" header is
+  added with the "chunked" value. In both cases, all existing "Content-Length"
+  and "Transfer-Encoding" headers are removed.
+
+  This function should be used in the filter context to be able to alter the
+  payload of the HTTP message. The internal state of the HTTP message is updated
+  accordingly. :js:func:`HTTPMessage.add_header()` or
+  :js:func:`HTTPMessage.set_header()` functions must be used in that case.
+
+  :param class_httpmessage http_msg: The manipulated HTTP message.
+  :param type length: The new payload length to set. It can be an integer or
+		      the string "chunked".
+  :returns: true if the payload length was successfully updated, false
+	    otherwise.
+
 .. js:function:: HTTPMessage.set_eom(http_msg)
 
   This function set the end of message for the HTTP message **http_msg**.
@@ -4432,6 +4729,10 @@ CertCache class
   :param string certificate.ocsp: An OCSP response in base64. (cf management.txt)
   :param string certificate.issuer: The certificate of the OCSP issuer.
   :param string certificate.sctl: An SCTL file.
+
+  .. Note::
+     This function may be slow. As such, it may only be used during startup
+     (main or init context) or from a yield-capable runtime context.
 
 .. code-block:: lua
 

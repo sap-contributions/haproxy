@@ -16,6 +16,7 @@
 #include <haproxy/h1.h>
 #include <haproxy/h1_htx.h>
 #include <haproxy/http.h>
+#include <haproxy/http-hdr.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
 #include <haproxy/tools.h>
@@ -51,7 +52,7 @@ static int h1_process_req_vsn(struct h1m *h1m, union h1_sl *sl)
 {
 	/* RFC7230#2.6 has enforced the format of the HTTP version string to be
 	 * exactly one digit "." one digit. This check may be disabled using
-	 * option accept-invalid-http-request.
+	 * option accept-unsafe-violations-in-http-request.
 	 */
 	if (h1m->err_pos == -2) { /* PR_O2_REQBUG_OK not set */
 		if (sl->rq.v.len != 8)
@@ -93,9 +94,9 @@ static int h1_process_res_vsn(struct h1m *h1m, union h1_sl *sl)
 {
 	/* RFC7230#2.6 has enforced the format of the HTTP version string to be
 	 * exactly one digit "." one digit. This check may be disabled using
-	 * option accept-invalid-http-request.
+	 * option accept-unsafe-violations-in-http-response.
 	 */
-	if (h1m->err_pos == -2) { /* PR_O2_REQBUG_OK not set */
+	if (h1m->err_pos == -2) { /* PR_O2_RSPBUG_OK not set */
 		if (sl->st.v.len != 8)
 			return 0;
 
@@ -163,8 +164,10 @@ static int h1_postparse_req_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 	 * size allowed.
 	 */
 	if (h1_eval_htx_size(meth, uri, vsn, hdrs) > max) {
-		if (htx_is_empty(htx))
+		if (htx_is_empty(htx)) {
+			h1m->err_code = 431;
 			goto error;
+		}
 		goto output_full;
 	}
 
@@ -174,13 +177,26 @@ static int h1_postparse_req_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 	if (h1sl->rq.meth == HTTP_METH_CONNECT) {
 		h1m->flags &= ~(H1_MF_CLEN|H1_MF_CHNK);
 		h1m->curr_len = h1m->body_len = 0;
+		h1m->state = H1_MSG_DONE;
+		htx->flags |= HTX_FL_EOM;
 	}
-	else if (h1sl->rq.meth == HTTP_METH_HEAD)
-		flags |= HTX_SL_F_BODYLESS_RESP;
+	else {
+		if (h1sl->rq.meth == HTTP_METH_HEAD)
+			flags |= HTX_SL_F_BODYLESS_RESP;
 
+		if (((h1m->flags & H1_MF_CLEN) && h1m->body_len == 0) ||
+		    (h1m->flags & (H1_MF_XFER_LEN|H1_MF_CLEN|H1_MF_CHNK)) == H1_MF_XFER_LEN) {
+			h1m->state = H1_MSG_DONE;
+			htx->flags |= HTX_FL_EOM;
+		}
+	}
 
 	flags |= h1m_htx_sl_flags(h1m);
-	if ((flags & (HTX_SL_F_CONN_UPG|HTX_SL_F_BODYLESS)) == HTX_SL_F_CONN_UPG) {
+
+	/* Remove Upgrade header in problematic cases :
+	 * - "h2c" or "h2" token specified as token
+	 */
+	if ((h1m->flags & (H1_MF_CONN_UPG|H1_MF_UPG_H2C)) == (H1_MF_CONN_UPG|H1_MF_UPG_H2C)) {
 		int i;
 
 		for (i = 0; hdrs[i].n.len; i++) {
@@ -190,6 +206,7 @@ static int h1_postparse_req_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 		h1m->flags &=~ H1_MF_CONN_UPG;
 		flags &= ~HTX_SL_F_CONN_UPG;
 	}
+
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth, uri, vsn);
 	if (!sl || !htx_add_all_headers(htx, hdrs))
 		goto error;
@@ -258,7 +275,7 @@ static int h1_postparse_res_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 			if (isteqi(hdrs[hdr].n, ist("status"))) {
 				code = http_parse_status_val(hdrs[hdr].v, &status, &reason);
 			}
-			else if (isteqi(hdrs[hdr].n, ist("location"))) {
+			else if (isteqi(hdrs[hdr].n, ist("location")) && !code) {
 				code = 302;
 				status = ist("302");
 				reason = ist("Found");
@@ -285,21 +302,47 @@ static int h1_postparse_res_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx 
 		h1m->flags &= ~(H1_MF_CONN_UPG|H1_MF_UPG_WEBSOCKET);
 
 	if (((h1m->flags & H1_MF_METH_CONNECT) && code >= 200 && code < 300) || code == 101) {
+		if (h1m->flags & H1_MF_XFER_ENC)
+			http_del_hdr(hdrs, ist("transfer-encoding"));
+		if (h1m->flags & H1_MF_CLEN)
+			http_del_hdr(hdrs, ist("content-length"));
+
 		h1m->flags &= ~(H1_MF_CLEN|H1_MF_CHNK);
 		h1m->flags |= H1_MF_XFER_LEN;
 		h1m->curr_len = h1m->body_len = 0;
-		flags |= HTX_SL_F_BODYLESS_RESP;
+		h1m->state = H1_MSG_DONE;
+		htx->flags |= HTX_FL_EOM;
 	}
 	else if ((h1m->flags & H1_MF_METH_HEAD) || (code >= 100 && code < 200) ||
 		 (code == 204) || (code == 304)) {
 		/* Responses known to have no body. */
+		if ((code >= 100 && code < 200) || (code == 204)) {
+			if (h1m->flags & H1_MF_XFER_ENC)
+				http_del_hdr(hdrs, ist("transfer-encoding"));
+			if (h1m->flags & H1_MF_CLEN)
+				http_del_hdr(hdrs, ist("content-length"));
+
+			h1m->flags &= ~(H1_MF_CLEN|H1_MF_CHNK);
+		}
+
 		h1m->flags |= H1_MF_XFER_LEN;
 		h1m->curr_len = h1m->body_len = 0;
-		flags |= HTX_SL_F_BODYLESS_RESP;
+		if (code >= 200)
+			flags |= HTX_SL_F_BODYLESS_RESP;
+		h1m->state = H1_MSG_DONE;
+		htx->flags |= HTX_FL_EOM;
 	}
-	else if (h1m->flags & (H1_MF_CLEN|H1_MF_CHNK)) {
-		/* Responses with a known body length. */
-		h1m->flags |= H1_MF_XFER_LEN;
+	else {
+		if (h1m->flags & (H1_MF_CLEN|H1_MF_CHNK)) {
+			/* Responses with a known body length. */
+			h1m->flags |= H1_MF_XFER_LEN;
+		}
+
+		if (((h1m->flags & H1_MF_CLEN) && h1m->body_len == 0) ||
+		    (h1m->flags & (H1_MF_XFER_LEN|H1_MF_CLEN|H1_MF_CHNK)) == H1_MF_XFER_LEN) {
+			h1m->state = H1_MSG_DONE;
+			htx->flags |= HTX_FL_EOM;
+		}
 	}
 
 	flags |= h1m_htx_sl_flags(h1m);
@@ -359,8 +402,13 @@ int h1_parse_msg_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx *dsthtx,
 		 * contains headers and is full, which is detected by it being
 		 * full and the offset to be zero, it's an error because
 		 * headers are too large to be handled by the parser. */
-		if (ret < 0 || (!ret && !ofs && !buf_room_for_htx_data(srcbuf)))
+		if (ret < 0)
 			goto error;
+		if (!ret && !ofs && !buf_room_for_htx_data(srcbuf)) {
+			if (!(h1m->flags & H1_MF_RESP))
+				h1m->err_code = (h1m->err_state < H1_MSG_HDR_FIRST) ? 414: 431;
+			goto error;
+		}
 		goto end;
 	}
 	total = ret;
@@ -388,13 +436,6 @@ int h1_parse_msg_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx *dsthtx,
 		ret = h1_postparse_res_hdrs(h1m, h1sl, dsthtx, hdrs, max);
 		if (ret < 0)
 			return ret;
-	}
-
-	/* Switch messages without any payload to DONE state */
-	if (((h1m->flags & H1_MF_CLEN) && h1m->body_len == 0) ||
-	    ((h1m->flags & (H1_MF_XFER_LEN|H1_MF_CLEN|H1_MF_CHNK)) == H1_MF_XFER_LEN)) {
-		h1m->state = H1_MSG_DONE;
-		dsthtx->flags |= HTX_FL_EOM;
 	}
 
   end:
@@ -693,11 +734,6 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 				++ridx;
 				break;
 			}
-			else if (end[ridx] == '\n') {
-				/* Parse LF only, nothing more to do */
-				++ridx;
-				break;
-			}
 			else if (likely(end[ridx] == ';')) {
 				/* chunk extension, ends at next CRLF */
 				if (!++ridx)
@@ -710,7 +746,7 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 				continue;
 			}
 			else {
-				/* all other characters are unexpected */
+				/* all other characters are unexpected, especially LF alone */
 				goto parsing_error;
 			}
 		}
@@ -740,9 +776,12 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 		dpos += chksz;
 		ridx += chksz;
 
-		/* Parse CRLF or LF (always present) */
-		if (likely(end[ridx] == '\r'))
-			++ridx;
+		/* Parse CRLF */
+		if (unlikely(end[ridx] != '\r')) {
+			h1m->state = H1_MSG_CHUNK_CRLF;
+			goto parsing_error;
+		}
+		++ridx;
 		if (end[ridx] != '\n') {
 			h1m->state = H1_MSG_CHUNK_CRLF;
 			goto parsing_error;
@@ -902,6 +941,7 @@ int h1_parse_msg_tlrs(struct h1m *h1m, struct htx *dsthtx,
 		b_slow_realign_ofs(srcbuf, trash.area, 0);
 
 	tlr_h1m.flags = (H1_MF_NO_PHDR|H1_MF_HDRS_ONLY);
+	tlr_h1m.err_pos = h1m->err_pos;
 	ret = h1_headers_to_hdr_list(b_peek(srcbuf, ofs), b_tail(srcbuf),
 				     hdrs, sizeof(hdrs)/sizeof(hdrs[0]), &tlr_h1m, NULL);
 	if (ret <= 0) {
@@ -940,6 +980,7 @@ int h1_parse_msg_tlrs(struct h1m *h1m, struct htx *dsthtx,
 
 /* Appends the H1 representation of the request line <sl> to the chunk <chk>. It
  * returns 1 if data are successfully appended, otherwise it returns 0.
+ * <chk> buffer must not wrap.
  */
 int h1_format_htx_reqline(const struct htx_sl *sl, struct buffer *chk)
 {
@@ -974,10 +1015,12 @@ int h1_format_htx_reqline(const struct htx_sl *sl, struct buffer *chk)
 
 /* Appends the H1 representation of the status line <sl> to the chunk <chk>. It
  * returns 1 if data are successfully appended, otherwise it returns 0.
+ * <chk> buffer must not wrap.
  */
 int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk)
 {
 	size_t sz = chk->data;
+	struct ist reason;
 
 	if (HTX_SL_LEN(sl) + 4 > b_room(chk))
 		return 0;
@@ -990,10 +1033,15 @@ int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk)
 		if (!chunk_memcat(chk, HTX_SL_RES_VPTR(sl), HTX_SL_RES_VLEN(sl)))
 			goto full;
 	}
+
+	reason = htx_sl_res_reason(sl);
+	if (istlen(reason) == 0)
+		reason = ist(http_get_reason(sl->info.res.status));
+
 	if (!chunk_memcat(chk, " ", 1) ||
 	    !chunk_memcat(chk, HTX_SL_RES_CPTR(sl), HTX_SL_RES_CLEN(sl)) ||
 	    !chunk_memcat(chk, " ", 1) ||
-	    !chunk_memcat(chk, HTX_SL_RES_RPTR(sl), HTX_SL_RES_RLEN(sl)) ||
+	    !chunk_memcat(chk, istptr(reason), istlen(reason)) ||
 	    !chunk_memcat(chk, "\r\n", 2))
 		goto full;
 
@@ -1007,6 +1055,7 @@ int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk)
 /* Appends the H1 representation of the header <n> with the value <v> to the
  * chunk <chk>. It returns 1 if data are successfully appended, otherwise it
  * returns 0.
+ * <chk> buffer must not wrap.
  */
 int h1_format_htx_hdr(const struct ist n, const struct ist v, struct buffer *chk)
 {
@@ -1031,6 +1080,7 @@ int h1_format_htx_hdr(const struct ist n, const struct ist v, struct buffer *chk
 /* Appends the H1 representation of the data <data> to the chunk <chk>. If
  * <chunked> is non-zero, it emits HTTP/1 chunk-encoded data. It returns 1 if
  * data are successfully appended, otherwise it returns 0.
+ * <chk> buffer must not wrap.
  */
 int h1_format_htx_data(const struct ist data, struct buffer *chk, int chunked)
 {
@@ -1064,6 +1114,75 @@ int h1_format_htx_data(const struct ist data, struct buffer *chk, int chunked)
 
   full:
 	chk->data = sz;
+	return 0;
+}
+
+/* Format the htx message into its H1 representation. It returns 1 on success or
+ * 0 if <outbuf> is full or not emtpy. No check are preformed on the message, it must be
+ * valid. Trailers are silently ignored if the message is not chunked.
+ */
+int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf)
+{
+	const struct htx_sl *sl;
+        const struct htx_blk *blk;
+	struct ist n, v;
+	enum htx_blk_type type;
+	uint32_t flags = 0;
+	int has_eod = 0;
+
+	if (b_data(outbuf))
+		return 0;
+
+	for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
+		type = htx_get_blk_type(blk);
+		if (type == HTX_BLK_REQ_SL) {
+			sl = htx_get_blk_ptr(htx, blk);
+			flags = sl->flags;
+			if (!h1_format_htx_reqline(sl, outbuf))
+				goto full;
+		}
+		else if (type == HTX_BLK_RES_SL) {
+			sl = htx_get_blk_ptr(htx, blk);
+			flags = sl->flags;
+			if (!h1_format_htx_stline(sl, outbuf))
+				goto full;
+		}
+		else if (type == HTX_BLK_HDR) {
+			n = htx_get_blk_name(htx, blk);
+			v = htx_get_blk_value(htx, blk);
+
+			if (!h1_format_htx_hdr(n, v, outbuf))
+				goto full;
+		}
+		else if (type == HTX_BLK_EOH) {
+			if (!b_putblk(outbuf, "\r\n", 2))
+				goto full;
+		}
+		else if (type == HTX_BLK_DATA) {
+			v = htx_get_blk_value(htx, blk);
+			if (!h1_format_htx_data(v, outbuf, (flags & HTX_SL_F_CHNK)))
+				goto full;
+		}
+		else if (type == HTX_BLK_TLR) {
+			if ((flags & HTX_SL_F_CHNK) && has_eod == 0 && !b_putblk(outbuf, "0\r\n", 3))
+				goto full;
+			has_eod = 1;
+			n = htx_get_blk_name(htx, blk);
+			v = htx_get_blk_value(htx, blk);
+
+			if (!h1_format_htx_hdr(n, v, outbuf))
+				goto full;
+		}
+		else if (type == HTX_BLK_EOT)
+			break;
+	}
+
+	if ((flags & HTX_SL_F_CHNK) && has_eod == 0 && !b_putblk(outbuf, "0\r\n\r\n", 5))
+		goto full;
+
+	return 1;
+  full:
+	b_reset(outbuf);
 	return 0;
 }
 

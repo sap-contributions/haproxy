@@ -59,6 +59,7 @@
 #include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
+#include <haproxy/systemd.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
 #include <haproxy/time.h>
@@ -151,10 +152,10 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 	/* first, let's measure the longest match */
 	list_for_each_entry(kw_list, &cli_keywords.list, list) {
 		for (kw = &kw_list->kw[0]; kw->str_kw[0]; kw++) {
-			if (kw->level & ~appctx->cli_level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
+			if (kw->level & ~appctx->cli_ctx.level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
 				continue;
-			if (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
-			    (appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
+			if (!(appctx->cli_ctx.level & ACCESS_MCLI_DEBUG) &&
+			    (appctx->cli_ctx.level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
 			    (ACCESS_MASTER_ONLY|ACCESS_MASTER))
 				continue;
 
@@ -199,10 +200,10 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 	if (args && args[length] && *args[length]) {
 		list_for_each_entry(kw_list, &cli_keywords.list, list) {
 			for (kw = &kw_list->kw[0]; kw->str_kw[0]; kw++) {
-				if (kw->level & ~appctx->cli_level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
+				if (kw->level & ~appctx->cli_ctx.level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
 					continue;
-				if (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
-				    ((appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
+				if (!(appctx->cli_ctx.level & ACCESS_MCLI_DEBUG) &&
+				    ((appctx->cli_ctx.level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
 				    (ACCESS_MASTER_ONLY|ACCESS_MASTER)))
 					continue;
 
@@ -286,15 +287,15 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 			/* in a worker or normal process, don't display master-only commands
 			 * nor expert/experimental mode commands if not in this mode.
 			 */
-			if (kw->level & ~appctx->cli_level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
+			if (kw->level & ~appctx->cli_ctx.level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
 				continue;
 
 			/* in master, if the CLI don't have the
 			 * ACCESS_MCLI_DEBUG don't display commands that have
 			 * neither the master bit nor the master-only bit.
 			 */
-			if (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
-			    ((appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
+			if (!(appctx->cli_ctx.level & ACCESS_MCLI_DEBUG) &&
+			    ((appctx->cli_ctx.level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
 			    (ACCESS_MASTER_ONLY|ACCESS_MASTER)))
 				continue;
 
@@ -320,7 +321,7 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 	/* always show the prompt/help/quit commands */
 	chunk_strcat(tmp,
 	             "  help [<command>]                        : list matching or all commands\n"
-	             "  prompt [timed]                          : toggle interactive mode with prompt\n"
+	             "  prompt [help | n | i | p | timed ]*     : toggle interactive mode with prompt\n"
 	             "  quit                                    : disconnect\n");
 
 	chunk_init(&out, NULL, 0);
@@ -447,20 +448,19 @@ void cli_list_keywords(void)
 static struct proxy *cli_alloc_fe(const char *name, const char *file, int line)
 {
 	struct proxy *fe;
+	char *errmsg = NULL;
 
-	fe = calloc(1, sizeof(*fe));
-	if (!fe)
+	fe = alloc_new_proxy("GLOBAL", PR_CAP_FE|PR_CAP_INT, &errmsg);
+	if (!fe) {
+		ha_free(&errmsg); // ignored
 		return NULL;
+	}
 
-	init_new_proxy(fe);
 	fe->next = proxies_list;
 	proxies_list = fe;
-	fe->last_change = ns_to_sec(now_ns);
-	fe->id = strdup("GLOBAL");
-	fe->cap = PR_CAP_FE|PR_CAP_INT;
 	fe->maxconn = 10;                 /* default to 10 concurrent connections */
 	fe->timeout.client = MS_TO_TICKS(10000); /* default timeout of 10 seconds */
-	fe->conf.file = strdup(file);
+	fe->conf.file = copy_file_name(file);
 	fe->conf.line = line;
 	fe->accept = frontend_accept;
 	fe->default_target = &cli_applet.obj_type;
@@ -647,30 +647,30 @@ int listeners_setenv(struct proxy *frontend, const char *varname)
 				char addr[46];
 				char port[6];
 
-				/* separate listener by semicolons */
-				if (trash->data)
-					chunk_appendf(trash, ";");
-
-				if (l->rx.addr.ss_family == AF_UNIX) {
+				if (l->rx.addr.ss_family == AF_UNIX ||
+				    l->rx.addr.ss_family == AF_CUST_ABNS ||
+				    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
 					const struct sockaddr_un *un;
 
 					un = (struct sockaddr_un *)&l->rx.addr;
-					if (un->sun_path[0] == '\0') {
-						chunk_appendf(trash, "abns@%s", un->sun_path+1);
+					if (l->rx.addr.ss_family == AF_CUST_ABNS ||
+					    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
+						chunk_appendf(trash, "%sabns@%s", (trash->data ? ";" : ""), un->sun_path+1);
 					} else {
-						chunk_appendf(trash, "unix@%s", un->sun_path);
+						chunk_appendf(trash, "%sunix@%s", (trash->data ? ";" : ""), un->sun_path);
 					}
 				} else if (l->rx.addr.ss_family == AF_INET) {
 					addr_to_str(&l->rx.addr, addr, sizeof(addr));
 					port_to_str(&l->rx.addr, port, sizeof(port));
-					chunk_appendf(trash, "ipv4@%s:%s", addr, port);
+					chunk_appendf(trash, "%sipv4@%s:%s", (trash->data ? ";" : ""), addr, port);
 				} else if (l->rx.addr.ss_family == AF_INET6) {
 					addr_to_str(&l->rx.addr, addr, sizeof(addr));
 					port_to_str(&l->rx.addr, port, sizeof(port));
-					chunk_appendf(trash, "ipv6@[%s]:%s", addr, port);
-				} else if (l->rx.addr.ss_family == AF_CUST_SOCKPAIR) {
-					chunk_appendf(trash, "sockpair@%d", ((struct sockaddr_in *)&l->rx.addr)->sin_addr.s_addr);
+					chunk_appendf(trash, "%sipv6@[%s]:%s", (trash->data ? ";" : ""), addr, port);
 				}
+				/* AF_CUST_SOCKPAIR is explicitly skipped, we don't want to show reload and shared
+				 * master CLI sockpairs in HAPROXY_CLI and HAPROXY_MASTER_CLI
+				 */
 			}
 		}
 		trash->area[trash->data++] = '\0';
@@ -701,7 +701,7 @@ REGISTER_CONFIG_POSTPARSER("cli", cli_socket_setenv);
 int cli_has_level(struct appctx *appctx, int level)
 {
 
-	if ((appctx->cli_level & ACCESS_LVL_MASK) < level) {
+	if ((appctx->cli_ctx.level & ACCESS_LVL_MASK) < level) {
 		cli_err(appctx, cli_permission_denied_msg);
 		return 0;
 	}
@@ -720,30 +720,29 @@ int pcli_has_level(struct stream *s, int level)
 /* Returns severity_output for the current session if set, or default for the socket */
 static int cli_get_severity_output(struct appctx *appctx)
 {
-	if (appctx->cli_severity_output)
-		return appctx->cli_severity_output;
+	if (appctx->cli_ctx.severity_output)
+		return appctx->cli_ctx.severity_output;
 	return strm_li(appctx_strm(appctx))->bind_conf->severity_output;
 }
 
 /* Processes the CLI interpreter on the stats socket. This function is called
  * from the CLI's IO handler running in an appctx context. The function returns
  * 1 if the request was understood, otherwise zero (in which case an error
- * message will be displayed). It is called with appctx->st0
- * set to CLI_ST_GETREQ and presets ->st2 to 0 so that parsers don't have to do
- * it. It will possilbly leave st0 to CLI_ST_CALLBACK if the keyword needs to
- * have its own I/O handler called again. Most of the time, parsers will only
- * set st0 to CLI_ST_PRINT and put their message to be displayed into cli.msg.
- * If a keyword parser is NULL and an I/O handler is declared, the I/O handler
- * will automatically be used.
+ * message will be displayed). It is called with appctx->st0 set to
+ * CLI_ST_PROMPT. It will possilbly leave st0 to CLI_ST_CALLBACK if the
+ * keyword needs to have its own I/O handler called again. Most of the time,
+ * parsers will only set st0 to CLI_ST_PRINT and put their message to be
+ * displayed into cli.msg.  If a keyword parser is NULL and an I/O handler is
+ * declared, the I/O handler will automatically be used.
  */
-static int cli_parse_request(struct appctx *appctx)
+static int cli_process_cmdline(struct appctx *appctx)
 {
-	char *args[MAX_CLI_ARGS + 1], *p, *end, *payload = NULL;
-	int i = 0;
+	char *args[MAX_CLI_ARGS + 1], *orig, *p, *end, *payload = NULL;
+	int i = 0, ret = 0;
 	struct cli_kw *kw;
 
-	p = appctx->chunk->area;
-	end = p + appctx->chunk->data;
+	orig = p = b_head(appctx->cli_ctx.cmdline);
+	end = p + strlen(p);
 
 	/*
 	 * Get pointers on words.
@@ -757,14 +756,6 @@ static int cli_parse_request(struct appctx *appctx)
 		if (!*p)
 			break;
 
-		if (strcmp(p, PAYLOAD_PATTERN) == 0) {
-			/* payload pattern recognized here, this is not an arg anymore,
-			 * the payload starts at the first byte that follows the zero
-			 * after the pattern.
-			 */
-			payload = p + strlen(PAYLOAD_PATTERN) + 1;
-			break;
-		}
 
 		args[i] = p;
 		while (1) {
@@ -779,7 +770,8 @@ static int cli_parse_request(struct appctx *appctx)
 				break;
 			}
 		}
-		*p++ = 0;
+		if (p < end)
+			*p++ = 0;
 
 		/* unescape backslashes (\) */
 		for (j = 0, k = 0; args[i][k]; k++) {
@@ -796,33 +788,51 @@ static int cli_parse_request(struct appctx *appctx)
 
 		i++;
 	}
-	/* fill unused slots */
-	p = appctx->chunk->area + appctx->chunk->data;
+	/* Pass the payload to the last command. It happens when the end of the
+	 * command is just before the payload pattern.
+	 */
+	if (appctx->cli_ctx.payload && appctx->cli_ctx.payload == end + strlen(appctx->cli_ctx.payload_pat) + 3) {
+		appctx->st1 |= APPCTX_CLI_ST1_LASTCMD;
+		payload = appctx->cli_ctx.payload;
+	}
+	if (end+1 == b_tail(appctx->cli_ctx.cmdline))
+		appctx->st1 |= APPCTX_CLI_ST1_LASTCMD;
+
+	/* throw an error if too many args are provided */
+	if (*p && i == MAX_CLI_ARGS) {
+		char *err = NULL;
+
+		cli_err(appctx, memprintf(&err, "Too many arguments. Commands must have at most %d arguments.\n", MAX_CLI_ARGS));
+		goto end;
+	}
+
+
+	/* fill unused slots to point on the \0 at the end of the command */
 	for (; i < MAX_CLI_ARGS + 1; i++)
-		args[i] = p;
+		args[i] = end;
 
 	if (!**args)
-		return 0;
+		goto end;
 
 	kw = cli_find_kw(args);
 	if (!kw ||
-	    (kw->level & ~appctx->cli_level & ACCESS_MASTER_ONLY) ||
-	    (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
-	     (appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) == (ACCESS_MASTER_ONLY|ACCESS_MASTER))) {
+	    (kw->level & ~appctx->cli_ctx.level & ACCESS_MASTER_ONLY) ||
+	    (!(appctx->cli_ctx.level & ACCESS_MCLI_DEBUG) &&
+	     (appctx->cli_ctx.level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) == (ACCESS_MASTER_ONLY|ACCESS_MASTER))) {
 		/* keyword not found in this mode */
 		cli_gen_usage_msg(appctx, args);
-		return 0;
+		goto end;
 	}
 
 	/* don't handle expert mode commands if not in this mode. */
-	if (kw->level & ~appctx->cli_level & ACCESS_EXPERT) {
+	if (kw->level & ~appctx->cli_ctx.level & ACCESS_EXPERT) {
 		cli_err(appctx, "This command is restricted to expert mode only.\n");
-		return 0;
+		goto end;
 	}
 
-	if (kw->level & ~appctx->cli_level & ACCESS_EXPERIMENTAL) {
+	if (kw->level & ~appctx->cli_ctx.level & ACCESS_EXPERIMENTAL) {
 		cli_err(appctx, "This command is restricted to experimental mode only.\n");
-		return 0;
+		goto end;
 	}
 
 	if (kw->level == ACCESS_EXPERT)
@@ -830,34 +840,45 @@ static int cli_parse_request(struct appctx *appctx)
 	else if (kw->level == ACCESS_EXPERIMENTAL)
 		mark_tainted(TAINTED_CLI_EXPERIMENTAL_MODE);
 
-	appctx->io_handler = kw->io_handler;
-	appctx->io_release = kw->io_release;
+	appctx->cli_ctx.io_handler = kw->io_handler;
+	appctx->cli_ctx.io_release = kw->io_release;
 
-	if (kw->parse && kw->parse(args, payload, appctx, kw->private) != 0)
+	if (kw->parse && kw->parse(args, payload, appctx, kw->private) != 0) {
+		ret = 1;
 		goto fail;
+	}
 
 	/* kw->parse could set its own io_handler or io_release handler */
-	if (!appctx->io_handler)
+	if (!appctx->cli_ctx.io_handler) {
+		ret = 1;
 		goto fail;
+	}
 
 	appctx->st0 = CLI_ST_CALLBACK;
-	return 1;
-fail:
-	appctx->io_handler = NULL;
-	appctx->io_release = NULL;
-	return 1;
+	ret = 1;
+	goto end;
+
+  fail:
+	appctx->cli_ctx.io_handler = NULL;
+	appctx->cli_ctx.io_release = NULL;
+
+  end:
+	/* Skip the command */
+	b_del(appctx->cli_ctx.cmdline, end - orig + 1);
+	return ret;
 }
 
 /* prepends then outputs the argument msg with a syslog-type severity depending on severity_output value */
 static int cli_output_msg(struct appctx *appctx, const char *msg, int severity, int severity_output)
 {
 	struct buffer *tmp;
-
-	if (likely(severity_output == CLI_SEVERITY_NONE))
-		return applet_putstr(appctx, msg);
+	struct ist imsg;
 
 	tmp = get_trash_chunk();
 	chunk_reset(tmp);
+
+	if (likely(severity_output == CLI_SEVERITY_NONE))
+		goto send_it;
 
 	if (severity < 0 || severity > 7) {
 		ha_warning("socket command feedback with invalid severity %d", severity);
@@ -875,9 +896,185 @@ static int cli_output_msg(struct appctx *appctx, const char *msg, int severity, 
 				ha_warning("Unrecognized severity output %d", severity_output);
 		}
 	}
-	chunk_appendf(tmp, "%s", msg);
+ send_it:
+	/* the vast majority of messages have their trailing LF but a few are
+	 * still missing it, and very rare ones might even have two. For this
+	 * reason, we'll first delete the trailing LFs if present, then
+	 * systematically append one.
+	 */
+	for (imsg = ist(msg); imsg.len > 0 && imsg.ptr[imsg.len - 1] == '\n'; imsg.len--)
+		;
+
+	chunk_istcat(tmp, imsg);
+	chunk_istcat(tmp, ist("\n"));
 
 	return applet_putchk(appctx, tmp);
+}
+
+int cli_init(struct appctx *appctx)
+{
+	struct stconn *sc = appctx_sc(appctx);
+	struct bind_conf *bind_conf = strm_li(__sc_strm(sc))->bind_conf;
+
+	appctx->cli_ctx.severity_output = bind_conf->severity_output;
+	applet_reset_svcctx(appctx);
+	appctx->st0 = CLI_ST_PARSE_CMDLINE;
+	appctx->cli_ctx.level = bind_conf->level;
+	appctx->cli_ctx.payload = NULL;
+	appctx->cli_ctx.cmdline = NULL;
+
+	/* Wakeup the applet ASAP. */
+        applet_need_more_data(appctx);
+        return 0;
+
+}
+
+int cli_parse_cmdline(struct appctx *appctx)
+{
+	char *str;
+	size_t len;
+	int ret = 0;
+
+	if (!b_data(&appctx->inbuf))
+		goto end;
+
+	/* Allocate a chunk to process the command line */
+	if (!appctx->cli_ctx.cmdline) {
+		appctx->cli_ctx.cmdline = alloc_trash_chunk();
+		if (!appctx->cli_ctx.cmdline) {
+			cli_err(appctx, "Failed to alloc a buffer to process the command line.\n");
+			applet_set_error(appctx);
+			b_reset(&appctx->inbuf);
+			goto end;
+		}
+	}
+
+	while (1) {
+
+		/* payload doesn't take escapes nor does it end on semi-colons,
+		 * so we use the regular getline. Normal mode however must stop
+		 * on LFs and semi-colons that are not prefixed by a backslash.
+		 * Note we reserve one byte at the end to insert a trailing nul
+		 * byte.
+		 */
+		str = b_tail(appctx->cli_ctx.cmdline);
+		if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD))
+			len = b_getdelim(&appctx->inbuf, 0, b_data(&appctx->inbuf), str, b_room(appctx->cli_ctx.cmdline), "\n;", '\\');
+		else
+			len = b_getline(&appctx->inbuf, 0, b_data(&appctx->inbuf), str, b_room(appctx->cli_ctx.cmdline) - 1);
+
+		if (!len) {
+			if (!b_room(appctx->cli_ctx.cmdline) || (b_data(&appctx->inbuf) > b_room(appctx->cli_ctx.cmdline) - 1)) {
+				cli_err(appctx, "The command line is too big for the buffer size. Please change tune.bufsize in the configuration to use a bigger command.\n");
+				applet_set_error(appctx);
+				b_reset(&appctx->inbuf);
+			}
+			break;
+		}
+
+		b_del(&appctx->inbuf, len);
+		b_add(appctx->cli_ctx.cmdline,  len);
+		applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+
+		if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)) {
+			char *last_arg;
+			char sep = str[len -1];
+
+			/* For the command line, change the separator (\n or \;) into a \0 */
+			str[--len] = '\0';
+
+			if (sep == ';') {
+				/* It is not the end of the command line, loop to get the next command */
+				continue;
+			}
+
+			if (!len)
+				goto process_cmdline;
+
+			/* The end of the command line was reached. Change the trailing \r, if any,
+			 * by a null byte. For the command line, the trailing \r and \n are removed,
+			 * but we conserve them for payload mode.
+			 */
+			if (str[len-1] == '\r') {
+				str[--len] = '\0';
+				if (!len)
+					goto process_cmdline;
+			}
+
+			/*
+			 * Look for the "payload start" pattern at the end of a
+			 * line Its location is not remembered here, this is
+			 * just to switch to a gathering mode.
+			 *
+			 * The pattern must start by << followed by 0 to 7
+			 * characters, and finished by the end of the command
+			 * (\n or ;).
+			 */
+
+			/* look for the first space starting by the end of the line */
+			for (last_arg = str+len-1; last_arg != str; last_arg--) {
+				if (*last_arg == ' ' || *last_arg == '\t') {
+					last_arg++;
+					break;
+				}
+			}
+
+			if (strncmp(last_arg, PAYLOAD_PATTERN, strlen(PAYLOAD_PATTERN)) == 0) {
+				ssize_t pat_len = strlen(last_arg) - strlen(PAYLOAD_PATTERN);
+
+				/* A customized pattern can't be more than 7 characters
+				 * if it's more, don't make it a payload
+				 */
+				if (pat_len < sizeof(appctx->cli_ctx.payload_pat)) {
+					/* copy the customized pattern, don't store the << */
+					strncpy(appctx->cli_ctx.payload_pat, last_arg + strlen(PAYLOAD_PATTERN), sizeof(appctx->cli_ctx.payload_pat)-1);
+					appctx->cli_ctx.payload_pat[sizeof(appctx->cli_ctx.payload_pat)-1] = '\0';
+
+					/* The last command finishes before the payload pattern.
+					 * Don't strip trailing spaces to be sure to detect when
+					 * the payload should be used.
+					 */
+					*last_arg = '\0';
+
+					/* The payload will start on the next character in the buffer */
+					appctx->cli_ctx.payload = b_tail(appctx->cli_ctx.cmdline);
+					appctx->st1 |= APPCTX_CLI_ST1_PAYLOAD;
+				}
+			}
+		}
+		else {
+			/* Add a \0 just after the \n to mark the end of this payload line
+			 * to ease pattern detection. But it is not part of the buffer.
+			 * (note: the space for this character was reserved when b_getline() was called)
+			 */
+			str[len] = '\0';
+
+			/* look for a pattern at the end of the payload
+			 * (take care to exclude the last character because it is a \n)
+			 */
+			if (len-1 == strlen(appctx->cli_ctx.payload_pat)) {
+				if (strncmp(str, appctx->cli_ctx.payload_pat, len-1) == 0) {
+					/* end of payload was reached, rewind before the previous \n and replace it by a \0 */
+					b_sub(appctx->cli_ctx.cmdline, strlen(appctx->cli_ctx.payload_pat) + 2);
+					*b_tail(appctx->cli_ctx.cmdline) = '\0';
+					appctx->st1 &= ~APPCTX_CLI_ST1_PAYLOAD;
+				}
+			}
+		}
+
+	  process_cmdline:
+		if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)) {
+			appctx->st0 = CLI_ST_PROCESS_CMDLINE;
+			break;
+		}
+	}
+	if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)
+			appctx->st0 = CLI_ST_PROMPT;
+
+  end:
+	if (appctx->st0 != CLI_ST_PARSE_CMDLINE)
+		ret = 1;
+	return ret;
 }
 
 /* This I/O handler runs as an applet embedded in a stream connector. It is
@@ -888,168 +1085,63 @@ static int cli_output_msg(struct appctx *appctx, const char *msg, int severity, 
  * CLI_ST_* constants. appctx->st1 is used to indicate whether prompt is enabled
  * or not.
  */
-static void cli_io_handler(struct appctx *appctx)
+void cli_io_handler(struct appctx *appctx)
 {
-	struct stconn *sc = appctx_sc(appctx);
-	struct channel *req = sc_oc(sc);
-	struct channel *res = sc_ic(sc);
-	struct bind_conf *bind_conf = strm_li(__sc_strm(sc))->bind_conf;
-	int reql;
-	int len;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
-		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
+		appctx->st0 = CLI_ST_END;
 		goto out;
 	}
 
-	/* Check if the input buffer is available. */
-	if (!b_size(&res->buf)) {
-		sc_need_room(sc, 0);
+	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL) ||
+	    !appctx_get_buf(appctx, &appctx->outbuf)) {
+                applet_wont_consume(appctx);
 		goto out;
 	}
 
 	while (1) {
 		if (appctx->st0 == CLI_ST_INIT) {
 			/* reset severity to default at init */
-			appctx->cli_severity_output = bind_conf->severity_output;
-			applet_reset_svcctx(appctx);
-			appctx->st0 = CLI_ST_GETREQ;
-			appctx->cli_level = bind_conf->level;
+			cli_init(appctx);
 		}
 		else if (appctx->st0 == CLI_ST_END) {
-			se_fl_set(appctx->sedesc, SE_FL_EOS);
-			free_trash_chunk(appctx->chunk);
-			appctx->chunk = NULL;
+			applet_set_eos(appctx);
 			break;
 		}
-		else if (appctx->st0 == CLI_ST_GETREQ) {
-			char *str;
-
-			/* use a trash chunk to store received data */
-			if (!appctx->chunk) {
-				appctx->chunk = alloc_trash_chunk();
-				if (!appctx->chunk) {
-					se_fl_set(appctx->sedesc, SE_FL_ERROR);
+		else if (appctx->st0 == CLI_ST_PARSE_CMDLINE) {
+			applet_will_consume(appctx);
+			if (cli_parse_cmdline(appctx) == 0) {
+				/* Now we close the output if we're not in interactive
+				 * mode and the request buffer is empty. This still
+				 * allows pipelined requests to be sent in
+				 * non-interactive mode.
+				 */
+				if (se_fl_test(appctx->sedesc, SE_FL_SHW)) {
 					appctx->st0 = CLI_ST_END;
 					continue;
 				}
+				break;
 			}
-
-			str = appctx->chunk->area + appctx->chunk->data;
-
+		}
+		else if (appctx->st0 == CLI_ST_PROCESS_CMDLINE) {
 			/* ensure we have some output room left in the event we
 			 * would want to return some info right after parsing.
 			 */
-			if (buffer_almost_full(sc_ib(sc))) {
-				sc_need_room(sc, b_size(&res->buf) / 2);
+			if (buffer_almost_full(&appctx->outbuf)) {
+				applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 				break;
 			}
 
-			/* payload doesn't take escapes nor does it end on semi-colons, so
-			 * we use the regular getline. Normal mode however must stop on
-			 * LFs and semi-colons that are not prefixed by a backslash. Note
-			 * that we reserve one byte at the end to insert a trailing nul byte.
-			 */
-
-			if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)
-				reql = co_getline(sc_oc(sc), str,
-				                  appctx->chunk->size - appctx->chunk->data - 1);
-			else
-				reql = co_getdelim(sc_oc(sc), str,
-				                   appctx->chunk->size - appctx->chunk->data - 1,
-				                   "\n;", '\\');
-
-			if (reql <= 0) { /* closed or EOL not found */
-				if (reql == 0)
-					break;
-				se_fl_set(appctx->sedesc, SE_FL_ERROR);
-				appctx->st0 = CLI_ST_END;
-				continue;
-			}
-
-			if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)) {
-				/* seek for a possible unescaped semi-colon. If we find
-				 * one, we replace it with an LF and skip only this part.
-				 */
-				for (len = 0; len < reql; len++) {
-					if (str[len] == '\\') {
-						len++;
-						continue;
-					}
-					if (str[len] == ';') {
-						str[len] = '\n';
-						reql = len + 1;
-						break;
-					}
-				}
-			}
-
-			/* now it is time to check that we have a full line,
-			 * remove the trailing \n and possibly \r, then cut the
-			 * line.
-			 */
-			len = reql - 1;
-			if (str[len] != '\n') {
-				se_fl_set(appctx->sedesc, SE_FL_ERROR);
-				appctx->st0 = CLI_ST_END;
-				continue;
-			}
-
-			if (len && str[len-1] == '\r')
-				len--;
-
-			str[len] = '\0';
-			appctx->chunk->data += len;
-
-			if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) {
-				appctx->chunk->area[appctx->chunk->data] = '\n';
-				appctx->chunk->area[appctx->chunk->data + 1] = 0;
-				appctx->chunk->data++;
-			}
-
+			appctx->t->expire = TICK_ETERNITY;
 			appctx->st0 = CLI_ST_PROMPT;
 
-			if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) {
-				/* empty line */
-				if (!len) {
-					/* remove the last two \n */
-					appctx->chunk->data -= 2;
-					appctx->chunk->area[appctx->chunk->data] = 0;
-					cli_parse_request(appctx);
-					chunk_reset(appctx->chunk);
-					/* NB: cli_sock_parse_request() may have put
-					 * another CLI_ST_O_* into appctx->st0.
-					 */
-
-					appctx->st1 &= ~APPCTX_CLI_ST1_PAYLOAD;
-				}
-			}
-			else {
-				/*
-				 * Look for the "payload start" pattern at the end of a line
-				 * Its location is not remembered here, this is just to switch
-				 * to a gathering mode.
-				 */
-				if (strcmp(appctx->chunk->area + appctx->chunk->data - strlen(PAYLOAD_PATTERN), PAYLOAD_PATTERN) == 0) {
-					appctx->st1 |= APPCTX_CLI_ST1_PAYLOAD;
-					appctx->chunk->data++; // keep the trailing \0 after '<<'
-				}
-				else {
-					/* no payload, the command is complete: parse the request */
-					cli_parse_request(appctx);
-					chunk_reset(appctx->chunk);
-				}
-			}
-
-			/* re-adjust req buffer */
-			co_skip(sc_oc(sc), reql);
-			sc_opposite(sc)->flags |= SC_FL_RCV_ONCE; /* we plan to read small requests */
+			cli_process_cmdline(appctx);
 		}
 		else {	/* output functions */
 			struct cli_print_ctx *ctx;
 			const char *msg;
 			int sev;
-
+		cli_output:
 			switch (appctx->st0) {
 			case CLI_ST_PROMPT:
 				break;
@@ -1095,22 +1187,33 @@ static void cli_io_handler(struct appctx *appctx)
 					         appctx->st0 == CLI_ST_PRINT_UMSGERR) {
 						usermsgs_clr(NULL);
 					}
+					appctx->t->expire = TICK_ETERNITY;
 					appctx->st0 = CLI_ST_PROMPT;
 				}
+				if (applet_fl_test(appctx, APPCTX_FL_ERR_PENDING)) {
+					appctx->st0 = CLI_ST_END;
+					continue;
+				}
+
 				break;
 
 			case CLI_ST_CALLBACK: /* use custom pointer */
-				if (appctx->io_handler)
-					if (appctx->io_handler(appctx)) {
+				if (appctx->cli_ctx.io_handler)
+					if (appctx->cli_ctx.io_handler(appctx)) {
+						appctx->t->expire = TICK_ETERNITY;
 						appctx->st0 = CLI_ST_PROMPT;
-						if (appctx->io_release) {
-							appctx->io_release(appctx);
-							appctx->io_release = NULL;
+						if (appctx->cli_ctx.io_release) {
+							appctx->cli_ctx.io_release(appctx);
+							appctx->cli_ctx.io_release = NULL;
+							/* some release handlers might have
+							 * pending output to print.
+							 */
+							continue;
 						}
 					}
 				break;
 			default: /* abnormal state */
-				se_fl_set(appctx->sedesc, SE_FL_ERROR);
+				applet_set_error(appctx);
 				break;
 			}
 
@@ -1120,12 +1223,15 @@ static void cli_io_handler(struct appctx *appctx)
 				const char *prompt = "";
 
 				if (appctx->st1 & APPCTX_CLI_ST1_PROMPT) {
-					/*
-					 * when entering a payload with interactive mode, change the prompt
-					 * to emphasize that more data can still be sent
-					 */
-					if (appctx->chunk->data && appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)
+					if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) {
+						/* when entering a payload with interactive mode, change the prompt
+						 * to emphasize that more data can still be sent */
 						prompt = "+ ";
+					}
+					else if (b_data(appctx->cli_ctx.cmdline) && !(appctx->st1 & APPCTX_CLI_ST1_LASTCMD)) {
+						/* we are executing pipelined commands, don't display the prompt */
+						prompt = "\n";
+					}
 					else if (appctx->st1 & APPCTX_CLI_ST1_TIMED) {
 						uint up = ns_to_sec(now_ns - start_time_ns);
 						snprintf(prompt_buf, sizeof(prompt_buf),
@@ -1143,35 +1249,41 @@ static void cli_io_handler(struct appctx *appctx)
 
 				if (applet_putstr(appctx, prompt) != -1) {
 					applet_reset_svcctx(appctx);
-					appctx->st0 = CLI_ST_GETREQ;
+					appctx->st0 = (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) ? CLI_ST_PARSE_CMDLINE : CLI_ST_PROCESS_CMDLINE;
 				}
 			}
 
 			/* If the output functions are still there, it means they require more room. */
 			if (appctx->st0 >= CLI_ST_OUTPUT) {
-				applet_wont_consume(appctx);
+				if (appctx->st0 != CLI_ST_CALLBACK)
+					applet_wont_consume(appctx);
 				break;
 			}
 
-			/* Now we close the output if we're not in interactive
-			 * mode and the request buffer is empty. This still
-			 * allows pipelined requests to be sent in
-			 * non-interactive mode.
-			 */
-			if (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && !co_data(req) && (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD))) {
-				se_fl_set(appctx->sedesc, SE_FL_EOI);
-				appctx->st0 = CLI_ST_END;
-				continue;
-			}
-
-			/* switch state back to GETREQ to read next requests */
-			applet_reset_svcctx(appctx);
-			appctx->st0 = CLI_ST_GETREQ;
-			applet_will_consume(appctx);
-			applet_expect_data(appctx);
-
 			/* reactivate the \n at the end of the response for the next command */
 			appctx->st1 &= ~APPCTX_CLI_ST1_NOLF;
+
+			/* switch state back to PARSE_CMDLINE to read next requests in interactove mode, otherwise close  */
+			if (appctx->st1 & APPCTX_CLI_ST1_LASTCMD) {
+				applet_reset_svcctx(appctx);
+				free_trash_chunk(appctx->cli_ctx.cmdline);
+				appctx->cli_ctx.payload = NULL;
+				appctx->cli_ctx.cmdline = NULL;
+				appctx->st1 &= ~APPCTX_CLI_ST1_LASTCMD;
+				if (appctx->st1 & APPCTX_CLI_ST1_INTER) {
+					appctx->st0 = CLI_ST_PARSE_CMDLINE;
+					applet_will_consume(appctx);
+					applet_expect_data(appctx);
+				}
+				else {
+					applet_set_eoi(appctx);
+					appctx->st0 = CLI_ST_END;
+					continue;
+				}
+			}
+
+			if ((b_data(&appctx->inbuf) && appctx->st0 == CLI_ST_PARSE_CMDLINE) || appctx->st0 == CLI_ST_PROCESS_CMDLINE)
+				appctx_wakeup(appctx);
 
 			/* this forces us to yield between pipelined commands and
 			 * avoid extremely long latencies (e.g. "del map" etc). In
@@ -1179,14 +1291,16 @@ static void cli_io_handler(struct appctx *appctx)
 			 * refills the buffer with new bytes in non-interactive
 			 * mode, avoiding to close on apparently empty commands.
 			 */
-			if (co_data(sc_oc(sc))) {
-				appctx_wakeup(appctx);
-				goto out;
-			}
+			break;
 		}
 	}
 
  out:
+	if (appctx->st0 == CLI_ST_END) {
+		/* eat the whole request */
+		b_reset(&appctx->inbuf);
+		applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+	}
 	return;
 }
 
@@ -1196,12 +1310,9 @@ static void cli_io_handler(struct appctx *appctx)
  */
 static void cli_release_handler(struct appctx *appctx)
 {
-	free_trash_chunk(appctx->chunk);
-	appctx->chunk = NULL;
-
-	if (appctx->io_release) {
-		appctx->io_release(appctx);
-		appctx->io_release = NULL;
+	if (appctx->cli_ctx.io_release) {
+		appctx->cli_ctx.io_release(appctx);
+		appctx->cli_ctx.io_release = NULL;
 	}
 	else if (appctx->st0 == CLI_ST_PRINT_DYN || appctx->st0 == CLI_ST_PRINT_DYNERR) {
 		struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
@@ -1221,12 +1332,7 @@ static void cli_release_handler(struct appctx *appctx)
 static int cli_io_handler_show_env(struct appctx *appctx)
 {
 	struct show_env_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
 	char **var = ctx->var;
-
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
-		return 1;
 
 	chunk_reset(&trash);
 
@@ -1257,15 +1363,10 @@ static int cli_io_handler_show_env(struct appctx *appctx)
  */
 static int cli_io_handler_show_fd(struct appctx *appctx)
 {
-	struct stconn *sc = appctx_sc(appctx);
 	struct show_fd_ctx *fdctx = appctx->svcctx;
 	uint match = fdctx->show_mask;
 	int fd = fdctx->fd;
 	int ret = 1;
-
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
-		goto end;
 
 	chunk_reset(&trash);
 
@@ -1324,7 +1425,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 #if defined(USE_QUIC)
 		else if (fdt.iocb == quic_conn_sock_fd_iocb) {
 			qc = fdtab[fd].owner;
-			li = qc ? qc->li : NULL;
+			li = qc ? objt_listener(qc->target) : NULL;
+			sv = qc ? objt_server(qc->target) : NULL;
 			xprt_ctx   = qc ? qc->xprt_ctx : NULL;
 			conn = qc ? qc->conn : NULL;
 			xprt = conn ? conn->xprt : NULL; // in fact it's &ssl_quic
@@ -1355,7 +1457,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			suspicious = 1;
 
 		chunk_printf(&trash,
-			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) ref=%#x gid=%d tmask=0x%lx umask=0x%lx prmsk=0x%lx pwmsk=0x%lx owner=%p iocb=%p(",
+			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) ref=%#x gid=%d tmask=0x%lx umask=0x%lx prmsk=0x%lx pwmsk=0x%lx owner=%p gen=%u tkov=%u iocb=%p(",
 			     fd,
 			     fdt.state,
 			     (fdt.state & FD_CLONED) ? 'C' : 'c',
@@ -1377,6 +1479,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     polled_mask[fd].poll_recv,
 			     polled_mask[fd].poll_send,
 			     fdt.owner,
+			     fdt.generation,
+			     fdt.nb_takeover,
 			     fdt.iocb);
 		resolve_sym_name(&trash, NULL, fdt.iocb);
 
@@ -1398,6 +1502,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 				salen = sizeof(sa);
 				if (getsockname(fd, (struct sockaddr *)&sa, &salen) != -1) {
+					/* only real address families in .ss_family (as provided by getsockname) */
 					if (sa.ss_family == AF_INET)
 						chunk_appendf(&trash, " fam=ipv4 lport=%d", ntohs(((const struct sockaddr_in *)&sa)->sin_port));
 					else if (sa.ss_family == AF_INET6)
@@ -1450,6 +1555,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 			salen = sizeof(sa);
 			if (getsockname(fd, (struct sockaddr *)&sa, &salen) != -1) {
+				/* only real address families in .ss_family (as provided by getsockname) */
 				if (sa.ss_family == AF_INET)
 					chunk_appendf(&trash, " fam=ipv4 lport=%d", ntohs(((const struct sockaddr_in *)&sa)->sin_port));
 				else if (sa.ss_family == AF_INET6)
@@ -1519,11 +1625,14 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 			char addr[46];
 			char port[6];
 
-			if (l->rx.addr.ss_family == AF_UNIX) {
+			if (l->rx.addr.ss_family == AF_UNIX ||
+			    l->rx.addr.ss_family == AF_CUST_ABNS ||
+			    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
 				const struct sockaddr_un *un;
 
 				un = (struct sockaddr_un *)&l->rx.addr;
-				if (un->sun_path[0] == '\0') {
+				if (l->rx.addr.ss_family == AF_CUST_ABNS ||
+				    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
 					chunk_appendf(&trash, "abns@%s ", un->sun_path+1);
 				} else {
 					chunk_appendf(&trash, "unix@%s ", un->sun_path);
@@ -1567,7 +1676,7 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 
 
 /* parse a "show env" CLI request. Returns 0 if it needs to continue, 1 if it
- * wants to stop here. It reserves a sohw_env_ctx where it puts the variable to
+ * wants to stop here. It reserves a show_env_ctx where it puts the variable to
  * be dumped as well as a flag if a single variable is requested, otherwise puts
  * environ there.
  */
@@ -1726,7 +1835,11 @@ static int set_severity_output(int *target, char *argument)
 /* parse a "set severity-output" command. */
 static int cli_parse_set_severity_output(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	if (*args[2] && set_severity_output(&appctx->cli_severity_output, args[2]))
+	/* this will ask the applet to not output a \n after the command */
+	if (strcmp(args[3], "-") == 0)
+		appctx->st1 |= APPCTX_CLI_ST1_NOLF;
+
+	if (*args[2] && set_severity_output(&appctx->cli_ctx.severity_output, args[2]))
 		return 0;
 
 	return cli_err(appctx, "one of 'none', 'number', 'string' is a required argument\n");
@@ -1736,11 +1849,11 @@ static int cli_parse_set_severity_output(char **args, char *payload, struct appc
 /* show the level of the current CLI session */
 static int cli_parse_show_lvl(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	if ((appctx->cli_level & ACCESS_LVL_MASK) == ACCESS_LVL_ADMIN)
+	if ((appctx->cli_ctx.level & ACCESS_LVL_MASK) == ACCESS_LVL_ADMIN)
 		return cli_msg(appctx, LOG_INFO, "admin\n");
-	else if ((appctx->cli_level & ACCESS_LVL_MASK) == ACCESS_LVL_OPER)
+	else if ((appctx->cli_ctx.level & ACCESS_LVL_MASK) == ACCESS_LVL_OPER)
 		return cli_msg(appctx, LOG_INFO, "operator\n");
-	else if ((appctx->cli_level & ACCESS_LVL_MASK) == ACCESS_LVL_USER)
+	else if ((appctx->cli_ctx.level & ACCESS_LVL_MASK) == ACCESS_LVL_USER)
 		return cli_msg(appctx, LOG_INFO, "user\n");
 	else
 		return cli_msg(appctx, LOG_INFO, "unknown\n");
@@ -1757,17 +1870,17 @@ static int cli_parse_set_lvl(char **args, char *payload, struct appctx *appctx, 
 		if (!cli_has_level(appctx, ACCESS_LVL_OPER)) {
 			return 1;
 		}
-		appctx->cli_level &= ~ACCESS_LVL_MASK;
-		appctx->cli_level |= ACCESS_LVL_OPER;
+		appctx->cli_ctx.level &= ~ACCESS_LVL_MASK;
+		appctx->cli_ctx.level |= ACCESS_LVL_OPER;
 
 	} else if (strcmp(args[0], "user") == 0) {
 		if (!cli_has_level(appctx, ACCESS_LVL_USER)) {
 			return 1;
 		}
-		appctx->cli_level &= ~ACCESS_LVL_MASK;
-		appctx->cli_level |= ACCESS_LVL_USER;
+		appctx->cli_ctx.level &= ~ACCESS_LVL_MASK;
+		appctx->cli_ctx.level |= ACCESS_LVL_USER;
 	}
-	appctx->cli_level &= ~(ACCESS_EXPERT|ACCESS_EXPERIMENTAL);
+	appctx->cli_ctx.level &= ~(ACCESS_EXPERT|ACCESS_EXPERIMENTAL);
 	return 1;
 }
 
@@ -1804,13 +1917,13 @@ static int cli_parse_expert_experimental_mode(char **args, char *payload, struct
 
 	if (!*args[1]) {
 		memprintf(&output, "%s is %s\n", level_str,
-		          (appctx->cli_level & level) ? "ON" : "OFF");
+		          (appctx->cli_ctx.level & level) ? "ON" : "OFF");
 		return cli_dynmsg(appctx, LOG_INFO, output);
 	}
 
-	appctx->cli_level &= ~level;
+	appctx->cli_ctx.level &= ~level;
 	if (strcmp(args[1], "on") == 0)
-		appctx->cli_level |= level;
+		appctx->cli_ctx.level |= level;
 	return 1;
 }
 
@@ -1839,14 +1952,14 @@ static int cli_parse_set_anon(char **args, char *payload, struct appctx *appctx,
 			key = atoll(args[3]);
 			if (key < 1 || key > UINT_MAX)
 				return cli_err(appctx, "Value out of range (1 to 4294967295 expected).\n");
-			appctx->cli_anon_key = key;
+			appctx->cli_ctx.anon_key = key;
 		}
 		else {
 			tmp = HA_ATOMIC_LOAD(&global.anon_key);
 			if (tmp != 0)
-				appctx->cli_anon_key = tmp;
+				appctx->cli_ctx.anon_key = tmp;
 			else
-				appctx->cli_anon_key = ha_random32();
+				appctx->cli_ctx.anon_key = ha_random32();
 		}
 	}
 	else if (strcmp(args[2], "off") == 0) {
@@ -1855,7 +1968,7 @@ static int cli_parse_set_anon(char **args, char *payload, struct appctx *appctx,
 			return cli_err(appctx, "Key can't be added while disabling anonymized mode\n");
 		}
 		else {
-			appctx->cli_anon_key = 0;
+			appctx->cli_ctx.anon_key = 0;
 		}
 	}
 	else {
@@ -1890,14 +2003,14 @@ static int cli_parse_show_anon(char **args, char *payload, struct appctx *appctx
 {
 	char *msg = NULL;
 	char *anon_mode = NULL;
-	uint32_t c_key = appctx->cli_anon_key;
+	uint32_t c_key = appctx->cli_ctx.anon_key;
 
 	if (!c_key)
 		anon_mode = "Anonymized mode disabled";
 	else
 		anon_mode = "Anonymized mode enabled";
 
-	if ( !((appctx->cli_level & ACCESS_LVL_MASK) < ACCESS_LVL_OPER) && c_key != 0) {
+	if ( !((appctx->cli_ctx.level & ACCESS_LVL_MASK) < ACCESS_LVL_OPER) && c_key != 0) {
 		cli_dynmsg(appctx, LOG_INFO, memprintf(&msg, "%s\nKey : %u\n", anon_mode, c_key));
 	}
 	else {
@@ -1953,6 +2066,172 @@ static int cli_parse_set_ratelimit(char **args, char *payload, struct appctx *ap
 	dequeue_all_listeners();
 
 	return 1;
+}
+
+/* Parse a "wait <time>" command.
+ * It uses a "cli_wait_ctx" struct for its context.
+ * Returns 0 if the server deletion has been successfully scheduled, 1 on failure.
+ */
+static int cli_parse_wait(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct cli_wait_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	uint wait_ms;
+	const char *err;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	if (!*args[1])
+		return cli_err(appctx, "Expects a duration in milliseconds.\n");
+
+	err = parse_time_err(args[1], &wait_ms, TIME_UNIT_MS);
+	if (err || wait_ms < 1) {
+		/* in case -h is passed as the first option, continue to the next test */
+		if (strcmp(args[1], "-h") == 0)
+			args--;
+		else
+			return cli_err(appctx, "Invalid duration.\n");
+	}
+
+	if (strcmp(args[2], "srv-removable") == 0) {
+		struct ist be_name, sv_name;
+
+		if (!*args[3])
+			return cli_err(appctx, "Missing server name (<backend>/<server>).\n");
+
+		sv_name = ist(args[3]);
+		be_name = istsplit(&sv_name, '/');
+		if (!istlen(sv_name))
+			return cli_err(appctx, "Require 'backend/server'.\n");
+
+		be_name = istdup(be_name);
+		sv_name = istdup(sv_name);
+		if (!isttest(be_name) || !isttest(sv_name)) {
+			free(istptr(be_name));
+			free(istptr(sv_name));
+			return cli_err(appctx, "Out of memory trying to clone the server name.\n");
+		}
+
+		ctx->args[0] = ist0(be_name);
+		ctx->args[1] = ist0(sv_name);
+		ctx->cond = CLI_WAIT_COND_SRV_UNUSED;
+	}
+	else if (*args[2]) {
+		/* show the command's help either upon request (-h) or error */
+		err = "Usage: wait {-h|<duration>} [condition [args...]]\n"
+			"  - '-h' displays this help\n"
+			"  - <duration> is the maximum wait time, optionally suffixed by the unit among\n"
+			"    'us', 'ms', 's', 'm', 'h', and 'd'. ; the default unit is milliseconds.\n"
+			"  - <condition> indicates what to wait for, no longer than the specified\n"
+			"    duration. Supported conditions are:\n"
+			"    - <none> : by default, just sleep for the specified duration.\n"
+			"    - srv-removable <px>/<sv> : wait for this server to become removable.\n"
+			"";
+
+		if (strcmp(args[2], "-h") == 0)
+			return cli_msg(appctx, LOG_INFO, err);
+		else
+			return cli_err(appctx, err);
+	}
+
+	ctx->start = now_ms;
+	ctx->deadline = tick_add(now_ms, wait_ms);
+
+	/* proceed with the I/O handler */
+	return 0;
+}
+
+/* Execute a "wait" condition. The delay is exponentially incremented between
+ * now_ms and ctx->deadline in powers of 1.5 and with a bound set to 10% of the
+ * programmed wait time, so that in a few wakeups we can later check a condition
+ * with reasonable accuracy. Shutdowns and other errors are handled as well and
+ * terminate the operation, but not new inputs so that it remains possible to
+ * chain other commands after it. Returns 0 if not finished, 1 if finished.
+ */
+static int cli_io_handler_wait(struct appctx *appctx)
+{
+	struct cli_wait_ctx *ctx = appctx->svcctx;
+	uint total, elapsed, left, wait;
+	int ret;
+
+	/* note: upon first invocation, the timeout is not set */
+	if (tick_isset(appctx->t->expire) &&
+	    !tick_is_expired(appctx->t->expire, now_ms))
+		goto wait;
+
+	/* here we should evaluate our waiting conditions, if any */
+
+	if (ctx->cond == CLI_WAIT_COND_SRV_UNUSED) {
+		/* check if the server in args[0]/args[1] can be released now */
+		ret = srv_check_for_deletion(ctx->args[0], ctx->args[1], NULL, NULL, NULL);
+
+		if (ret < 0) {
+			/* unrecoverable failure */
+			ctx->error = CLI_WAIT_ERR_FAIL;
+			return 1;
+		} else if (ret > 0) {
+			/* immediate success */
+			ctx->error = CLI_WAIT_ERR_DONE;
+			return 1;
+		}
+		/* let's check the timer */
+	}
+
+	/* and here we recalculate the new wait time or abort */
+	left  = tick_remain(now_ms, ctx->deadline);
+	if (!left) {
+		/* let the release handler know we've expired. When there is no
+		 * wait condition, it's a simple sleep so we declare we're done.
+		 */
+		if (ctx->cond == CLI_WAIT_COND_NONE)
+			ctx->error = CLI_WAIT_ERR_DONE;
+		else
+			ctx->error = CLI_WAIT_ERR_EXP;
+		return 1;
+	}
+
+	total = tick_remain(ctx->start, ctx->deadline);
+	elapsed = total - left;
+	wait = elapsed / 2 + 1;
+	if (wait > left)
+		wait = left;
+	else if (wait > total / 10)
+		wait = total / 10;
+
+	appctx->t->expire = tick_add(now_ms, wait);
+
+ wait:
+	/* Stop waiting upon close/abort/error */
+	if (unlikely(se_fl_test(appctx->sedesc, SE_FL_SHW)) && !b_data(&appctx->inbuf)) {
+		ctx->error = CLI_WAIT_ERR_INTR;
+		return 1;
+	}
+
+	return 0;
+}
+
+
+/* release structs allocated by "delete server" */
+static void cli_release_wait(struct appctx *appctx)
+{
+	struct cli_wait_ctx *ctx = appctx->svcctx;
+	const char *msg;
+	int i;
+
+	switch (ctx->error) {
+	case CLI_WAIT_ERR_EXP:      msg = "Wait delay expired.\n"; break;
+	case CLI_WAIT_ERR_INTR:     msg = "Interrupted.\n"; break;
+	case CLI_WAIT_ERR_FAIL:     msg = ctx->msg ? ctx->msg : "Failed.\n"; break;
+	default:                    msg = "Done.\n"; break;
+	}
+
+	for (i = 0; i < sizeof(ctx->args) / sizeof(ctx->args[0]); i++)
+		ha_free(&ctx->args[i]);
+
+	if (ctx->error == CLI_WAIT_ERR_DONE)
+		cli_msg(appctx, LOG_INFO, msg);
+	else
+		cli_err(appctx, msg);
 }
 
 /* parse the "expose-fd" argument on the bind lines */
@@ -2122,6 +2401,9 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 		if (!(fdtab[cur_fd].state & FD_EXPORTED))
 			continue;
 
+		/* this FD is now shared between processes */
+		HA_ATOMIC_OR(&fdtab[cur_fd].state, FD_CLONED);
+
 		ns_name = if_name = "";
 		ns_nlen = if_nlen = 0;
 
@@ -2168,7 +2450,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 			iov.iov_len = curoff;
 			if (sendmsg(fd, &msghdr, 0) != curoff) {
 				ha_warning("Failed to transfer sockets\n");
-				return -1;
+				goto out;
 			}
 
 			/* Wait for an ack */
@@ -2178,7 +2460,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 
 			if (ret <= 0) {
 				ha_warning("Unexpected error while transferring sockets\n");
-				return -1;
+				goto out;
 			}
 			curoff = 0;
 			nb_queued = 0;
@@ -2196,14 +2478,22 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 			ha_warning("Failed to transfer sockets\n");
 			goto out;
 		}
+
+		/* Wait for an ack */
+		do {
+			ret = recv(fd, &tot_fd_nb, sizeof(tot_fd_nb), 0);
+		} while (ret == -1 && errno == EINTR);
+
+		if (ret <= 0) {
+			ha_warning("Unexpected error while transferring sockets\n");
+			goto out;
+		}
 	}
 
 out:
-	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1) {
+	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1)
 		ha_warning("Cannot make the unix socket non-blocking\n");
-		goto out;
-	}
-	se_fl_set(appctx->sedesc, SE_FL_EOI);
+	applet_set_eoi(appctx);
 	appctx->st0 = CLI_ST_END;
 	free(cmsgbuf);
 	free(tmpbuf);
@@ -2215,18 +2505,158 @@ static int cli_parse_simple(char **args, char *payload, struct appctx *appctx, v
 	if (*args[0] == 'h')
 		/* help */
 		cli_gen_usage_msg(appctx, args);
-	else if (*args[0] == 'p')
+	else if (*args[0] == 'p') {
 		/* prompt */
-		if (strcmp(args[1], "timed") == 0) {
-			appctx->st1 |= APPCTX_CLI_ST1_PROMPT;
-			appctx->st1 ^= APPCTX_CLI_ST1_TIMED;
+		int mode = 0;  // 0=default, 1="n", 2="i", 3="p"
+		int timed = 0; // non-zero = "timed" present
+		int arg;
+		const char *usage =
+			"Usage: prompt [help | n | i | p | timed]*\n"
+			"Changes the default prompt and interactive mode. Available options:\n"
+			"  help    display this help\n"
+			"  n       set to single-command mode (no prompt, single command)\n"
+			"  i       set to interactive mode only (no prompt, multi-command)\n"
+			"  p       set to prompt+interactive mode (prompt + multi-command)\n"
+			"  timed   toggle displaying the current date in the prompt\n"
+			"Without any argument, toggles between n/i->p, p->n.\n"
+			;
+
+		for (arg = 1; *args[arg]; arg++) {
+			if (strcmp(args[arg], "n") == 0)
+				mode = 1;
+			else if (strcmp(args[arg], "i") == 0)
+				mode = 2;
+			else if (strcmp(args[arg], "p") == 0)
+				mode = 3;
+			else if (strcmp(args[arg], "timed") == 0)
+				timed = 1;
+			else if (strcmp(args[arg], "help") == 0)
+				return cli_msg(appctx, LOG_INFO, usage);
+			else
+				return cli_err(appctx, usage);
 		}
+		/* In timed mode, the default is to enable prompt+inter and toggle timed.
+		 * In other mode, the default is to toggle prompt+inter (n/i->p, p->n).
+		 */
+		if (timed) {
+			appctx->st1 &= ~(APPCTX_CLI_ST1_PROMPT | APPCTX_CLI_ST1_INTER);
+			appctx->st1 ^= APPCTX_CLI_ST1_TIMED;
+			mode = mode ? mode : 3; // p by default
+		}
+
+		if (mode) {
+			/* force mode (n,i,p) */
+			appctx->st1 &= ~(APPCTX_CLI_ST1_PROMPT | APPCTX_CLI_ST1_INTER);
+			appctx->st1 |= ((mode >= 3) ? APPCTX_CLI_ST1_PROMPT : 0)  | ((mode >= 2) ? APPCTX_CLI_ST1_INTER : 0);
+		}
+		else if (~appctx->st1 & (APPCTX_CLI_ST1_PROMPT | APPCTX_CLI_ST1_INTER))
+			appctx->st1 |= APPCTX_CLI_ST1_PROMPT | APPCTX_CLI_ST1_INTER;    // p
 		else
-			appctx->st1 ^= APPCTX_CLI_ST1_PROMPT;
+			appctx->st1 &= ~(APPCTX_CLI_ST1_PROMPT | APPCTX_CLI_ST1_INTER); // n
+	}
 	else if (*args[0] == 'q') {
 		/* quit */
-		se_fl_set(appctx->sedesc, SE_FL_EOI);
+		applet_set_eoi(appctx);
 		appctx->st0 = CLI_ST_END;
+	}
+
+	return 1;
+}
+
+static int cli_parse_echo(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	int i = 1; /* starts after 'echo' */
+
+	chunk_reset(&trash);
+
+	while (*args[i]) {
+		/* add a space if there was a word before */
+		if (i == 1)
+			chunk_printf(&trash, "%s", args[i]);
+		else
+			chunk_appendf(&trash, " %s", args[i]);
+		i++;
+	}
+	chunk_appendf(&trash, "\n");
+
+	cli_msg(appctx, LOG_INFO, trash.area);
+
+	return 1;
+}
+
+static int _send_status(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct listener *mproxy_li;
+	struct mworker_proc *proc;
+	char *msg = "READY\n";
+	int pid;
+
+	BUG_ON((strcmp(args[0], "_send_status") != 0),
+		"Triggered in _send_status by unsupported command name.");
+
+	pid = atoi(args[2]);
+
+	list_for_each_entry(proc, &proc_list, list) {
+		/* update status of the new worker */
+		if (proc->pid == pid) {
+			proc->options &= ~PROC_O_INIT;
+			mproxy_li = fdtab[proc->ipc_fd[0]].owner;
+			stop_listener(mproxy_li, 0, 0, 0);
+		}
+		/* send TERM to workers, which have exceeded max_reloads counter */
+		if (max_reloads != -1) {
+			if ((proc->options & PROC_O_TYPE_WORKER) &&
+				(proc->options & PROC_O_LEAVING) &&
+				(proc->reloads > max_reloads) && (proc->pid > 0)) {
+				kill(proc->pid, SIGTERM);
+			}
+
+		}
+	}
+
+	/* At this point we are sure, that newly forked worker is started,
+	 * so we can write our PID in a pidfile, if provided. Master doesn't
+	 * perform chroot.
+	 */
+	if (global.pidfile != NULL) {
+		if (handle_pidfile() < 0) {
+			ha_alert("Fatal error(s) found, exiting.\n");
+			exit(1);
+		}
+	}
+
+	/* either send USR1/TERM to old master, case when we launched as -W -D ... -sf $(cat pidfile),
+	 * or send USR1/TERM to old worker processes.
+	 */
+	if (nb_oldpids > 0) {
+		nb_oldpids = tell_old_pids(oldpids_sig);
+	}
+
+	if (daemon_fd[1] != -1) {
+		if (write(daemon_fd[1], msg, strlen(msg)) < 0) {
+			ha_alert("[%s.main()] Failed to write into pipe with parent process: %s\n", progname, strerror(errno));
+			exit(1);
+		}
+		close(daemon_fd[1]);
+		daemon_fd[1] = -1;
+	}
+
+	load_status = 1;
+	ha_notice("Loading success.\n");
+
+	if (global.tune.options & GTUNE_USE_SYSTEMD)
+		sd_notifyf(0, "READY=1\nMAINPID=%lu\nSTATUS=Ready.\n", (unsigned long)getpid());
+
+	/* master and worker have successfully started, now we can set quiet mode
+	 * if MODE_DAEMON
+	 */
+	if ((!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
+		(global.mode & MODE_DAEMON)) {
+		/* detach from the tty, this is required to properly daemonize. */
+		if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL))
+			stdio_quiet(-1);
+		global.mode &= ~MODE_VERBOSE;
+		global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
 	}
 
 	return 1;
@@ -2416,11 +2846,15 @@ static int pcli_prefix_to_pid(const char *prefix)
 	return -1;
 }
 
-/* Return::
- *  >= 0 : number of words to escape
+/*
+ * pcli_find_and_exec_kw() parses a command for the master CLI.  It looks for a
+ * prefix or a command that is handled directly by the proxy and never sent to
+ * a worker.
+ *
+ * Return:
+ *  >= 0 : number of words that were parsed and need to be skipped
  *  = -1 : error
  */
-
 int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg, int *next_pid)
 {
 	if (argl < 1)
@@ -2442,12 +2876,51 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
 			*next_pid = target_pid;
 		return 1;
 	} else if (strcmp("prompt", args[0]) == 0) {
-		if (argl >= 2 && strcmp(args[1], "timed") == 0) {
-			s->pcli_flags |= PCLI_F_PROMPT;
-			s->pcli_flags ^= PCLI_F_TIMED;
+		int mode = 0;  // 0=default, 1="n" (not in master), 2="i", 3="p"
+		int timed = 0; // non-zero = "timed" present
+		int arg;
+
+		const char *usage =
+			"Usage: prompt [help | i | p | timed]*\n"
+			"Changes the default prompt and interactive mode. Available options:\n"
+			"  help    display this help\n"
+			"  i       set to interactive mode only (no prompt, multi-command)\n"
+			"  p       set to prompt+interactive mode (prompt + multi-command)\n"
+			"  timed   toggle displaying the current date in the prompt\n"
+			"Without any argument, toggles between i<->p.\n"
+			;
+
+		for (arg = 1; arg < argl; arg++) {
+			if (strcmp(args[arg], "i") == 0)
+				mode = 2;
+			else if (strcmp(args[arg], "p") == 0)
+				mode = 3;
+			else if (strcmp(args[arg], "timed") == 0)
+				timed = 1;
+			else {
+				memprintf(errmsg, "%s", usage);
+				return -1;
+			}
 		}
+
+		/* In timed mode, the default is to enable prompt+inter and toggle timed.
+		 * In other mode, the default is to toggle prompt+inter (n/i->p, p->n).
+		 */
+		if (timed) {
+			s->pcli_flags ^= PCLI_F_TIMED;
+			mode = mode ? mode : 3; // p by default
+		}
+
+		if (mode) {
+			/* force mode (i,p) */
+			s->pcli_flags &= ~PCLI_F_PROMPT;
+			s->pcli_flags |= (mode >= 3) ? PCLI_F_PROMPT : 0;
+		}
+		else if (~s->pcli_flags & PCLI_F_PROMPT)
+			s->pcli_flags |= PCLI_F_PROMPT; // p
 		else
-			s->pcli_flags ^= PCLI_F_PROMPT;
+			s->pcli_flags &= ~PCLI_F_PROMPT; // i
+
 		return argl; /* return the number of elements in the array */
 	} else if (strcmp("quit", args[0]) == 0) {
 		sc_schedule_abort(s->scf);
@@ -2500,9 +2973,111 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
 		if ((argl > 1) && (strcmp(args[1], "on") == 0))
 			s->pcli_flags |= ACCESS_MCLI_DEBUG;
 		return argl;
+	} else if (strcmp(args[0], "set") == 0) {
+		if ((argl > 1) && (strcmp(args[1], "severity-output") == 0)) {
+			if ((argl > 2) &&strcmp(args[2], "none") == 0) {
+				s->pcli_flags &= ~(ACCESS_MCLI_SEVERITY_NB|ACCESS_MCLI_SEVERITY_STR);
+			} else if ((argl > 2) && strcmp(args[2], "string") == 0) {
+				s->pcli_flags |= ACCESS_MCLI_SEVERITY_STR;
+			} else if ((argl > 2) && strcmp(args[2], "number") == 0) {
+				s->pcli_flags |= ACCESS_MCLI_SEVERITY_NB;
+			} else {
+				memprintf(errmsg, "one of 'none', 'number', 'string' is a required argument\n");
+				return -1;
+			}
+			/* only skip argl if we have "set severity-output" not only "set" */
+			return argl;
+		}
 	}
 
 	return 0;
+}
+
+/* parse <str> up to <end> for stream <s> and request channel <req>, searching
+ * for the '@@' prefix. If found, the pid is returned in <next_pid> and the
+ * function returns a positive value representing the number of bytes
+ * processed. If the prefix is found but the pid couldn't be parsed, <0 is
+ * returned with an error placed into <errmsg>. If the string is incomplete
+ * (missing '\n'), -1 is returned with no error. If nothing is found, zero is
+ * returned. In any case, <str> is advanced by the number of chars to be
+ * skipped.
+ */
+int pcli_find_bidir_prefix(struct stream *s, struct channel *req, char **str, const char *end, char **errmsg, int *next_pid)
+{
+	char *p = *str;
+	int ret = 0;
+
+	/* skip leading spaces / tabs*/
+	while (p < end && (*p == '\t' || *p == ' '))
+		p++;
+
+	/* We only parse complete lines */
+	if (memchr(p, '\n', end - p) == NULL) {
+		ret = -1;
+		goto leave;
+	}
+
+	/* check for '@@' prefix */
+	if (p + 2 <= end && p[0] == '@' && p[1] == '@') {
+		const char *pid_str = p;
+		int target_pid;
+
+		p += 2; // skip '@@'
+
+		/* find end of process designation, then zero out all following LWS
+		 * to stop on the beginning of the command if any.
+		 */
+		while (p < end && !(*p == '\t' || *p == '\n' || *p == '\r' || *p == ' '))
+			p++;
+
+		while (p < end && (*p == '\t' || *p == '\n' || *p == '\r' || *p == ' '))
+			*(p++) = 0;
+
+		target_pid = pcli_prefix_to_pid(pid_str + 1);
+		if (target_pid == -1) {
+			memprintf(errmsg, "Can't find the target PID matching the prefix '%s'\n", pid_str);
+			ret = -1;
+			goto leave;
+		}
+
+		/* bidirectional connection to this worker */
+		s->pcli_flags |= PCLI_F_BIDIR;
+		*next_pid = target_pid;
+
+		/* skip '@@pid' and LWS */
+		b_del(&req->buf, p - *str);
+
+		/* forward what remains */
+		ret = end - p;
+
+		/* without any command, simply enter the worker in interactive
+		 * mode or prompt mode (the same as currently used in the master).
+		 * The goal is to make it easy for both scripts and humans to
+		 * enter in the same mode in the worker as they were in the master.
+		 */
+		if (!ret) {
+			const char *cmd;
+
+			cmd = "prompt";
+			ret += ci_insert(req, ret, cmd, strlen(cmd));
+
+			cmd = (s->pcli_flags & PCLI_F_PROMPT) ? " p" : " i";
+			ret += ci_insert(req, ret, cmd, strlen(cmd));
+
+			if (s->pcli_flags & PCLI_F_TIMED) {
+				cmd = " timed";
+				ret += ci_insert(req, ret, cmd, strlen(cmd));
+			}
+
+			cmd = "\n";
+			ret += ci_insert(req, ret, cmd, strlen(cmd));
+		}
+	}
+
+	/* update with already parsed contents */
+ leave:
+	*str = p;
+	return ret;
 }
 
 /*
@@ -2522,7 +3097,6 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	int argl; /* number of args */
 	char *p;
 	char *trim = NULL;
-	char *payload = NULL;
 	int wtrim = 0; /* number of words to trim */
 	int reql = 0;
 	int ret;
@@ -2540,6 +3114,13 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	p = str;
 
 	if (!(s->pcli_flags & PCLI_F_PAYLOAD)) {
+		/* look for the '@@' prefix and intercept it if found */
+		ret = pcli_find_bidir_prefix(s, req, &p, end, errmsg, next_pid);
+		if (ret != 0) // success or failure
+			goto end;
+
+		reql = p - str;
+		p = str;
 
 		/* Looks for the end of one command */
 		while (p+reql < end) {
@@ -2572,13 +3153,20 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 
 	/* there is no end to this command, need more to parse ! */
 	if (!reql || *(end-1) != '\n') {
-		return -1;
+		ret = -1;
+		goto end;
 	}
 
+	/* in payload mode, skip the whole parsing/exec and just look for a pattern */
 	if (s->pcli_flags & PCLI_F_PAYLOAD) {
-		if (reql == 1) /* last line of the payload */
-			s->pcli_flags &= ~PCLI_F_PAYLOAD;
-		return reql;
+		if (reql-1 == strlen(s->pcli_payload_pat)) {
+			/* the custom pattern len can be 0 (empty line)  */
+			if (strncmp(str, s->pcli_payload_pat, strlen(s->pcli_payload_pat)) == 0) {
+				s->pcli_flags &= ~PCLI_F_PAYLOAD;
+			}
+		}
+		ret = reql;
+		goto end;
 	}
 
 	*(end-1) = '\0';
@@ -2606,8 +3194,23 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		*p++ = 0;
 		i++;
 	}
-
 	argl = i;
+
+	/* first look for '<<' at the beginning of the last argument */
+	if (argl && strncmp(args[argl-1], PAYLOAD_PATTERN, strlen(PAYLOAD_PATTERN)) == 0) {
+		size_t pat_len = strlen(args[argl-1] + strlen(PAYLOAD_PATTERN));
+
+		/*
+		 * A customized pattern can't be more than 7 characters
+		 * if it's more, don't make it a payload
+		 */
+		if (pat_len < sizeof(s->pcli_payload_pat)) {
+			s->pcli_flags |= PCLI_F_PAYLOAD;
+			/* copy the customized pattern, don't store the << */
+			strncpy(s->pcli_payload_pat, args[argl-1] + strlen(PAYLOAD_PATTERN), sizeof(s->pcli_payload_pat)-1);
+			s->pcli_payload_pat[sizeof(s->pcli_payload_pat)-1] = '\0';
+		}
+	}
 
 	for (; i < MAX_CLI_ARGS + 1; i++)
 		args[i] = NULL;
@@ -2623,12 +3226,6 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		p++;
 	}
 
-	payload = strstr(str, PAYLOAD_PATTERN);
-	if ((end - 1) == (payload + strlen(PAYLOAD_PATTERN))) {
-		/* if the payload pattern is at the end */
-		s->pcli_flags |= PCLI_F_PAYLOAD;
-	}
-
 	*(end-1) = '\n';
 
 	if (wtrim > 0) {
@@ -2641,7 +3238,8 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		ret = end - trim;
 	} else if (wtrim < 0) {
 		/* parsing error */
-		return -1;
+		ret = -1;
+		goto end;
 	} else {
 		/* the whole string */
 		ret = end - str;
@@ -2651,26 +3249,41 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 
 		/* the mcli-debug-mode is only sent to the applet of the master */
 		if ((s->pcli_flags & ACCESS_MCLI_DEBUG) && *next_pid <= 0) {
-			ci_insert_line2(req, 0, "mcli-debug-mode on -", strlen("mcli-debug-mode on -"));
-			ret += strlen("mcli-debug-mode on -") + 2;
+			const char *cmd = "mcli-debug-mode on -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 		if (s->pcli_flags & ACCESS_EXPERIMENTAL) {
-			ci_insert_line2(req, 0, "experimental-mode on -", strlen("experimental-mode on -"));
-			ret += strlen("experimental-mode on -") + 2;
+			const char *cmd = "experimental-mode on -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 		if (s->pcli_flags & ACCESS_EXPERT) {
-			ci_insert_line2(req, 0, "expert-mode on -", strlen("expert-mode on -"));
-			ret += strlen("expert-mode on -") + 2;
+			const char *cmd = "expert-mode on -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
+		}
+		if (s->pcli_flags & ACCESS_MCLI_SEVERITY_STR) {
+			const char *cmd = "set severity-output string -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
+		}
+		if (s->pcli_flags & ACCESS_MCLI_SEVERITY_NB) {
+			const char *cmd = "set severity-output number -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 
 		if (pcli_has_level(s, ACCESS_LVL_ADMIN)) {
 			goto end;
 		} else if (pcli_has_level(s, ACCESS_LVL_OPER)) {
-			ci_insert_line2(req, 0, "operator -", strlen("operator -"));
-			ret += strlen("operator -") + 2;
+			const char *cmd = "operator -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		} else if (pcli_has_level(s, ACCESS_LVL_USER)) {
-			ci_insert_line2(req, 0, "user -", strlen("user -"));
-			ret += strlen("user -") + 2;
+			const char *cmd = "user -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 	}
 end:
@@ -2691,6 +3304,7 @@ int pcli_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	if (s->res.analysers & AN_RES_WAIT_CLI)
 		return 0;
 
+	s->pcli_flags &= ~PCLI_F_BIDIR; // only for one connection
 	if ((s->pcli_flags & ACCESS_LVL_MASK) == ACCESS_LVL_NONE)
 		s->pcli_flags |= strm_li(s)->bind_conf->level & ACCESS_LVL_MASK;
 
@@ -2725,12 +3339,18 @@ read_again:
 		int target_pid;
 		/* enough data */
 
-		/* forward only 1 command */
-		channel_forward(req, to_forward);
+		/* forward only 1 command for '@' or everything for '@@' */
+		if (!(s->pcli_flags & PCLI_F_BIDIR))
+			channel_forward(req, to_forward);
+		else
+			channel_forward_forever(req);
 
 		if (!(s->pcli_flags & PCLI_F_PAYLOAD)) {
-			/* we send only 1 command per request, and we write close after it */
-			sc_schedule_shutdown(s->scb);
+			/* we send only 1 command per request, and we write
+			 * close after it when not in full-duplex mode.
+			 */
+			if (!(s->pcli_flags & PCLI_F_BIDIR))
+				sc_schedule_shutdown(s->scb);
 		} else {
 			pcli_write_prompt(s);
 		}
@@ -2745,6 +3365,8 @@ read_again:
 				target_pid = s->pcli_next_pid;
 			/* we can connect now */
 			s->target = pcli_pid_to_server(target_pid);
+			if (objt_server(s->target))
+				s->sv_tgcounters = __objt_server(s->target)->counters.shared.tg[tgid - 1];
 
 			if (!s->target)
 				goto server_disconnect;
@@ -2831,6 +3453,8 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	}
 
 	if (s->scb->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) {
+		uint8_t do_log = 0;
+
 		/* stream cleanup */
 
 		pcli_write_prompt(s);
@@ -2864,10 +3488,17 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		pendconn_free(s);
 
 		/* let's do a final log if we need it */
-		if (!LIST_ISEMPTY(&fe->logformat) && s->logs.logwait &&
+		if (fe->to_log == LW_LOGSTEPS) {
+			if (log_orig_proxy(LOG_ORIG_TXN_CLOSE, fe))
+				do_log = 1;
+		}
+		else if (!lf_expr_isempty(&fe->logformat) && s->logs.logwait)
+			do_log = 1;
+
+		if (do_log &&
 		    !(s->flags & SF_MONITOR) &&
 		    (!(fe->options & PR_O_NULLNOLOG) || s->req.total)) {
-			s->do_log(s);
+			s->do_log(s, log_orig(LOG_ORIG_TXN_CLOSE, LOG_ORIG_FL_NONE));
 		}
 
 		/* stop tracking content-based counters */
@@ -2901,20 +3532,16 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		s->target = NULL;
 
-		/* only release our endpoint if we don't intend to reuse the
-		 * connection.
-		 */
-		if (!sc_conn_ready(s->scb)) {
-			s->srv_conn = NULL;
-			if (sc_reset_endp(s->scb) < 0) {
-				if (!s->conn_err_type)
-					s->conn_err_type = STRM_ET_CONN_OTHER;
-				if (s->srv_error)
-					s->srv_error(s, s->scb);
-				return 1;
-			}
-			se_fl_clr(s->scb->sedesc, ~SE_FL_DETACHED);
+		/* Always release our endpoint */
+		s->srv_conn = NULL;
+		if (sc_reset_endp(s->scb) < 0) {
+			if (!s->conn_err_type)
+				s->conn_err_type = STRM_ET_CONN_OTHER;
+			if (s->srv_error)
+				s->srv_error(s, s->scb);
+			return 1;
 		}
+		se_fl_clr(s->scb->sedesc, ~SE_FL_DETACHED);
 
 		sockaddr_free(&s->scb->dst);
 
@@ -2924,6 +3551,9 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		s->req.flags &= ~(CF_AUTO_CONNECT|CF_STREAMER|CF_STREAMER_FAST|CF_WROTE_DATA);
 		s->res.flags &= ~(CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_EVENT|CF_WROTE_DATA|CF_READ_EVENT);
+		s->req.to_forward = 0;
+		s->res.to_forward = 0;
+		s->pcli_flags &= ~PCLI_F_BIDIR;
 		s->flags &= ~(SF_DIRECT|SF_ASSIGNED|SF_BE_ASSIGNED|SF_FORCE_PRST|SF_IGNORE_PRST);
 		s->flags &= ~(SF_CURR_SESS|SF_REDIRECTABLE|SF_SRV_REUSED);
 		s->flags &= ~(SF_ERR_MASK|SF_FINST_MASK|SF_REDISP);
@@ -2942,11 +3572,13 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		s->target = NULL;
 		/* re-init store persistence */
 		s->store_count = 0;
-		s->uniq_id = global.req_count++;
+		s->uniq_id = _HA_ATOMIC_FETCH_ADD(&global.req_count, 1);
 
-		s->scf->flags &= ~(SC_FL_EOS|SC_FL_ERROR|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
+		s->scf->flags &= ~(SC_FL_EOI|SC_FL_EOS|SC_FL_ERROR|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
 		s->scf->flags &= ~SC_FL_SND_NEVERWAIT;
 		s->scf->flags |= SC_FL_RCV_ONCE; /* one read is usually enough */
+
+		se_have_more_data(s->scf->sedesc);
 
 		s->req.flags |= CF_WAKE_ONCE; /* need to be called again if there is some command left in the request */
 
@@ -3000,29 +3632,47 @@ void mworker_cli_proxy_stop()
 }
 
 /*
- * Create the mworker CLI proxy
+ * Create the MASTER proxy
  */
-int mworker_cli_proxy_create()
+int mworker_cli_create_master_proxy(char **errmsg)
 {
-	struct mworker_proc *child;
-	char *msg = NULL;
-	char *errmsg = NULL;
-
-	mworker_proxy = alloc_new_proxy("MASTER", PR_CAP_LISTEN|PR_CAP_INT, &errmsg);
-	if (!mworker_proxy)
-		goto error_proxy;
+	mworker_proxy = alloc_new_proxy("MASTER", PR_CAP_LISTEN|PR_CAP_INT, errmsg);
+	if (!mworker_proxy) {
+		return -1;
+	}
 
 	mworker_proxy->mode = PR_MODE_CLI;
-	mworker_proxy->maxconn = 10;                 /* default to 10 concurrent connections */
-	mworker_proxy->timeout.client = 0; /* no timeout */
+	/* default to 10 concurrent connections */
+	mworker_proxy->maxconn = 10;
+	/* no timeout */
+	mworker_proxy->timeout.client = 0;
 	mworker_proxy->conf.file = strdup("MASTER");
 	mworker_proxy->conf.line = 0;
 	mworker_proxy->accept = frontend_accept;
-	mworker_proxy-> lbprm.algo = BE_LB_ALGO_NONE;
+	mworker_proxy->lbprm.algo = BE_LB_ALGO_NONE;
 
 	/* Does not init the default target the CLI applet, but must be done in
 	 * the request parsing code */
 	mworker_proxy->default_target = NULL;
+	mworker_proxy->next = proxies_list;
+	proxies_list = mworker_proxy;
+
+	return 0;
+}
+
+/*
+ * Attach servers to ipc_fd[0] of all presented in proc_list workers. Master and
+ * worker share MCLI sockpair (ipc_fd[0] and ipc_fd[1]). Servers are attached to
+ * ipc_fd[0], which is always opened at master side. ipc_fd[0] of worker, started
+ * before the reload, is inherited in master after the reload (execvp).
+ */
+int mworker_cli_attach_server(char **errmsg)
+{
+	char *msg = NULL;
+	struct mworker_proc *child;
+
+	BUG_ON((mworker_proxy == NULL), "Triggered in mworker_cli_attach_server(), "
+		"mworker_proxy must be created before this call.");
 
 	/* create all servers using the mworker_proc list */
 	list_for_each_entry(child, &proc_list, list) {
@@ -3039,21 +3689,18 @@ int mworker_cli_proxy_create()
 		if (!newsrv)
 			goto error;
 
-		/* we don't know the new pid yet */
-		if (child->pid == -1)
+		if (child->options & PROC_O_INIT)
 			memprintf(&msg, "cur-%d", 1);
 		else
 			memprintf(&msg, "old-%d", child->pid);
 
-		newsrv->next = mworker_proxy->srv;
-		mworker_proxy->srv = newsrv;
 		newsrv->conf.file = strdup(msg);
 		newsrv->id = strdup(msg);
 		newsrv->conf.line = 0;
 
 		memprintf(&msg, "sockpair@%d", child->ipc_fd[0]);
-		if ((sk = str2sa_range(msg, &port, &port1, &port2, NULL, &proto,
-		                       &errmsg, NULL, NULL, PA_O_STREAM)) == 0) {
+		if ((sk = str2sa_range(msg, &port, &port1, &port2, NULL, &proto, NULL,
+		                       errmsg, NULL, NULL, NULL, PA_O_STREAM)) == 0) {
 			goto error;
 		}
 		ha_free(&msg);
@@ -3073,9 +3720,6 @@ int mworker_cli_proxy_create()
 		child->srv = newsrv;
 	}
 
-	mworker_proxy->next = proxies_list;
-	proxies_list = mworker_proxy;
-
 	return 0;
 
 error:
@@ -3083,14 +3727,9 @@ error:
 	list_for_each_entry(child, &proc_list, list) {
 		free((char *)child->srv->conf.file); /* cast because of const char *  */
 		free(child->srv->id);
-		ha_free(&child->srv);
+		srv_free(&child->srv);
 	}
-	free_proxy(mworker_proxy);
 	free(msg);
-
-error_proxy:
-	ha_alert("%s\n", errmsg);
-	free(errmsg);
 
 	return -1;
 }
@@ -3098,7 +3737,7 @@ error_proxy:
 /*
  * Create a new listener for the master CLI proxy
  */
-struct bind_conf *mworker_cli_proxy_new_listener(char *line)
+struct bind_conf *mworker_cli_master_proxy_new_listener(char *line)
 {
 	struct bind_conf *bind_conf;
 	struct listener *l;
@@ -3179,6 +3818,9 @@ struct bind_conf *mworker_cli_proxy_new_listener(char *line)
 	bind_conf->nice = -64;  /* we want to boost priority for local stats */
 	bind_conf->options |= BC_O_UNLIMITED; /* don't make the peers subject to global limits */
 
+	/* Pin master CLI on the first thread of the first group only */
+	thread_set_pin_grp1(&bind_conf->thread_set, 1);
+
 	list_for_each_entry(l, &bind_conf->listeners, by_bind) {
 		l->rx.flags |= RX_F_MWORKER; /* we are keeping this FD in the master */
 		global.maxsock++; /* for the listening socket */
@@ -3196,21 +3838,16 @@ err:
 }
 
 /*
- * Create a new CLI socket using a socketpair for a worker process
- * <mworker_proc> is the process structure, and <proc> is the process number
+ * Creates a "master-socket" bind conf and a listener. Assigns
+ * this new listener to the one "end" of the given process <proc> sockpair in
+ * order to have a new master CLI listening socket for this process.
  */
-int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
+int mworker_cli_global_proxy_new_listener(struct mworker_proc *proc)
 {
 	struct bind_conf *bind_conf;
 	struct listener *l;
 	char *path = NULL;
 	char *err = NULL;
-
-	/* master pipe to ensure the master is still alive  */
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, mworker_proc->ipc_fd) < 0) {
-		ha_alert("Cannot create worker socketpair.\n");
-		return -1;
-	}
 
 	/* XXX: we might want to use a separate frontend at some point */
 	if (!global.cli_fe) {
@@ -3228,14 +3865,14 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 	bind_conf->level |= ACCESS_LVL_ADMIN; /* TODO: need to lower the rights with a CLI keyword*/
 	bind_conf->level |= ACCESS_FD_LISTENERS;
 
-	if (!memprintf(&path, "sockpair@%d", mworker_proc->ipc_fd[1])) {
+	if (!memprintf(&path, "sockpair@%d", proc->ipc_fd[1])) {
 		ha_alert("Cannot allocate listener.\n");
 		goto error;
 	}
 
 	if (!str2listener(path, global.cli_fe, bind_conf, "master-socket", 0, &err)) {
 		free(path);
-		ha_alert("Cannot create a CLI sockpair listener for process #%d\n", proc);
+		ha_alert("Cannot create a CLI sockpair listener.\n");
 		goto error;
 	}
 	ha_free(&path);
@@ -3257,8 +3894,7 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 	return 0;
 
 error:
-	close(mworker_proc->ipc_fd[0]);
-	close(mworker_proc->ipc_fd[1]);
+	close(proc->ipc_fd[1]);
 	free(err);
 
 	return -1;
@@ -3266,22 +3902,29 @@ error:
 
 static struct applet cli_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<CLI>", /* used for logging */
 	.fct = cli_io_handler,
+	.rcv_buf = appctx_raw_rcv_buf,
+	.snd_buf = appctx_raw_snd_buf,
 	.release = cli_release_handler,
 };
 
 /* master CLI */
 static struct applet mcli_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<MCLI>", /* used for logging */
 	.fct = cli_io_handler,
+	.rcv_buf = appctx_raw_rcv_buf,
+	.snd_buf = appctx_raw_snd_buf,
 	.release = cli_release_handler,
 };
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "help", NULL },                      NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
+	{ { "echo", NULL },                      "echo <text>                             : print text to the output",                                cli_parse_echo,   NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "prompt", NULL },                    NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "quit", NULL },                      NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "_getsocks", NULL },                 NULL,                                                                                                _getsocks, NULL },
@@ -3296,13 +3939,15 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "set", "severity-output",  NULL },   "set severity-output [none|number|string]: set presence of severity level in feedback information",  cli_parse_set_severity_output, NULL, NULL },
 	{ { "set", "timeout",  NULL },           "set timeout [cli] <delay>               : change a timeout setting",                                cli_parse_set_timeout, NULL, NULL },
 	{ { "show", "anon", NULL },              "show anon                               : display the current state of anonymized mode",            cli_parse_show_anon, NULL },
-	{ { "show", "env",  NULL },              "show env [var]                          : dump environment variables known to the process",         cli_parse_show_env, cli_io_handler_show_env, NULL },
+	{ { "show", "env",  NULL },              "show env [var]                          : dump environment variables known to the process",         cli_parse_show_env, cli_io_handler_show_env, NULL, NULL, ACCESS_MASTER },
 	{ { "show", "cli", "sockets",  NULL },   "show cli sockets                        : dump list of cli sockets",                                cli_parse_default, cli_io_handler_show_cli_sock, NULL, NULL, ACCESS_MASTER },
 	{ { "show", "cli", "level", NULL },      "show cli level                          : display the level of the current CLI session",            cli_parse_show_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "show", "fd", NULL },                "show fd [-!plcfbsd]* [num]              : dump list of file descriptors in use or a specific one",  cli_parse_show_fd, cli_io_handler_show_fd, NULL },
 	{ { "show", "version", NULL },           "show version                            : show version of the current process",                     cli_parse_show_version, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "operator", NULL },                  "operator                                : lower the level of the current CLI session to operator",  cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "user", NULL },                      "user                                    : lower the level of the current CLI session to user",      cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
+	{ { "wait", NULL },                      "wait {-h|<delay_ms>} cond [args...]     : wait the specified delay or condition (-h to see list)",  cli_parse_wait, cli_io_handler_wait, cli_release_wait, NULL },
+	{ { "_send_status", NULL },              NULL,  											      _send_status, NULL, NULL, NULL, ACCESS_MASTER_ONLY },
 	{{},}
 }};
 

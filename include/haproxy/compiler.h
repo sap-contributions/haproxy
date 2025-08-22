@@ -55,6 +55,24 @@
 #define ___equals_1(x)       ____equals_1(comma_for_one ## x 1)
 #define __equals_1(x)        ___equals_1(x)
 
+/* same but checks if defined as zero, useful to distinguish between -DFOO and
+ * -DFOO=0.
+ */
+#define comma_for_zero0 ,
+#define _____equals_0(x, y, ...) (y)
+#define ____equals_0(x, ...) _____equals_0(x, 0)
+#define ___equals_0(x)       ____equals_0(comma_for_zero ## x 1)
+#define __equals_0(x)        ___equals_0(x)
+
+/* same but checks if defined as empty, useful to distinguish between -DFOO= and
+ * -DFOO=anything.
+ */
+#define comma_for_empty ,
+#define _____def_as_empty(x, y, ...) (y)
+#define ____def_as_empty(x, ...) _____def_as_empty(x, 0)
+#define ___def_as_empty(x)       ____def_as_empty(comma_for_empty ## x 1)
+#define __def_as_empty(x)        ___def_as_empty(x)
+
 /* gcc 5 and clang 3 brought __has_attribute(), which is not well documented in
  * the case of gcc, but is convenient since handled at the preprocessor level.
  * In both cases it's possible to test for __has_attribute() using ifdef. When
@@ -64,6 +82,14 @@
  */
 #ifndef __has_attribute
 #define __has_attribute(x) __equals_1(__has_attribute_ ## x)
+#endif
+
+/* gcc 10 and clang 3 brought __has_builtin() to test if a builtin exists.
+ * Just like above, if it doesn't exist, we remap it to a macro allowing us
+ * to define these ourselves by defining __has_builtin_<name> to 1.
+ */
+#ifndef __has_builtin
+#define __has_builtin(x) __equals_1(__has_builtin_ ## x)
 #endif
 
 /* The fallthrough attribute arrived with gcc 7, the same version that started
@@ -183,6 +209,11 @@
 #define __read_mostly           HA_SECTION("read_mostly")
 #endif
 
+/* __builtin_unreachable() was added in gcc 4.5 */
+#if defined(__GNUC__) && (__GNUC__ >= 5 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5))
+#define __has_builtin___builtin_unreachable 1
+#endif
+
 /* This allows gcc to know that some locations are never reached, for example
  * after a longjmp() in the Lua code, hence that some errors caught by such
  * methods cannot propagate further. This is important with gcc versions 6 and
@@ -192,12 +223,49 @@
 #ifdef DEBUG_USE_ABORT
 #define my_unreachable() abort()
 #else
-#if defined(__GNUC__) && (__GNUC__ >= 5 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5))
+#if __has_builtin(__builtin_unreachable)
 #define my_unreachable() __builtin_unreachable()
 #else
 #define my_unreachable() do { } while (1)
 #endif
 #endif
+
+/* By using an unreachable statement, we can tell the compiler that certain
+ * conditions are not expected to be met and let it arrange as it wants to
+ * optimize some checks away. The principle is to place a test on the condition
+ * and call unreachable upon a match. It may also help static code analyzers
+ * know that some conditions are not supposed to happen. This can only be used
+ * with compilers that support it, and we do not want to emit any static code
+ * for other ones, so we use a construct that the compiler should easily be
+ * able to optimize away. Clang also has __builtin_assume() since at least 3.x.
+ * In addition, ASSUME_NONNULL() tells the compiler that the pointer argument
+ * will never be null. If not supported, it will be disguised via an assembly
+ * step.
+ */
+#if __has_builtin(__builtin_assume)
+# define ASSUME(expr) __builtin_assume(expr)
+# define ASSUME_NONNULL(p) ({ typeof(p) __p = (p); __builtin_assume(__p != NULL); (__p); })
+#elif __has_builtin(__builtin_unreachable)
+# define ASSUME(expr) do { if (!(expr)) __builtin_unreachable(); } while (0)
+# define ASSUME_NONNULL(p) ({ typeof(p) __p = (p); if (__p == NULL) __builtin_unreachable(); (__p); })
+#else
+# define ASSUME(expr) do { if (!(expr)) break; } while (0)
+# define ASSUME_NONNULL(p) ({ typeof(p) __p = (p); asm("" : "=rm"(__p) : "0"(__p)); __p; })
+#endif
+
+/* This prevents the compiler from folding multiple identical code paths into a
+ * single one, by adding a dependency on the line number in the path. This may
+ * typically happen on function tails, or purposely placed abort() before an
+ * unreachable() statement, due to the compiler performing an Identical Code
+ * Folding optimization. This macro is aimed at helping with code tracing in
+ * crash dumps and may also be used for specific optimizations. One known case
+ * is gcc-4.7 and 4.8 which aggressively fold multiple ABORT_NOW() exit points
+ * and which causes wrong line numbers to be reported by the debugger (note
+ * that even newer compilers do this when using abort()). Please keep in mind
+ * that nothing prevents the compiler from folding the code after that point,
+ * but at least it will not fold the code before.
+ */
+#define DO_NOT_FOLD() do { asm volatile("" :: "i"(__LINE__)); } while (0)
 
 /* This macro may be used to block constant propagation that lets the compiler
  * detect a possible NULL dereference on a variable resulting from an explicit
@@ -233,6 +301,11 @@
 #define _TOSTR(x) #x
 #define TOSTR(x) _TOSTR(x)
 
+/* concatenates the two strings after resolving possible macros */
+#undef CONCAT // Turns out NetBSD defines it to the same in exec_elf.h
+#define _CONCAT(a,b) a ## b
+#define CONCAT(a,b) _CONCAT(a,b)
+
 /*
  * Gcc >= 3 provides the ability for the program to give hints to the
  * compiler about what branch of an if is most likely to be taken. This
@@ -248,6 +321,11 @@
 #define likely(x) (__builtin_expect((x) != 0, 1))
 #define unlikely(x) (__builtin_expect((x) != 0, 0))
 #endif
+#endif
+
+/* Define the missing __builtin_prefetch() for tcc. */
+#if defined(__TINYC__)
+#define __builtin_prefetch(addr, ...) do { } while (0)
 #endif
 
 #ifndef __GNUC_PREREQ__
@@ -272,7 +350,7 @@
  * <type> which has its member <name> stored at address <ptr>.
  */
 #ifndef container_of
-#define container_of(ptr, type, name) ((type *)(((void *)(ptr)) - ((long)&((type *)0)->name)))
+#define container_of(ptr, type, name) ((type *)(((char *)(ptr)) - offsetof(type, name)))
 #endif
 
 /* returns a pointer to the structure of type <type> which has its member <name>
@@ -281,7 +359,7 @@
 #ifndef container_of_safe
 #define container_of_safe(ptr, type, name) \
 	({ void *__p = (ptr); \
-		__p ? (type *)(__p - ((long)&((type *)0)->name)) : (type *)0; \
+		__p ? (type *)((char *)__p - offsetof(type, name)) : (type *)0; \
 	})
 #endif
 
@@ -444,12 +522,35 @@
 #define __decl_thread(decl)
 #endif
 
+/* The __decl_thread_var() statement declares a variable when threads are enabled
+ * or replaces it with an dummy statement to avoid placing a lone semi-colon. The
+ * purpose is to condition the presence of some variables or to the fact that
+ * threads are enabled, without having to enclose them inside an ugly
+ * #ifdef USE_THREAD/#endif clause.
+ */
+#ifdef USE_THREAD
+#define __decl_thread_var(decl) decl
+#else
+#define __decl_thread_var(decl) enum { CONCAT(_dummy_var_decl_,__LINE__), }
+#endif
+
 /* clang has a __has_feature() macro which reports true/false on a number of
  * internally supported features. Let's make sure this macro is always defined
  * and returns zero when not supported.
  */
 #ifndef __has_feature
 #define __has_feature(x) 0
+#endif
+
+/* gcc 15 throws warning if fixed-size char array does not contain a terminating
+ * NUL. gcc has an attribute 'nonstring', which allows to suppress this warning
+ * for such array declarations. But it's not the case for clang and other
+ * compilers.
+ */
+#if __has_attribute(nonstring)
+#define __nonstring __attribute__ ((nonstring))
+#else
+#define __nonstring
 #endif
 
 #endif /* _HAPROXY_COMPILER_H */

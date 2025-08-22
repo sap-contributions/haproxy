@@ -17,9 +17,14 @@
 #endif
 
 #if defined(__FreeBSD__)
+#include <sys/param.h>
+#if __FreeBSD_version < 1300058
 #include <elf.h>
 #include <dlfcn.h>
 extern void *__elf_aux_vector;
+#else
+#include <sys/auxv.h>
+#endif
 #endif
 
 #if defined(__NetBSD__)
@@ -30,12 +35,14 @@ extern void *__elf_aux_vector;
 #include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -47,6 +54,11 @@ extern void *__elf_aux_vector;
 #include <sys/auxv.h>
 #endif
 
+#if defined(USE_PRCTL)
+#include <sys/prctl.h>
+#endif
+
+#include <import/cebus_tree.h>
 #include <import/eb32sctree.h>
 #include <import/eb32tree.h>
 #include <import/ebmbtree.h>
@@ -54,6 +66,7 @@ extern void *__elf_aux_vector;
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/chunk.h>
+#include <haproxy/compiler.h>
 #include <haproxy/dgram.h>
 #include <haproxy/global.h>
 #include <haproxy/hlua.h>
@@ -71,6 +84,8 @@ extern void *__elf_aux_vector;
 #include <haproxy/task.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
+
+extern char **environ;
 
 /* This macro returns false if the test __x is false. Many
  * of the following parsing function must be abort the processing
@@ -109,6 +124,12 @@ THREAD_LOCAL unsigned int statistical_prng_state = 2463534242U;
 
 /* set to true if this is a static build */
 int build_is_static = 0;
+
+/* known file names, made of file_name_node, to be used with file_name_*() */
+struct {
+	struct ceb_node *root; // file names tree, used with cebus_*()
+	__decl_thread(HA_RWLOCK_T lock);
+} file_names = { 0 };
 
 /* A global static table to store hashed words */
 static THREAD_LOCAL char hash_word[NB_L_HASH_WORD][20];
@@ -947,13 +968,15 @@ struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, i
  * AF_CUST_EXISTING_FD.
  *
  * The matching protocol will be set into <proto> if non-null.
+ * The address protocol and transport types hints which are directly resolved
+ * will be set into <sa_type> if not NULL.
  *
  * Any known file descriptor is also assigned to <fd> if non-null, otherwise it
  * is forced to -1.
  */
 struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int *high, int *fd,
-                                      struct protocol **proto, char **err,
-                                      const char *pfx, char **fqdn, unsigned int opts)
+                                      struct protocol **proto, struct net_addr_type *sa_type,
+                                      char **err, const char *pfx, char **fqdn, int *alt, unsigned int opts)
 {
 	static THREAD_LOCAL struct sockaddr_storage ss;
 	struct sockaddr_storage *ret = NULL;
@@ -961,10 +984,10 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	char *back, *str2;
 	char *port1, *port2;
 	int portl, porth, porta;
-	int abstract = 0;
 	int new_fd = -1;
-	enum proto_type proto_type;
-	int ctrl_type;
+	enum proto_type proto_type = 0; // to shut gcc warning
+	int ctrl_type = 0; // to shut gcc warning
+	int alt_proto = 0;
 
 	portl = porth = porta = 0;
 	if (fqdn)
@@ -988,6 +1011,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	    ((opts & (PA_O_STREAM|PA_O_DGRAM)) == (PA_O_DGRAM|PA_O_STREAM) && (opts & PA_O_DEFAULT_DGRAM))) {
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
+		alt_proto = 1;
 	} else {
 		proto_type = PROTO_TYPE_STREAM;
 		ctrl_type = SOCK_STREAM;
@@ -1002,6 +1026,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		str2 += 6;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
+		alt_proto = 1;
 	}
 	else if (strncmp(str2, "quic+", 5) == 0) {
 		str2 += 5;
@@ -1011,27 +1036,28 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 	if (strncmp(str2, "unix@", 5) == 0) {
 		str2 += 5;
-		abstract = 0;
 		ss.ss_family = AF_UNIX;
 	}
 	else if (strncmp(str2, "uxdg@", 5) == 0) {
 		str2 += 5;
-		abstract = 0;
 		ss.ss_family = AF_UNIX;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
+		alt_proto = 1;
 	}
 	else if (strncmp(str2, "uxst@", 5) == 0) {
 		str2 += 5;
-		abstract = 0;
 		ss.ss_family = AF_UNIX;
 		proto_type = PROTO_TYPE_STREAM;
 		ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "abns@", 5) == 0) {
 		str2 += 5;
-		abstract = 1;
-		ss.ss_family = AF_UNIX;
+		ss.ss_family = AF_CUST_ABNS;
+	}
+	else if (strncmp(str2, "abnsz@", 5) == 0) {
+		str2 += 6;
+		ss.ss_family = AF_CUST_ABNSZ;
 	}
 	else if (strncmp(str2, "ip@", 3) == 0) {
 		str2 += 3;
@@ -1051,11 +1077,19 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		proto_type = PROTO_TYPE_STREAM;
 		ctrl_type = SOCK_STREAM;
 	}
+	else if (strncmp(str2, "mptcp4@", 7) == 0) {
+		str2 += 7;
+		ss.ss_family = AF_INET;
+		proto_type = PROTO_TYPE_STREAM;
+		ctrl_type = SOCK_STREAM;
+		alt_proto = 1;
+	}
 	else if (strncmp(str2, "udp4@", 5) == 0) {
 		str2 += 5;
 		ss.ss_family = AF_INET;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
+		alt_proto = 1;
 	}
 	else if (strncmp(str2, "tcp6@", 5) == 0) {
 		str2 += 5;
@@ -1063,11 +1097,19 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		proto_type = PROTO_TYPE_STREAM;
 		ctrl_type = SOCK_STREAM;
 	}
+	else if (strncmp(str2, "mptcp6@", 7) == 0) {
+		str2 += 7;
+		ss.ss_family = AF_INET6;
+		proto_type = PROTO_TYPE_STREAM;
+		ctrl_type = SOCK_STREAM;
+		alt_proto = 1;
+	}
 	else if (strncmp(str2, "udp6@", 5) == 0) {
 		str2 += 5;
 		ss.ss_family = AF_INET6;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
+		alt_proto = 1;
 	}
 	else if (strncmp(str2, "tcp@", 4) == 0) {
 		str2 += 4;
@@ -1075,11 +1117,19 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		proto_type = PROTO_TYPE_STREAM;
 		ctrl_type = SOCK_STREAM;
 	}
+	else if (strncmp(str2, "mptcp@", 6) == 0) {
+		str2 += 6;
+		ss.ss_family = AF_UNSPEC;
+		proto_type = PROTO_TYPE_STREAM;
+		ctrl_type = SOCK_STREAM;
+		alt_proto = 1;
+	}
 	else if (strncmp(str2, "udp@", 4) == 0) {
 		str2 += 4;
 		ss.ss_family = AF_UNSPEC;
 		proto_type = PROTO_TYPE_DGRAM;
 		ctrl_type = SOCK_DGRAM;
+		alt_proto = 1;
 	}
 	else if (strncmp(str2, "quic4@", 6) == 0) {
 		str2 += 6;
@@ -1101,9 +1151,16 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		str2 += 9;
 		ss.ss_family = AF_CUST_SOCKPAIR;
 	}
-	else if (strncmp(str2, "rev@", 3) == 0) {
+	else if (strncmp(str2, "rhttp@", 3) == 0) {
+		/* TODO duplicated code from check_kw_experimental() */
+		if (!experimental_directives_allowed) {
+			memprintf(err, "Address '%s' is experimental, must be allowed via a global 'expose-experimental-directives'", str2);
+			goto out;
+		}
+		mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
+
 		str2 += 4;
-		ss.ss_family = AF_CUST_REV_SRV;
+		ss.ss_family = AF_CUST_RHTTP_SRV;
 	}
 	else if (*str2 == '/') {
 		ss.ss_family = AF_UNIX;
@@ -1167,11 +1224,15 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 			goto out;
 		}
 	}
-	else if (ss.ss_family == AF_UNIX) {
+	else if (ss.ss_family == AF_UNIX || ss.ss_family == AF_CUST_ABNS || ss.ss_family == AF_CUST_ABNSZ) {
 		struct sockaddr_un *un = (struct sockaddr_un *)&ss;
 		int prefix_path_len;
 		int max_path_len;
 		int adr_len;
+		int abstract = 0;
+
+		if (ss.ss_family == AF_CUST_ABNS || ss.ss_family == AF_CUST_ABNSZ)
+			abstract = 1;
 
 		/* complete unix socket path name during startup or soft-restart is
 		 * <unix_bind_prefix><path>.<pid>.<bak|tmp>
@@ -1192,7 +1253,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 			memcpy(un->sun_path, pfx, prefix_path_len);
 		memcpy(un->sun_path + prefix_path_len + abstract, str2, adr_len + 1 - abstract);
 	}
-	else if (ss.ss_family == AF_CUST_REV_SRV) {
+	else if (ss.ss_family == AF_CUST_RHTTP_SRV) {
 		/* Nothing to do here. */
 	}
 	else { /* IPv4 and IPv6 */
@@ -1346,7 +1407,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		 */
 		new_proto = protocol_lookup(ss.ss_family,
 					    proto_type,
-					    ctrl_type == SOCK_DGRAM);
+					    alt_proto);
 
 		if (!new_proto && (!fqdn || !*fqdn) && (ss.ss_family != AF_CUST_EXISTING_FD)) {
 			memprintf(err, "unsupported %s protocol for %s family %d address '%s'%s",
@@ -1383,6 +1444,12 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		*fd = new_fd;
 	if (proto)
 		*proto = new_proto;
+	if (sa_type) {
+		sa_type->proto_type = proto_type;
+		sa_type->xprt_type = (ctrl_type == SOCK_DGRAM) ? PROTO_TYPE_DGRAM : PROTO_TYPE_STREAM;
+	}
+	if (alt)
+		*alt = alt_proto;
 	free(back);
 	return ret;
 }
@@ -1390,6 +1457,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 /* converts <addr> and <port> into a string representation of the address and port. This is sort
  * of an inverse of str2sa_range, with some restrictions. The supported families are AF_INET,
  * AF_INET6, AF_UNIX, and AF_CUST_SOCKPAIR. If the family is unsopported NULL is returned.
+ * If port is special value '-1', then only the address is represented and <map_ports> is ignored.
  * If map_ports is true, then the sign of the port is included in the output, to indicate it is
  * relative to the incoming port. AF_INET and AF_INET6 will be in the form "<addr>:<port>".
  * AF_UNIX will either be just the path (if using a pathname) or "abns@<path>" if it is abstract.
@@ -1412,8 +1480,11 @@ char * sa2str(const struct sockaddr_storage *addr, int port, int map_ports)
 		ptr = &((struct sockaddr_in6 *)addr)->sin6_addr;
 		break;
 	case AF_UNIX:
+	case AF_CUST_ABNS:
+	case AF_CUST_ABNSZ:
 		path = ((struct sockaddr_un *)addr)->sun_path;
-		if (path[0] == '\0') {
+		if (addr->ss_family == AF_CUST_ABNS ||
+		    addr->ss_family == AF_CUST_ABNSZ) {
 			const int max_length = sizeof(struct sockaddr_un) - offsetof(struct sockaddr_un, sun_path) - 1;
 			return memprintf(&out, "abns@%.*s", max_length, path+1);
 		} else {
@@ -1428,6 +1499,10 @@ char * sa2str(const struct sockaddr_storage *addr, int port, int map_ports)
 		BUG_ON(errno == ENOSPC);
 		return NULL;
 	}
+
+	if (port == -1)
+		return strdup(buffer); // address only
+
 	if (map_ports)
 		return memprintf(&out, "%s:%+d", buffer, port);
 	else
@@ -1859,6 +1934,8 @@ int addr_to_str(const struct sockaddr_storage *addr, char *str, int size)
 		ptr = &((struct sockaddr_in6 *)addr)->sin6_addr;
 		break;
 	case AF_UNIX:
+	case AF_CUST_ABNS:
+	case AF_CUST_ABNSZ:
 		memcpy(str, "unix", 5);
 		return addr->ss_family;
 	default:
@@ -1896,6 +1973,8 @@ int port_to_str(const struct sockaddr_storage *addr, char *str, int size)
 		port = ((struct sockaddr_in6 *)addr)->sin6_port;
 		break;
 	case AF_UNIX:
+	case AF_CUST_ABNS:
+	case AF_CUST_ABNSZ:
 		memcpy(str, "unix", 5);
 		return addr->ss_family;
 	default:
@@ -1918,6 +1997,7 @@ int addr_is_local(const struct netns_entry *ns,
                   const struct sockaddr_storage *orig)
 {
 	struct sockaddr_storage addr;
+	const struct proto_fam *fam;
 	int result;
 	int fd;
 
@@ -1927,7 +2007,10 @@ int addr_is_local(const struct netns_entry *ns,
 	memcpy(&addr, orig, sizeof(addr));
 	set_host_port(&addr, 0);
 
-	fd = my_socketat(ns, addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	fam = proto_fam_lookup(addr.ss_family);
+	BUG_ON(!fam);
+
+	fd = my_socketat(ns, fam->sock_domain, SOCK_DGRAM, IPPROTO_UDP);
 	if (fd < 0)
 		return -1;
 
@@ -1951,13 +2034,13 @@ int addr_is_local(const struct netns_entry *ns,
  * <map> with the hexadecimal representation of their ASCII-code (2 digits)
  * prefixed by <escape>, and will store the result between <start> (included)
  * and <stop> (excluded), and will always terminate the string with a '\0'
- * before <stop>. The position of the '\0' is returned if the conversion
- * completes. If bytes are missing between <start> and <stop>, then the
- * conversion will be incomplete and truncated. If <stop> <= <start>, the '\0'
- * cannot even be stored so we return <start> without writing the 0.
+ * before <stop>. If bytes are missing between <start> and <stop>, then the
+ * conversion will be incomplete and truncated.
  * The input string must also be zero-terminated.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
-const char hextab[16] = "0123456789ABCDEF";
+const char hextab[16] __nonstring = "0123456789ABCDEF";
 char *encode_string(char *start, char *stop,
 		    const char escape, const long *map,
 		    const char *string)
@@ -1977,8 +2060,9 @@ char *encode_string(char *start, char *stop,
 			string++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /*
@@ -2007,8 +2091,9 @@ char *encode_chunk(char *start, char *stop,
 			str++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /*
@@ -2017,8 +2102,9 @@ char *encode_chunk(char *start, char *stop,
  * is reached or NULL-byte is encountered. The result will
  * be stored between <start> (included) and <stop> (excluded). This
  * function will always try to terminate the resulting string with a '\0'
- * before <stop>, and will return its position if the conversion
- * completes.
+ * before <stop>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
@@ -2038,8 +2124,167 @@ char *escape_string(char *start, char *stop,
 			string++;
 		}
 		*start = '\0';
+		return start;
+	}
+	return NULL;
+}
+
+/* CBOR helper to encode an uint64 value with prefix (3bits MAJOR type)
+ * according to RFC8949
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
+                                char *start, char *stop, uint64_t value,
+                                uint8_t prefix)
+{
+	int nb_bytes = 0;
+
+	/*
+	 * For encoding logic, see:
+	 * https://www.rfc-editor.org/rfc/rfc8949.html#name-specification-of-the-cbor-e
+	 */
+	if (value < 24) {
+		/* argument is the value itself */
+		prefix |= value;
+	}
+	else {
+		if (value <= 0xFFU) {
+			/* 1-byte */
+			nb_bytes = 1;
+			prefix |= 24; // 0x18
+		}
+		else if (value <= 0xFFFFU) {
+			/* 2 bytes */
+			nb_bytes = 2;
+			prefix |= 25; // 0x19
+		}
+		else if (value <= 0xFFFFFFFFU) {
+			/* 4 bytes */
+			nb_bytes = 4;
+			prefix |= 26; // 0x1A
+		}
+		else {
+			/* 8 bytes */
+			nb_bytes = 8;
+			prefix |= 27; // 0x1B
+		}
+	}
+
+	start = ctx->e_fct_byte(ctx, start, stop, prefix);
+	if (start == NULL)
+		return NULL;
+
+	/* encode 1 byte at a time from higher bits to lower bits */
+	while (nb_bytes) {
+		uint8_t cur_byte = (value >> ((nb_bytes - 1) * 8)) & 0xFFU;
+
+		start = ctx->e_fct_byte(ctx, start, stop, cur_byte);
+		if (start == NULL)
+			return NULL;
+
+		nb_bytes--;
+	}
+
+	return start;
+}
+
+/* CBOR helper to encode an int64 value according to RFC8949
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop, int64_t value)
+{
+	uint64_t absolute_value = llabs(value);
+	int cbor_prefix;
+
+	/*
+	 * For encoding logic, see:
+	 * https://www.rfc-editor.org/rfc/rfc8949.html#name-specification-of-the-cbor-e
+	 */
+	if (value >= 0)
+		cbor_prefix = 0x00; // unsigned int
+	else {
+		cbor_prefix = 0x20; // negative int
+		/* N-1 for negative int */
+		absolute_value -= 1;
+	}
+	return cbor_encode_uint64_prefix(ctx, start, stop,
+	                                 absolute_value, cbor_prefix);
+}
+
+/* CBOR helper to encode a <prefix> string chunk according to RFC8949
+ *
+ * if <bytes> is NULL, then only the <prefix> (with length) will be
+ * emitted
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
+                               char *start, char *stop,
+                               const char *bytes, size_t len,
+                               uint8_t prefix)
+{
+
+	size_t it = 0;
+
+	/* write prefix (with text length as argument) */
+	start = cbor_encode_uint64_prefix(ctx, start, stop,
+	                                  len, prefix);
+	if (start == NULL)
+		return NULL;
+
+	/* write actual bytes if provided */
+	while (bytes && it < len) {
+		start = ctx->e_fct_byte(ctx, start, stop, bytes[it]);
+		if (start == NULL)
+			return NULL;
+		it++;
 	}
 	return start;
+}
+
+/* CBOR helper to encode a text chunk according to RFC8949
+ *
+ * if <text> is NULL, then only the text prefix (with length) will be emitted
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_text(struct cbor_encode_ctx *ctx,
+                       char *start, char *stop,
+                       const char *text, size_t len)
+{
+	return cbor_encode_bytes_prefix(ctx, start, stop, text, len, 0x60);
+}
+
+/* CBOR helper to encode a byte string chunk according to RFC8949
+ *
+ * if <bytes> is NULL, then only the byte string prefix (with length) will be
+ * emitted
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_bytes(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop,
+                        const char *bytes, size_t len)
+{
+	return cbor_encode_bytes_prefix(ctx, start, stop, bytes, len, 0x40);
 }
 
 /* Check a string for using it in a CSV output format. If the string contains
@@ -2052,10 +2297,18 @@ char *escape_string(char *start, char *stop,
  * It is useful if the escaped string is used between double quotes in the
  * format.
  *
- *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0, &trash));
+ *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0, 0, &trash));
  *
  * If <quote> is 1, the converter puts the quotes only if any reserved character
  * is present. If <quote> is 2, the converter always puts the quotes.
+ *
+ * If <oneline> is not 0, CRs are skipped and LFs are replaced by spaces.
+ * This re-format multi-lines strings to only one line. The purpose is to
+ * allow a line by line parsing but also to keep the output compliant with
+ * the CLI witch uses LF to defines the end of the response.
+ *
+ * If <oneline> is 2, In addition to previous action, the trailing spaces are
+ * removed.
  *
  * <output> is a struct buffer used for storing the output string.
  *
@@ -2071,7 +2324,7 @@ char *escape_string(char *start, char *stop,
  * the chunk. Please use csv_enc() instead if you want to replace the output
  * chunk.
  */
-const char *csv_enc_append(const char *str, int quote, struct buffer *output)
+const char *csv_enc_append(const char *str, int quote, int oneline, struct buffer *output)
 {
 	char *end = output->area + output->size;
 	char *out = output->area + output->data;
@@ -2087,6 +2340,19 @@ const char *csv_enc_append(const char *str, int quote, struct buffer *output)
 		*ptr++ = '"';
 
 	while (*str && ptr < end - 2) { /* -2 for reserving space for <"> and \0. */
+		if (oneline) {
+			if (*str == '\n' ) {
+				/* replace LF by a space */
+				*ptr++ = ' ';
+				str++;
+				continue;
+			}
+			else if (*str == '\r' ) {
+				/* skip CR */
+				str++;
+				continue;
+			}
+		}
 		*ptr = *str;
 		if (*str == '"') {
 			ptr++;
@@ -2098,6 +2364,12 @@ const char *csv_enc_append(const char *str, int quote, struct buffer *output)
 		}
 		ptr++;
 		str++;
+	}
+
+	if (oneline == 2) {
+		/* remove trailing spaces */
+		while (ptr > out && *(ptr - 1) == ' ')
+			ptr--;
 	}
 
 	if (quote)
@@ -2515,7 +2787,8 @@ const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags)
  * stored in <ret>. If an error is detected, the pointer to the unexpected
  * character is returned. If the conversion is successful, NULL is returned.
  */
-const char *parse_size_err(const char *text, unsigned *ret) {
+const char *parse_size_ui(const char *text, unsigned *ret)
+{
 	unsigned value = 0;
 
 	if (!isdigit((unsigned char)*text))
@@ -2556,6 +2829,76 @@ const char *parse_size_err(const char *text, unsigned *ret) {
 		if (value > ~0U >> 30)
 			return text;
 		value = value << 30;
+		break;
+	default:
+		return text;
+	}
+
+	if (*text != '\0' && *++text != '\0')
+		return text;
+
+	*ret = value;
+	return NULL;
+}
+
+/* this function converts the string starting at <text> to an ullong stored in
+ * <ret>. If an error is detected, the pointer to the unexpected character is
+ * returned. If the conversion is successful, NULL is returned.
+ */
+const char *parse_size_ull(const char *text, ullong *ret)
+{
+	ullong value = 0;
+
+	if (!isdigit((unsigned char)*text))
+		return text;
+
+	while (1) {
+		unsigned int j;
+
+		j = *text - '0';
+		if (j > 9)
+			break;
+		if (value > ~0ULL / 10)
+			return text;
+		value *= 10;
+		if (value > (value + j))
+			return text;
+		value += j;
+		text++;
+	}
+
+	switch (*text) {
+	case '\0':
+		break;
+	case 'K':
+	case 'k':
+		if (value > ~0ULL >> 10)
+			return text;
+		value = value << 10;
+		break;
+	case 'M':
+	case 'm':
+		if (value > ~0ULL >> 20)
+			return text;
+		value = value << 20;
+		break;
+	case 'G':
+	case 'g':
+		if (value > ~0ULL >> 30)
+			return text;
+		value = value << 30;
+		break;
+	case 'T':
+	case 't':
+		if (value > ~0ULL >> 40)
+			return text;
+		value = value << 40;
+		break;
+	case 'P':
+	case 'p':
+		if (value > ~0ULL >> 50)
+			return text;
+		value = value << 50;
 		break;
 	default:
 		return text;
@@ -2625,9 +2968,9 @@ bad_input:
 }
 
 /* copies at most <n> characters from <src> and always terminates with '\0' */
-char *my_strndup(const char *src, int n)
+char *my_strndup(const char *src, size_t n)
 {
-	int len = 0;
+	size_t len = 0;
 	char *ret;
 
 	while (len < n && src[len])
@@ -3344,7 +3687,7 @@ void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr)
 
 /* Try to convert IPv6 address to IPv4 address thanks to the
  * following mapping methods:
- *  - RFC4291 IPv4-Mapped IPv6 Address (prefered method)
+ *  - RFC4291 IPv4-Mapped IPv6 Address (preferred method)
  *    -> ::ffff:ip:v4
  *  - RFC4291 IPv4-Compatible IPv6 Address (deprecated, RFC3513 legacy for
  *    "IPv6 Addresses with Embedded IPv4 Addresses)
@@ -3376,7 +3719,7 @@ int v6tov4(struct in_addr *sin_addr, struct in6_addr *sin6_addr)
  *  1 (false) if the addr is not the same in both
  *  -1 (unable) if one of the addr is not AF_INET*
  */
-int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2, int check_port)
+int ipcmp(const struct sockaddr_storage *ss1, const struct sockaddr_storage *ss2, int check_port)
 {
 	if ((ss1->ss_family != AF_INET) && (ss1->ss_family != AF_INET6))
 		return -1;
@@ -3444,7 +3787,7 @@ int ipcmp2net(const struct sockaddr_storage *addr, const struct net_addr *net)
  * it is preserved, so that this function can be used to switch to another
  * address family with no risk. Returns a pointer to the destination.
  */
-struct sockaddr_storage *ipcpy(struct sockaddr_storage *source, struct sockaddr_storage *dest)
+struct sockaddr_storage *ipcpy(const struct sockaddr_storage *source, struct sockaddr_storage *dest)
 {
 	int prev_port;
 
@@ -3466,6 +3809,33 @@ struct sockaddr_storage *ipcpy(struct sockaddr_storage *source, struct sockaddr_
 
 	return dest;
 }
+
+/* Copy only the IP address from <saddr> socket address data into <buf> buffer.
+ * This is the responsibility of the caller to check the <buf> buffer is big
+ * enough to contain these socket address data.
+ * Return the number of bytes copied.
+ */
+size_t ipaddrcpy(unsigned char *buf, const struct sockaddr_storage *saddr)
+{
+	void *addr;
+	unsigned char *p;
+	size_t addr_len;
+
+	p = buf;
+	if (saddr->ss_family == AF_INET6) {
+		addr = &((struct sockaddr_in6 *)saddr)->sin6_addr;
+		addr_len = sizeof ((struct sockaddr_in6 *)saddr)->sin6_addr;
+	}
+	else {
+		addr = &((struct sockaddr_in *)saddr)->sin_addr;
+		addr_len = sizeof ((struct sockaddr_in *)saddr)->sin_addr;
+	}
+	memcpy(p, addr, addr_len);
+	p += addr_len;
+
+	return p - buf;
+}
+
 
 char *human_time(int t, short hz_div) {
 	static char rv[sizeof("24855d23h")+1];	// longest of "23h59m" and "59m59s"
@@ -4417,8 +4787,9 @@ int my_unsetenv(const char *name)
  * corresponding value. A variable is identified as a series of alphanumeric
  * characters or underscores following a '$' sign. The <in> string must be
  * free()able. NULL returns NULL. The resulting string might be reallocated if
- * some expansion is made. Variable names may also be enclosed into braces if
- * needed (eg: to concatenate alphanum characters).
+ * some expansion is made (an NULL will be returned on failure). Variable names
+ * may also be enclosed into braces if needed (eg: to concatenate alphanum
+ * characters).
  */
 char *env_expand(char *in)
 {
@@ -4473,6 +4844,9 @@ char *env_expand(char *in)
 		}
 
 		out = my_realloc2(out, out_len + (txt_end - txt_beg) + val_len + 1);
+		if (!out)
+			goto leave;
+
 		if (txt_end > txt_beg) {
 			memcpy(out + out_len, txt_beg, txt_end - txt_beg);
 			out_len += txt_end - txt_beg;
@@ -4487,6 +4861,7 @@ char *env_expand(char *in)
 
 	/* here we know that <out> was allocated and that we don't need <in> anymore */
 	free(in);
+leave:
 	return out;
 }
 
@@ -4668,38 +5043,6 @@ unsigned char utf8_next(const char *s, int len, unsigned int *c)
 	return code | ((p-(unsigned char *)s)&0x0f);
 }
 
-/* append a copy of string <str> (in a wordlist) at the end of the list <li>
- * On failure : return 0 and <err> filled with an error message.
- * The caller is responsible for freeing the <err> and <str> copy
- * memory area using free()
- */
-int list_append_word(struct list *li, const char *str, char **err)
-{
-	struct wordlist *wl;
-
-	wl = calloc(1, sizeof(*wl));
-	if (!wl) {
-		memprintf(err, "out of memory");
-		goto fail_wl;
-	}
-
-	wl->s = strdup(str);
-	if (!wl->s) {
-		memprintf(err, "out of memory");
-		goto fail_wl_s;
-	}
-
-	LIST_APPEND(li, &wl->list);
-
-	return 1;
-
-fail_wl_s:
-	free(wl->s);
-fail_wl:
-	free(wl);
-	return 0;
-}
-
 /* indicates if a memory location may safely be read or not. The trick consists
  * in performing a harmless syscall using this location as an input and letting
  * the operating system report whether it's OK or not. For this we have the
@@ -4844,13 +5187,23 @@ void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int
  *    "0x7f10b6557690 [48 c7 c0 0f 00 00 00 0f]"
  * It relies on may_access() to know if the bytes are dumpable, otherwise "--"
  * is emitted. A NULL <pfx> will be considered empty.
+ * if <n> is negative, then the bytes before the address are dumped instead, so
+ * that the address ends after the last byte. This can be handy for call traces
+ * where the code that follows hasn't been executed but the code that precedes
+ * usually contains a call instruction. In this case, the opening bracket uses
+ * a '<' instead of '[' to indicate that the address is at the ']'.
  */
 void dump_addr_and_bytes(struct buffer *buf, const char *pfx, const void *addr, int n)
 {
 	int ok = 0;
 	int i;
 
-	chunk_appendf(buf, "%s%#14lx [", pfx ? pfx : "", (long)addr);
+	chunk_appendf(buf, "%s%#14lx %c", pfx ? pfx : "", (long)addr, (n < 0) ? '<' : '[');
+
+	if (n < 0) {
+		addr += n;
+		n = -n;
+	}
 
 	for (i = 0; i < n; i++) {
 		if (i == 0 || (((long)(addr + i) ^ (long)(addr)) & 4096))
@@ -4859,6 +5212,58 @@ void dump_addr_and_bytes(struct buffer *buf, const char *pfx, const void *addr, 
 			chunk_appendf(buf, "%02x%s", ((uint8_t*)addr)[i], (i<n-1) ? " " : "]");
 		else
 			chunk_appendf(buf, "--%s", (i<n-1) ? " " : "]");
+	}
+}
+
+/* Dumps the 64 bytes around <addr> at the end of <output> with symbols
+ * decoding. An optional special pointer may be recognized (special), in
+ * which case its type (spec_type) and name (spec_name) will be reported.
+ * This is convenient for pool names but could be used for list heads or
+ * anything in that vein.
+*/
+void dump_area_with_syms(struct buffer *output, const void *base, const void *addr,
+                         const void *special, const char *spec_type, const char *spec_name)
+{
+	const char *start, *end, *p;
+	const void *tag;
+
+	chunk_appendf(output, "Contents around address %p+%lu=%p:\n", base, (ulong)(addr - base), addr);
+
+	/* dump in word-sized blocks */
+	start = (const void *)(((uintptr_t)addr - 32) & -sizeof(void*));
+	end   = (const void *)(((uintptr_t)addr + 32 + sizeof(void*) - 1) & -sizeof(void*));
+
+	while (start < end) {
+		dump_addr_and_bytes(output, "  ", start, sizeof(void*));
+		chunk_strcat(output, " [");
+		for (p = start; p < start + sizeof(void*); p++) {
+			if (!may_access(p))
+				chunk_strcat(output, "*");
+			else if (isprint((unsigned char)*p))
+				chunk_appendf(output, "%c", *p);
+			else
+				chunk_strcat(output, ".");
+		}
+
+		if (may_access(start))
+			tag = *(const void **)start;
+		else
+			tag = NULL;
+
+		if (special && tag == special) {
+			/* the pool can often be there so let's detect it */
+			chunk_appendf(output, "] [%s:%s", spec_type, spec_name);
+		}
+		else if (tag) {
+			/* print pointers that resolve to a symbol */
+			size_t back_data = output->data;
+			chunk_strcat(output, "] [");
+			if (!resolve_sym_name(output, NULL, tag))
+				output->data = back_data;
+		}
+
+		chunk_strcat(output, "]\n");
+		start = p;
 	}
 }
 
@@ -4980,6 +5385,7 @@ const char *get_exec_path()
 	if (execfn && execfn != ENOENT)
 		ret = (const char *)execfn;
 #elif defined(__FreeBSD__)
+#if __FreeBSD_version < 1300058
 	Elf_Auxinfo *auxv;
 	for (auxv = __elf_aux_vector; auxv->a_type != AT_NULL; ++auxv) {
 		if (auxv->a_type == AT_EXECPATH) {
@@ -4987,6 +5393,14 @@ const char *get_exec_path()
 			break;
 		}
 	}
+#else
+	static char execpath[MAXPATHLEN];
+
+	if (execpath[0] == '\0')
+		elf_aux_info(AT_EXECPATH, execpath, MAXPATHLEN);
+	if (execpath[0] != '\0')
+		ret = execpath;
+#endif
 #elif defined(__NetBSD__)
 	AuxInfo *auxv;
 	for (auxv = _dlauxinfo(); auxv->a_type != AT_NULL; ++auxv) {
@@ -5115,59 +5529,141 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		const void *func;
 		const char *name;
 	} fcts[] = {
-		{ .func = process_stream, .name = "process_stream" },
-		{ .func = task_run_applet, .name = "task_run_applet" },
-		{ .func = sc_conn_io_cb, .name = "sc_conn_io_cb" },
-		{ .func = sock_conn_iocb, .name = "sock_conn_iocb" },
-		{ .func = dgram_fd_handler, .name = "dgram_fd_handler" },
-		{ .func = listener_accept, .name = "listener_accept" },
-		{ .func = manage_global_listener_queue, .name = "manage_global_listener_queue" },
-		{ .func = poller_pipe_io_handler, .name = "poller_pipe_io_handler" },
-		{ .func = mworker_accept_wrapper, .name = "mworker_accept_wrapper" },
-		{ .func = session_expire_embryonic, .name = "session_expire_embryonic" },
+#define DEF_SYM(sym, ...) { .func = ({ __VA_ARGS__; sym; }), .name = #sym }
+		DEF_SYM(process_stream),
+		DEF_SYM(task_run_applet),
+		DEF_SYM(run_poll_loop),
+		DEF_SYM(run_tasks_from_lists),
+		DEF_SYM(process_runnable_tasks),
+		DEF_SYM(sc_conn_io_cb),
+		DEF_SYM(sock_conn_iocb),
+		DEF_SYM(dgram_fd_handler),
+		DEF_SYM(listener_accept),
+		DEF_SYM(manage_global_listener_queue),
+		DEF_SYM(poller_pipe_io_handler),
+		DEF_SYM(mworker_accept_wrapper),
+		DEF_SYM(session_expire_embryonic),
+		DEF_SYM(ha_dump_backtrace, extern void ha_dump_backtrace(struct buffer *, const char *, int)),
+		DEF_SYM(cli_io_handler, extern void cli_io_handler(struct appctx*)),
 #ifdef USE_THREAD
-		{ .func = accept_queue_process, .name = "accept_queue_process" },
+		DEF_SYM(accept_queue_process),
 #endif
 #ifdef USE_LUA
-		{ .func = hlua_process_task, .name = "hlua_process_task" },
+		DEF_SYM(hlua_process_task),
 #endif
 #ifdef SSL_MODE_ASYNC
-		{ .func = ssl_async_fd_free, .name = "ssl_async_fd_free" },
-		{ .func = ssl_async_fd_handler, .name = "ssl_async_fd_handler" },
+		DEF_SYM(ssl_async_fd_free),
+		DEF_SYM(ssl_async_fd_handler),
 #endif
 #ifdef USE_QUIC
-		{ .func = quic_conn_sock_fd_iocb, .name = "quic_conn_sock_fd_iocb" },
+		DEF_SYM(quic_conn_sock_fd_iocb),
 #endif
+#undef DEF_SYM
 	};
 
 #if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
-	Dl_info dli, dli_main;
-	size_t size;
+	static Dl_info dli_main;
+	static int dli_main_done; // 0 = not resolved, 1 = resolve in progress, 2 = done
+	__decl_thread_var(static HA_SPINLOCK_T dladdr_lock);
+	sigset_t new_mask, old_mask;
+	int isolated;
+	Dl_info dli;
+	size_t size = 0;
 	const char *fname, *p;
 #endif
-	int i;
+	size_t dist, best_dist;
+	int i, best_idx;
 
 	if (pfx)
 		chunk_appendf(buf, "%s", pfx);
 
+	best_idx = -1; best_dist = ~0;
 	for (i = 0; i < sizeof(fcts) / sizeof(fcts[0]); i++) {
-		if (addr == fcts[i].func) {
-			chunk_appendf(buf, "%s", fcts[i].name);
-			return addr;
+		if (addr < (void*)fcts[i].func)
+			continue;
+		dist = addr - (void*)fcts[i].func;
+		if (dist < (1<<18) && dist < best_dist) {
+			best_dist = dist;
+			best_idx = i;
+			if (!dist)
+				break;
 		}
 	}
 
+	/* if that's an exact match, no need to call dl_addr. This happens
+	 * when showing callback pointers for example, but not in backtraces.
+	 */
+	if (!best_dist)
+		goto use_array;
+
 #if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
 	/* Now let's try to be smarter */
-	if (!dladdr_and_size(addr, &dli, &size))
-		goto unknown;
+
+	/* dladdr_and_size() can be super expensive and will often rely on a
+	 * mutex inside the library to deal with concurrent accesses. We don't
+	 * want to inflict this to parallel callers who could wait much too
+	 * long (e.g. during a wdt warning). Thus, we'll do the following:
+	 *   - if we're isolated or in a panic, we're safe and don't need to
+	 *     lock so we don't wait.
+	 *   - otherwise we use a trylock and we fail on conflict so that
+	 *     noone waits when there is contention.
+	 */
+	isolated = thread_isolated() || (get_tainted() & TAINTED_PANIC);
+
+	if (!isolated &&
+	    HA_SPIN_TRYLOCK(OTHER_LOCK, &dladdr_lock) != 0)
+		goto use_array;
+
+	/* make sure we don't re-enter from wdt nor debug coming from other
+	 * threads as dladdr() is not re-entrant. We'll block these sensitive
+	 * signals while possibly dumping a backtrace.
+	 */
+	sigemptyset(&new_mask);
+#ifdef WDTSIG
+	sigaddset(&new_mask, WDTSIG);
+#endif
+#ifdef DEBUGSIG
+	sigaddset(&new_mask, DEBUGSIG);
+#endif
+	ha_sigmask(SIG_BLOCK, &new_mask, &old_mask);
+
+	/* now resolve the symbol */
+	i = dladdr_and_size(addr, &dli, &size);
+
+	if (!i) {
+		/* unblock temporarily blocked signals */
+		ha_sigmask(SIG_SETMASK, &old_mask, NULL);
+
+		if (!isolated)
+			HA_SPIN_UNLOCK(OTHER_LOCK, &dladdr_lock);
+		goto use_array;
+	}
 
 	/* 1. prefix the library name if it's not the same object as the one
 	 * that contains the main function. The name is picked between last '/'
 	 * and first following '.'.
 	 */
-	if (!dladdr(main, &dli_main))
-		dli_main.dli_fbase = NULL;
+
+	/* let's check main only once, no need to do it all the time */
+
+	i = HA_ATOMIC_LOAD(&dli_main_done);
+	while (i < 2) {
+		i = 0;
+		if (HA_ATOMIC_CAS(&dli_main_done, &i, 1)) {
+			/* we're the first ones, resolve it */
+			if (!dladdr(main, &dli_main))
+				dli_main.dli_fbase = NULL;
+			HA_ATOMIC_STORE(&dli_main_done, 2); // done
+			break;
+		}
+		ha_thread_relax();
+	}
+
+	/* unblock temporarily blocked signals */
+	ha_sigmask(SIG_SETMASK, &old_mask, NULL);
+
+	if (!isolated)
+		HA_SPIN_UNLOCK(OTHER_LOCK, &dladdr_lock);
 
 	if (dli_main.dli_fbase != dli.dli_fbase) {
 		fname = dli.dli_fname;
@@ -5198,12 +5694,60 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		return NULL;
 	}
 #endif /* __ELF__ && !__linux__ || USE_DL */
- unknown:
-	/* unresolved symbol from the main file, report relative offset to main */
-	if ((void*)addr < (void*)main)
+ use_array:
+	/* either exact match from the array, or unresolved symbol for which we
+	 * may have a close match. Otherwise we report an offset relative to main.
+	 */
+	if (best_idx >= 0) {
+		chunk_appendf(buf, "%s+%#lx", fcts[best_idx].name, (long)best_dist);
+		return best_dist == 0 ? addr : NULL;
+	}
+	else if ((void*)addr < (void*)main)
 		chunk_appendf(buf, "main-%#lx", (long)((void*)main - addr));
 	else
 		chunk_appendf(buf, "main+%#lx", (long)(addr - (void*)main));
+	return NULL;
+}
+
+/* Tries to append to buffer <buf> the DSO name containing the symbol at address
+ * <addr>. The name (lib or executable) is limited to what lies between the last
+ * '/' and the first following '.'. An optional prefix <pfx> is prepended before
+ * the output if not null. It returns "*unknown*" when the symbol is not found.
+ *
+ * The symbol's address is returned, or NULL when unresolved, in order to allow
+ * the caller to match it against known ones.
+ */
+const void *resolve_dso_name(struct buffer *buf, const char *pfx, const void *addr)
+{
+#if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
+	Dl_info dli;
+	size_t size;
+	const char *fname, *p;
+
+	/* Now let's try to be smarter */
+	if (!dladdr_and_size(addr, &dli, &size))
+		goto unknown;
+
+	if (pfx) {
+		chunk_appendf(buf, "%s", pfx);
+		pfx = NULL;
+	}
+
+	/* keep the part between '/' and '.' */
+	fname = dli.dli_fname;
+	p = strrchr(fname, '/');
+	if (p++)
+		fname = p;
+	p = strchr(fname, '.');
+	if (!p)
+		p = fname + strlen(fname);
+	chunk_appendf(buf, "%.*s", (int)(long)(p - fname), fname);
+	return addr;
+ unknown:
+#endif /* __ELF__ && !__linux__ || USE_DL */
+
+	/* unknown symbol */
+	chunk_appendf(buf, "%s*unknown*", pfx ? pfx : "");
 	return NULL;
 }
 
@@ -5473,10 +6017,10 @@ void ha_random_jump96(uint32_t dist)
 	}
 }
 
-/* Generates an RFC4122 UUID into chunk <output> which must be at least 37
- * bytes large.
+/* Generates an RFC 9562 version 4 UUID into chunk
+ * <output> which must be at least 37 bytes large.
  */
-void ha_generate_uuid(struct buffer *output)
+void ha_generate_uuid_v4(struct buffer *output)
 {
 	uint32_t rnd[4];
 	uint64_t last;
@@ -5497,6 +6041,95 @@ void ha_generate_uuid(struct buffer *output)
 	             (long long)((rnd[2] >> 14u) | ((uint64_t) rnd[3] << 18u)) & 0xFFFFFFFFFFFFull);
 }
 
+/* Generates an RFC 9562 version 7 UUID into chunk
+ * <output> which must be at least 37 bytes large.
+ */
+void ha_generate_uuid_v7(struct buffer *output)
+{
+	uint32_t rnd[3];
+	uint64_t last;
+	uint64_t time;
+
+	time = (date.tv_sec * 1000) + (date.tv_usec / 1000);
+	last = ha_random64();
+	rnd[0] = last;
+	rnd[1] = last >> 32;
+
+	last = ha_random64();
+	rnd[2] = last;
+
+	chunk_printf(output, "%8.8x-%4.4x-%4.4x-%4.4x-%12.12llx",
+	             (uint)(time >> 16u),
+	             (uint)(time & 0xFFFF),
+	             ((rnd[0] >> 16u) & 0xFFF) | 0x7000,  // highest 4 bits indicate the uuid version
+	             (rnd[1] & 0x3FFF) | 0x8000,  // the highest 2 bits indicate the UUID variant (10),
+	             (long long)((rnd[1] >> 14u) | ((uint64_t) rnd[2] << 18u)) & 0xFFFFFFFFFFFFull);
+}
+
+
+/* See is_path_mode(). This version is for internal use and uses a va_list. */
+static int _is_path_mode(mode_t mode, const char *path_fmt, va_list args)
+{
+	struct stat file_stat;
+	ssize_t ret;
+
+	chunk_reset(&trash);
+
+	ret = vsnprintf(trash.area, trash.size, path_fmt, args);
+	if (ret >= trash.size)
+		return 0;
+
+	if (stat(trash.area, &file_stat) != 0)
+		return 0;
+
+	return (file_stat.st_mode & S_IFMT) == mode;
+}
+
+/* Use <path_fmt> and following arguments as a printf format to build up the
+ * name of a file, which will be checked for existence and for mode matching
+ * <mode> among S_IF*. On success, non-zero is returned. On failure, zero is
+ * returned. The trash is destroyed.
+ */
+int is_path_mode(mode_t mode, const char *path_fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, path_fmt);
+	ret = _is_path_mode(mode, path_fmt, args);
+	va_end(args);
+	return ret;
+}
+
+/* Use <path_fmt> and following arguments as a printf format to build up the
+ * name of a file, which will be checked for existence. On success, non-zero
+ * is returned. On failure, zero is returned. The trash is destroyed.
+ */
+int is_file_present(const char *path_fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, path_fmt);
+	ret = _is_path_mode(S_IFREG, path_fmt, args);
+	va_end(args);
+	return ret;
+}
+
+/* Use <path_fmt> and following arguments as a printf format to build up the
+ * name of a directory, which will be checked for existence. On success, non-zero
+ * is returned. On failure, zero is returned. The trash is destroyed.
+ */
+int is_dir_present(const char *path_fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, path_fmt);
+	ret = _is_path_mode(S_IFDIR, path_fmt, args);
+	va_end(args);
+	return ret;
+}
 
 /* only used by parse_line() below. It supports writing in place provided that
  * <in> is updated to the next location before calling it. In that case, the
@@ -5536,7 +6169,9 @@ void ha_generate_uuid(struct buffer *output)
  * quote/brace is reported in <errptr> if not NULL. When using in-place parsing
  * error reporting might be difficult since zeroes will have been inserted into
  * the string. One solution for the caller may consist in replacing all args
- * delimiters with spaces in this case.
+ * delimiters with spaces in this case. As a convenience, the pointer to the
+ * first empty arg may be reported in errptr if that one was not assigned an
+ * error.
  */
 uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbargs, uint32_t opts, const char **errptr)
 {
@@ -5547,10 +6182,16 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 	size_t outmax = *outlen;
 	int argsmax = *nbargs - 1;
 	size_t outpos = 0;
+	size_t arg_start = 0; // copy of outpos before EMIT_CHAR().
+	const char *curr_in = in; // <in> at the beginning of the loop
+	const char *begin_new_arg = NULL; // <in> at transition to new arg
+	const char *empty_arg_ptr = NULL; // pos of first empty arg if any (wrt in)
 	int squote = 0;
 	int dquote = 0;
 	int arg = 0;
 	uint32_t err = 0;
+	int in_arg = 0;
+	int prev_in_arg = 0;
 
 	*nbargs = 0;
 	*outlen = 0;
@@ -5559,13 +6200,17 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 	if (arg < argsmax)
 		args[arg] = out;
 
+	arg_start = outpos;
 	while (1) {
+		prev_in_arg = in_arg;
+		curr_in = in;
+
 		if (*in >= '-' && *in != '\\') {
+			in_arg = 1;
 			/* speedup: directly send all regular chars starting
 			 * with '-', '.', '/', alnum etc...
 			 */
 			EMIT_CHAR(*in++);
-			continue;
 		}
 		else if (*in == '\0' || *in == '\n' || *in == '\r') {
 			/* end of line */
@@ -5576,6 +6221,7 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 			break;
 		}
 		else if (*in == '"' && !squote && (opts & PARSE_OPT_DQUOTE)) {  /* double quote outside single quotes */
+			in_arg = 1;
 			if (dquote) {
 				dquote = 0;
 				quote = NULL;
@@ -5585,9 +6231,9 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 				quote = in;
 			}
 			in++;
-			continue;
 		}
 		else if (*in == '\'' && !dquote && (opts & PARSE_OPT_SQUOTE)) { /* single quote outside double quotes */
+			in_arg = 1;
 			if (squote) {
 				squote = 0;
 				quote = NULL;
@@ -5597,7 +6243,6 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 				quote = in;
 			}
 			in++;
-			continue;
 		}
 		else if (*in == '\\' && !squote && (opts & PARSE_OPT_BKSLASH)) {
 			/* first, we'll replace \\, \<space>, \#, \r, \n, \t, \xXX with their
@@ -5606,6 +6251,7 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 			 */
 			char tosend = *in;
 
+			in_arg = 1;
 			switch (in[1]) {
 			case ' ':
 			case '\\':
@@ -5682,14 +6328,9 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 		}
 		else if (isspace((unsigned char)*in) && !squote && !dquote) {
 			/* a non-escaped space is an argument separator */
+			in_arg = 0;
 			while (isspace((unsigned char)*in))
 				in++;
-			EMIT_CHAR(0);
-			arg++;
-			if (arg < argsmax)
-				args[arg] = out + outpos;
-			else
-				err |= PARSE_ERR_TOOMANY;
 		}
 		else if (*in == '$' && (opts & PARSE_OPT_ENV) && (dquote || !(opts & PARSE_OPT_DQUOTE))) {
 			/* environment variables are evaluated anywhere, or only
@@ -5783,18 +6424,45 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 				while (*value) {
 					/* expand as individual parameters on a space character */
 					if (word_expand && isspace((unsigned char)*value)) {
-						EMIT_CHAR(0);
-						++arg;
-						if (arg < argsmax)
-							args[arg] = out + outpos;
-						else
-							err |= PARSE_ERR_TOOMANY;
+						in_arg = 0;
 
 						/* skip consecutive spaces */
 						while (isspace((unsigned char)*++value))
 							;
 					} else {
+						in_arg = 1;
 						EMIT_CHAR(*value++);
+					}
+					if (!prev_in_arg && in_arg) {
+						begin_new_arg = curr_in;
+						if (arg < argsmax)
+							args[arg] = out + arg_start;
+						else
+							err |= PARSE_ERR_TOOMANY;
+					}
+					if (prev_in_arg && !in_arg) {
+						if (!empty_arg_ptr && outpos == arg_start)
+							empty_arg_ptr = begin_new_arg;
+						EMIT_CHAR(0);
+						arg++;
+					}
+					prev_in_arg = in_arg;
+					arg_start = outpos;
+				}
+			}
+			else {
+				/* An unmatched environment variable was parsed.
+				 * Let's skip the trailing double-quote character
+				 * and spaces.
+				 */
+				in_arg = 1;
+				if (likely(*var_name != '.') && *in == '"') {
+					in++;
+					while (isspace((unsigned char)*in))
+						in++;
+					if (dquote) {
+						dquote = 0;
+						quote = NULL;
 					}
 				}
 			}
@@ -5802,20 +6470,35 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 		}
 		else {
 			/* any other regular char */
+			in_arg = 1;
 			EMIT_CHAR(*in++);
+		}
+
+		if (!prev_in_arg && in_arg) {
+			begin_new_arg = curr_in;
+			if (arg < argsmax)
+				args[arg] = out + arg_start;
+			else
+				err |= PARSE_ERR_TOOMANY;
+		}
+
+		if (prev_in_arg && !in_arg) {
+			if (!empty_arg_ptr && outpos == arg_start)
+				empty_arg_ptr = begin_new_arg;
+			EMIT_CHAR(0);
+			arg++;
+			arg_start = outpos;
 		}
 	}
 
 	/* end of output string */
-	EMIT_CHAR(0);
-
-	/* Don't add an empty arg after trailing spaces. Note that args[arg]
-	 * may contain some distances relative to NULL if <out> was NULL, or
-	 * pointers beyond the end of <out> in case <outlen> is too short, thus
-	 * we must not dereference it.
-	 */
-	if (arg < argsmax && args[arg] != out + outpos - 1)
+	if (in_arg) {
+		if (!empty_arg_ptr && outpos == arg_start)
+			empty_arg_ptr = begin_new_arg;
+		EMIT_CHAR(0);
 		arg++;
+		arg_start = outpos;
+	}
 
 	if (quote) {
 		/* unmatched quote */
@@ -5825,6 +6508,10 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 		goto leave;
 	}
  leave:
+	/* make sure empty lines are terminated */
+	if (!arg)
+		EMIT_CHAR(0);
+
 	*nbargs = arg;
 	*outlen = outpos;
 
@@ -5837,6 +6524,9 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 	while (arg >= 0 && arg <= argsmax)
 		args[arg++] = out + outpos - 1;
 
+	/* if no error but an empty arg, report its pointer in errptr for convenience */
+	if (empty_arg_ptr && errptr && !err)
+		*errptr = empty_arg_ptr;
 	return err;
 }
 #undef EMIT_CHAR
@@ -5944,10 +6634,10 @@ void update_word_fingerprint(uint8_t *fp, const char *word)
 
 	from = 28; // begin
 	for (p = word; *p; p++) {
-		c = tolower(*p);
+		c = tolower((unsigned char)*p);
 		switch(c) {
 		case 'a'...'z': to = c - 'a' + 1; break;
-		case 'A'...'Z': to = tolower(c) - 'a' + 1; break;
+		case 'A'...'Z': to = tolower((unsigned char )c) - 'a' + 1; break;
 		case '0'...'9': to = 27; break;
 		default:        to = 28; break;
 		}
@@ -6020,7 +6710,7 @@ const char *hash_ipanon(uint32_t scramble, char *ipstring, int hasport)
 			sa = &ss;
 		}
 		else {
-			sa = str2sa_range(ipstring, NULL, NULL, NULL, NULL, NULL, &errmsg, NULL, NULL,
+			sa = str2sa_range(ipstring, NULL, NULL, NULL, NULL, NULL, NULL, &errmsg, NULL, NULL, NULL,
 					  PA_O_PORT_OK | PA_O_STREAM | PA_O_DGRAM | PA_O_XPRT | PA_O_CONNECT |
 					  PA_O_PORT_RANGE | PA_O_PORT_OFS | PA_O_RESOLVE);
 			if (sa == NULL) {
@@ -6064,6 +6754,8 @@ const char *hash_ipanon(uint32_t scramble, char *ipstring, int hasport)
 				break;
 
 			case AF_UNIX:
+			case AF_CUST_ABNS:
+			case AF_CUST_ABNSZ:
 				return HA_ANON_STR(scramble, ipstring);
 				break;
 
@@ -6151,6 +6843,94 @@ int openssl_compare_current_name(const char *name)
 	}
 #endif
 	return 1;
+}
+
+/* prctl/PR_SET_VMA wrapper to easily give a name to virtual memory areas,
+ * knowing their address and size.
+ *
+ * It is only intended for use with memory allocated using mmap (private or
+ * shared anonymous maps) or malloc (provided that <size> is at least one page
+ * large), which is memory that may be released using munmap(). For memory
+ * allocated using malloc(), no naming will be attempted if the vma is less
+ * than one page large, because naming is only relevant for large memory
+ * blocks. For instance, glibc/malloc() will directly use mmap() once
+ * MMAP_THRESHOLD is reached (defaults to 128K), and will try to use the
+ * heap as much as possible below that.
+ *
+ * <type> and <name> are mandatory
+ * <id> is optional, if != ~0, will be used to append an id after the name
+ * in order to differentiate 2 entries set using the same <type> and <name>
+ *
+ * The function does nothing if naming API is not available, and naming errors
+ * are ignored.
+ */
+void vma_set_name_id(void *addr, size_t size, const char *type, const char *name, unsigned int id)
+{
+	long pagesize = sysconf(_SC_PAGESIZE);
+	void *aligned_addr;
+	__maybe_unused size_t aligned_size;
+
+	BUG_ON(!type || !name);
+
+	/* prctl/PR_SET/VMA expects the start of an aligned memory address, but
+	 * user may have provided address returned by malloc() which may not be
+	 * aligned nor point to the beginning of the map
+	 */
+	aligned_addr = (void *)((uintptr_t)addr & -4096);
+	aligned_size = (((addr +  size) - aligned_addr) + 4095) & -4096;
+
+	if (aligned_addr != addr) {
+		/* provided pointer likely comes from malloc(), at least it
+		 * doesn't come from mmap() which only returns aligned addresses
+		 */
+		if (size < pagesize)
+			return;
+	}
+#if defined(USE_PRCTL) && defined(PR_SET_VMA)
+	{
+		/*
+		 * From Linux 5.17 (and if the `CONFIG_ANON_VMA_NAME` kernel config is set)`,
+		 * anonymous regions can be named.
+		 * We intentionally ignore errors as it should not jeopardize the memory context
+		 * mapping whatsoever (e.g. older kernels).
+		 *
+		 * The naming can take up to 79 characters, accepting valid ASCII values
+		 * except [, ], \, $ and '.
+		 * As a result, when looking for /proc/<pid>/maps, we can see the anonymous range
+		 * as follow :
+		 * `7364c4fff000-736508000000 rw-s 00000000 00:01 3540  [anon_shmem:scope:name{-id}]`
+		 * (MAP_SHARED)
+		 * `7364c4fff000-736508000000 rw-s 00000000 00:01 3540  [anon:scope:name{-id}]`
+		 * (MAP_PRIVATE)
+		 */
+		char fullname[80];
+		int rn;
+
+		if (id != ~0)
+			rn = snprintf(fullname, sizeof(fullname), "%s:%s-%u", type, name, id);
+		else
+			rn = snprintf(fullname, sizeof(fullname), "%s:%s", type, name);
+
+		if (rn >= 0) {
+			/* Give a name to the map by setting PR_SET_VMA_ANON_NAME attribute
+			 * using prctl/PR_SET_VMA combination.
+			 *
+			 * note from 'man prctl':
+			 *   assigning an attribute to a virtual memory area might prevent it
+			 *   from being merged with adjacent virtual memory areas due to the
+			 *   difference in that attribute's value.
+			 */
+			(void)prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+			            aligned_addr, aligned_size, fullname);
+		}
+	}
+#endif
+}
+
+/* wrapper for vma_set_name_id() but without id */
+void vma_set_name(void *addr, size_t size, const char *type, const char *name)
+{
+	vma_set_name_id(addr, size, type, name, ~0);
 }
 
 #if defined(RTLD_DEFAULT) || defined(RTLD_NEXT)
@@ -6280,12 +7060,282 @@ void *dlopen(const char *filename, int flags)
 static int init_tools_per_thread()
 {
 	/* Let's make each thread start from a different position */
-	statistical_prng_state += tid * MAX_THREADS;
+	statistical_prng_state += ha_random32();
 	if (!statistical_prng_state)
 		statistical_prng_state++;
 	return 1;
 }
 REGISTER_PER_THREAD_INIT(init_tools_per_thread);
+
+/* reads at most one less than <size> from an arbitrary memory buffer and
+ * imitates the fgets behaviour, i.e. stops at '\n' or at 'EOF' and returns read
+ * data in the area pointed by <*buf>. <*position> ptr keeps the current
+ * position, from which we will start/resume reading, <*end> is a ptr to the end
+ * of the buffer to read, as we suppose don't have the EOF (see more details on
+ * it in load_cfg_in_mem(), which is now the only one producer of memory buffers
+ * to read for fgets_from_mem).
+ */
+char *fgets_from_mem(char* buf, int size, const char **position, const char *end)
+{
+	char *new_pos;
+	int len = 0;
+
+	/* keep fgets behaviour */
+	if (size <= 0)
+		return NULL;
+
+	/* EOF */
+	if (*position == end)
+		return NULL;
+
+	size--; /* keep fgets behaviour, reads at most one less than size */
+	if (size > end - *position)
+		size = end - *position;
+
+	new_pos = memchr(*position, '\n', size);
+	if (new_pos) {
+		/* '+1' to grab and copy '\n' at the end of line */
+		len = (new_pos + 1) - *position;
+	} else {
+		/* just copy either the given size, or the rest of the line
+		 * until the end
+		 */
+		len = MIN((end - *position), size);
+	}
+
+	memcpy(buf, *position, len);
+	*(buf + len)  = '\0';
+	*position += len;
+
+	return buf;
+}
+
+/* Does a backup of the process environment variables. Returns 0 on success and
+ * -1 on failure, which can happen only due to the lack of memory.
+ */
+int backup_env(void)
+{
+	char **env = environ;
+	char **tmp;
+
+	/* get size of **environ */
+	while (*env++)
+		;
+
+	init_env = malloc((env - environ) * sizeof(*env));
+	if (init_env == NULL) {
+		ha_alert("Cannot allocate memory to backup env variables.\n");
+		return -1;
+	}
+	tmp = init_env;
+	for (env = environ; *env; env++) {
+		*tmp = strdup(*env);
+		if (*tmp == NULL) {
+			ha_alert("Cannot allocate memory to backup env variable '%s'.\n",
+				 *env);
+			return -1;
+		}
+		tmp++;
+	}
+	/* last entry */
+	*tmp = NULL;
+
+	return 0;
+}
+
+/* Unsets all variables presented in **environ. Returns 0 on success and -1 on
+ * failure, when the process has run out of memory. Emits warnings and continues
+ * if unsetenv() fails (it fails only with EINVAL) or if the parsed string
+ * doesn't contain "=" (the latter is mandatory format for strings kept in
+ * **environ). This allows to terminate the process at the startup stage, if it
+ * was launched in zero-warning mode and there are some problems with
+ * environment. It's not thread-safe as uses my_unsetenv, which is not thread-safe.
+ */
+int clean_env(void)
+{
+	char **env = environ;
+	char *name, *pos;
+	size_t name_len;
+
+	while (*env) {
+		pos = strchr(*env, '=');
+		if (pos)
+			name_len = pos - *env;
+		else {
+			ha_warning("Unsupported env variable format '%s' "
+				   "(doesn't contain '='), won't be unset.\n",
+				   *env);
+			continue;
+		}
+		name = my_strndup(*env, name_len);
+		if (name == NULL) {
+			ha_alert("Cannot allocate memory to parse env variable: '%s'.\n",
+				 *env);
+			return -1;
+		}
+
+		my_unsetenv(name);
+
+		free(name);
+	}
+
+	return 0;
+}
+
+/* Restores **environ from backup created by backup_env(). Must be always
+ * preceded by clean_env() in order to properly restore the process environment.
+ * global init_env ptr array must be freed by the upper layers.
+ * Returns 0 on success and -1 in case if the process has run out of memory. If
+ * setenv() fails with EINVAL or the parsed string doesn't contain '=' (the
+ * latter is mandatory format for strings kept in **environ), emits warning and
+ * continues. This allows to terminate the process at the startup stage, if it
+ * was launched in zero-warning mode and there are some problems with
+ * environment.
+ */
+int restore_env(void)
+{
+	char **env = init_env;
+	char *pos;
+	char *value;
+
+	BUG_ON(!init_env, "Triggered in restore_env(): must be preceded by "
+	       "backup_env(), which allocates init_env.");
+
+	while (*env) {
+		pos = strchr(*env, '=');
+		if (!pos) {
+			ha_warning("Unsupported env variable format '%s' "
+				   "(doesn't contain '='), won't be restored.\n",
+				   *env);
+			env++;
+			continue;
+		}
+		/* replace '=' with /0 to split on 'NAME' and 'VALUE' tokens */
+		*pos = '\0';
+		pos++;
+		value = pos;
+		if (setenv(*env, value, 1) != 0) {
+			if (errno == EINVAL)
+				ha_warning("setenv() fails for '%s'='%s': %s.\n",
+					   *env, value, strerror(errno));
+			else {
+				ha_alert("Cannot allocate memory to set env variable: '%s'.\n",
+					 *env);
+				return -1;
+			}
+		}
+		env++;
+	}
+
+	return 0;
+}
+
+/*
+ * File Name Lookups. Principle: the file_names struct at the top stores all
+ * known file names in a tree. Each node is a struct file_name_node. A take()
+ * call will either locate an existing entry or allocate a new one, and return
+ * a pointer to the string itself. The returned strings are const so as to
+ * easily detect unwanted free() calls. Structures using this mechanism only
+ * need a "const char *" and will never free their entries.
+ */
+
+/* finds or copies the file name, returns a reference to the char* storage area
+ * or NULL if name is NULL or upon allocation error.
+ */
+const char *copy_file_name(const char *name)
+{
+	struct file_name_node *file;
+	struct ceb_node *node;
+	size_t len;
+
+	if (!name)
+		return NULL;
+
+	HA_RWLOCK_RDLOCK(OTHER_LOCK, &file_names.lock);
+	node = cebus_lookup(&file_names.root, name);
+	HA_RWLOCK_RDUNLOCK(OTHER_LOCK, &file_names.lock);
+
+	if (node) {
+		file = container_of(node, struct file_name_node, node);
+		return file->name;
+	}
+
+	len = strlen(name);
+	file = malloc(sizeof(struct file_name_node) + len + 1);
+	if (!file)
+		return NULL;
+
+	memcpy(file->name, name, len + 1);
+	HA_RWLOCK_WRLOCK(OTHER_LOCK, &file_names.lock);
+	node = cebus_insert(&file_names.root, &file->node);
+	HA_RWLOCK_WRUNLOCK(OTHER_LOCK, &file_names.lock);
+
+	if (node != &file->node) {
+		/* the node was created in between */
+		free(file);
+		file = container_of(node, struct file_name_node, node);
+	}
+	return file->name;
+}
+
+/* free all registered file names */
+void free_all_file_names()
+{
+	struct file_name_node *file;
+	struct ceb_node *node;
+
+	HA_RWLOCK_WRLOCK(OTHER_LOCK, &file_names.lock);
+
+	while ((node = cebus_first(&file_names.root))) {
+		file = container_of(node, struct file_name_node, node);
+		cebus_delete(&file_names.root, node);
+		free(file);
+	}
+
+	HA_RWLOCK_WRUNLOCK(OTHER_LOCK, &file_names.lock);
+}
+
+
+/*
+ * Fill a <dst> buffer with a path. <*dst> must be at least of size PATH_MAX.
+ * If a <base> is specified and the path does not start with "/", concatenate <base>/<path>
+ *
+ */
+int path_base(const char *path, const char *base, char *dst, char **err)
+{
+	int err_code = 0;
+	int rv = 0;
+
+	if (base && *base && *path != '/')
+		rv = snprintf(dst, PATH_MAX, "%s/%s", base, path);
+	else
+		rv = snprintf(dst, PATH_MAX, "%s", path);
+
+	if (rv >= PATH_MAX) {
+		memprintf(err, "'%s/%s' : path too long", base, path);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+out:
+	return err_code;
+}
+
+/*
+ * free() an array of strings terminated by a NULL entry
+ * set the pointer to NULL
+ */
+void ha_freearray(char ***array)
+{
+	int i;
+	char **r = *array;
+
+	for (i = 0; r && r[i]; i++) {
+		free(r[i]);
+		r[i] = NULL;
+	}
+	*array = NULL;
+}
 
 /*
  * Local variables:

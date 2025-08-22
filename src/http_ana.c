@@ -35,6 +35,7 @@
 #include <haproxy/sc_strm.h>
 #include <haproxy/server-t.h>
 #include <haproxy/stats.h>
+#include <haproxy/stats-html.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/trace.h>
@@ -66,8 +67,8 @@ static enum rule_result http_req_restrict_header_names(struct stream *s, struct 
 static void http_manage_client_side_cookies(struct stream *s, struct channel *req);
 static void http_manage_server_side_cookies(struct stream *s, struct channel *res);
 
-static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *backend);
-static int http_handle_stats(struct stream *s, struct channel *req);
+static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *px);
+static int http_handle_stats(struct stream *s, struct channel *req, struct proxy *px);
 
 static int http_handle_expect_hdr(struct stream *s, struct htx *htx, struct http_msg *msg);
 static int http_reply_100_continue(struct stream *s);
@@ -81,6 +82,7 @@ static int http_reply_100_continue(struct stream *s);
  */
 int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 {
+	uint8_t do_log = 0;
 
 	/*
 	 * We will analyze a complete HTTP request to check the its syntax.
@@ -231,29 +233,26 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 			struct acl_cond *cond;
 
 			s->flags |= SF_MONITOR;
-			_HA_ATOMIC_INC(&sess->fe->fe_counters.intercepted_req);
+			_HA_ATOMIC_INC(&sess->fe_tgcounters->intercepted_req);
 
 			/* Check if we want to fail this monitor request or not */
 			list_for_each_entry(cond, &sess->fe->mon_fail_cond, list) {
-				int ret = acl_exec_cond(cond, sess->fe, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
+				if (!acl_match_cond(cond, sess->fe, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+					continue;
 
-				ret = acl_pass(ret);
-				if (cond->pol == ACL_COND_UNLESS)
-					ret = !ret;
-
-				if (ret) {
-					/* we fail this request, let's return 503 service unavail */
-					txn->status = 503;
-					if (!(s->flags & SF_ERR_MASK))
-						s->flags |= SF_ERR_LOCAL; /* we don't want a real error here */
-					goto return_prx_cond;
-				}
+				/* we fail this request, let's return 503 service unavail */
+				txn->status = 503;
+				if (!(s->flags & SF_ERR_MASK))
+					s->flags |= SF_ERR_LOCAL; /* we don't want a real error here */
+				stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
+				goto return_prx_cond;
 			}
 
 			/* nothing to fail, let's reply normally */
 			txn->status = 200;
 			if (!(s->flags & SF_ERR_MASK))
 				s->flags |= SF_ERR_LOCAL; /* we don't want a real error here */
+			stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 			goto return_prx_cond;
 		}
 	}
@@ -263,7 +262,20 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	 * Note: we cannot log anymore if the request has been
 	 * classified as invalid.
 	 */
-	if (unlikely(s->logs.logwait & LW_REQ)) {
+	if (unlikely(sess->fe->to_log == LW_LOGSTEPS)) {
+		if (log_orig_proxy(LOG_ORIG_TXN_REQUEST, sess->fe))
+			do_log = 1; /* forced log (through "log-steps") */
+	}
+	else if (unlikely(s->logs.logwait & LW_REQ)) {
+		/* default behavior when log-steps isn't specified:
+		 * don't log systematically, but only if conditions are
+		 * met, ie: not log emitted yet for this txn, all data available
+		 * (unless "option logasap" is used)
+		 */
+		do_log = 2;
+	}
+
+	if (do_log) {
 		/* we have a complete HTTP request that we must log */
 		if ((txn->uri = pool_alloc(pool_head_requri)) != NULL) {
 			size_t len;
@@ -271,8 +283,8 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 			len = http_fmt_req_line(sl, txn->uri, global.tune.requri_len - 1);
 			txn->uri[len] = 0;
 
-			if (!(s->logs.logwait &= ~(LW_REQ|LW_INIT)))
-				s->do_log(s);
+			if (do_log == 1 || !(s->logs.logwait &= ~(LW_REQ|LW_INIT)))
+				s->do_log(s, log_orig(LOG_ORIG_TXN_REQUEST, LOG_ORIG_FL_NONE));
 		} else {
 			ha_alert("HTTP logging : out of memory.\n");
 		}
@@ -330,21 +342,23 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	txn->status = 500;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_prx_cond;
 
  return_bad_req:
 	txn->status = 400;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_cond:
-	http_reply_and_close(s, txn->status, http_error_message(s));
 	http_set_term_flags(s);
+	http_reply_and_close(s, txn->status, http_error_message(s));
 
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
@@ -390,6 +404,9 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		case HTTP_RULE_RES_YIELD: /* some data miss, call the function later. */
 			goto return_prx_yield;
 
+		case HTTP_RULE_RES_FYIELD: /* we must try again after context-switch */
+			goto return_prx_fyield;
+
 		case HTTP_RULE_RES_CONT:
 		case HTTP_RULE_RES_STOP: /* nothing to do */
 			break;
@@ -400,6 +417,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 			goto deny;
 
 		case HTTP_RULE_RES_ABRT: /* abort request, response already sent. Eg: auth */
+			stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 			goto return_prx_cond;
 
 		case HTTP_RULE_RES_DONE: /* OK, but terminate request processing (eg: redirect) */
@@ -446,15 +464,17 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		}
 
 		/* parse the whole stats request and extract the relevant information */
-		http_handle_stats(s, req);
+		http_handle_stats(s, req, px);
 		verdict = http_req_get_intercept_rule(px, NULL, &px->uri_auth->http_req_rules, s);
 		/* not all actions implemented: deny, allow, auth */
 
 		if (verdict == HTTP_RULE_RES_DENY) /* stats http-request deny */
 			goto deny;
 
-		if (verdict == HTTP_RULE_RES_ABRT) /* stats auth / stats http-request auth */
+		if (verdict == HTTP_RULE_RES_ABRT) { /* stats auth / stats http-request auth */
+			stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 			goto return_prx_cond;
+		}
 
 		if (verdict == HTTP_RULE_RES_BADREQ) /* failed with a bad request */
 			goto return_bad_req;
@@ -466,7 +486,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 	/* Proceed with the applets now. */
 	if (unlikely(objt_applet(s->target))) {
 		if (sess->fe == s->be) /* report it if the request was intercepted by the frontend */
-			_HA_ATOMIC_INC(&sess->fe->fe_counters.intercepted_req);
+			_HA_ATOMIC_INC(&sess->fe_tgcounters->intercepted_req);
 
 		if (http_handle_expect_hdr(s, htx, msg) == -1)
 			goto return_int_err;
@@ -490,18 +510,12 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 
 	/* check whether we have some ACLs set to redirect this request */
 	list_for_each_entry(rule, &px->redirect_rules, list) {
-		if (rule->cond) {
-			int ret;
-
-			ret = acl_exec_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-			if (!ret)
-				continue;
-		}
-		if (!http_apply_redirect_rule(rule, s, txn))
+		if (!acl_match_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
+		if (!http_apply_redirect_rule(rule, s, txn)) {
 			goto return_int_err;
+		}
+		stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 		goto done;
 	}
 
@@ -548,11 +562,12 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 	if (!req->analyse_exp)
 		req->analyse_exp = tick_add(now_ms, 0);
 	stream_inc_http_err_ctr(s);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->denied_req);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.denied_req);
+		_HA_ATOMIC_INC(&s->be_tgcounters->denied_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->denied_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->denied_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 	goto done_without_exp;
 
  deny:	/* this request was blocked (denied) */
@@ -564,50 +579,53 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 
 	s->logs.request_ts = now_ns;
 	stream_inc_http_err_ctr(s);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->denied_req);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.denied_req);
+		_HA_ATOMIC_INC(&s->be_tgcounters->denied_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->denied_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->denied_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 	goto return_prx_err;
 
  return_fail_rewrite:
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 	/* fall through */
 
  return_int_err:
 	txn->status = 500;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+		_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	goto return_prx_err;
 
  return_bad_req:
 	txn->status = 400;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_err:
+	http_set_term_flags(s);
 	http_reply_and_close(s, txn->status, http_error_message(s));
 	/* fall through */
 
  return_prx_cond:
 	http_set_term_flags(s);
-
 	req->analysers &= AN_REQ_FLT_END;
 	req->analyse_exp = TICK_ETERNITY;
 	s->current_rule = s->current_rule_list = NULL;
@@ -618,6 +636,12 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
  return_prx_yield:
 	channel_dont_connect(req);
 	DBG_TRACE_DEVEL("waiting for more data",
+			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
+	return 0;
+
+ return_prx_fyield:
+	channel_dont_connect(req);
+	DBG_TRACE_DEVEL("forced yield",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 	return 0;
 }
@@ -658,7 +682,7 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 	 * A unique ID is generated even when it is not sent to ensure that the ID can make use of
 	 * fetches only available in the HTTP request processing stage.
 	 */
-	if (!LIST_ISEMPTY(&sess->fe->format_unique_id)) {
+	if (!lf_expr_isempty(&sess->fe->format_unique_id)) {
 		struct ist unique_id = stream_generate_unique_id(s, &sess->fe->format_unique_id);
 
 		if (!isttest(unique_id)) {
@@ -724,27 +748,28 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
  return_fail_rewrite:
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 	/* fall through */
 
  return_int_err:
 	txn->status = 500;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+		_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 
-	http_reply_and_close(s, txn->status, http_error_message(s));
 	http_set_term_flags(s);
+	http_reply_and_close(s, txn->status, http_error_message(s));
 
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
@@ -784,8 +809,9 @@ int http_process_tarpit(struct stream *s, struct channel *req, int an_bit)
 	 */
 	s->logs.t_queue = ns_to_ms(now_ns - s->logs.accept_ts);
 
-	http_reply_and_close(s, txn->status, (!(s->scf->flags & SC_FL_ERROR) ? http_error_message(s) : NULL));
+	stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 	http_set_term_flags(s);
+	http_reply_and_close(s, txn->status, (!(s->scf->flags & SC_FL_ERROR) ? http_error_message(s) : NULL));
 
 	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 	return 0;
@@ -809,14 +835,19 @@ int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit
 
 	switch (http_wait_for_msg_body(s, req, s->be->timeout.httpreq, 0)) {
 	case HTTP_RULE_RES_CONT:
+		s->waiting_entity.type = STRM_ENTITY_NONE;
+		s->waiting_entity.ptr = NULL;
 		goto http_end;
 	case HTTP_RULE_RES_YIELD:
+		s->waiting_entity.type = STRM_ENTITY_WREQ_BODY;
+		s->waiting_entity.ptr = NULL;
 		goto missing_data_or_waiting;
 	case HTTP_RULE_RES_BADREQ:
 		goto return_bad_req;
 	case HTTP_RULE_RES_ERROR:
 		goto return_int_err;
 	case HTTP_RULE_RES_ABRT:
+		stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 		goto return_prx_cond;
 	default:
 		goto return_int_err;
@@ -840,21 +871,24 @@ int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit
 	txn->status = 500;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+		_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	goto return_prx_err;
 
  return_bad_req: /* let's centralize all bad requests */
 	txn->status = 400;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_err:
+	http_set_term_flags(s);
 	http_reply_and_close(s, txn->status, http_error_message(s));
 	/* fall through */
 
@@ -939,7 +973,8 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	}
 	else {
 		c_adv(req, htx->data - co_data(req));
-		if ((global.tune.options & GTUNE_USE_FAST_FWD) && (msg->flags & HTTP_MSGF_XFER_LEN))
+		if ((global.tune.options & GTUNE_USE_FAST_FWD) && (msg->flags & HTTP_MSGF_XFER_LEN) &&
+		    (!(msg->flags & HTTP_MSGF_CONN_UPG) || (htx->flags & HTX_FL_EOM)))
 			channel_htx_forward_forever(req, htx);
 	}
 
@@ -985,11 +1020,12 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
 	if ((s->scb->flags & SC_FL_SHUT_DONE) && co_data(req)) {
 		/* request errors are most likely due to the server aborting the
-		 * transfer.Bit handle server aborts only if there is no
-		 * response. Otherwise, let a change to foward the response
-		 * first.
+		 * transfer. But handle server aborts only if the response was
+		 * not received yet. Otherwise, let the response analyzer the
+		 * responsibility to handle the error. It is especially
+		 * important to properly handle L7-retries but also K/A silent close.
 		 */
-		if (htx_is_empty(htxbuf(&s->res.buf)))
+		if (txn->rsp.msg_state >= HTTP_MSG_BODY && htx_is_empty(htxbuf(&s->res.buf)))
 			goto return_srv_abort;
 	}
 
@@ -1028,10 +1064,12 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
  waiting:
 	/* waiting for the last bits to leave the buffer */
 	if (s->scb->flags & SC_FL_SHUT_DONE) {
-		/* Handle server aborts only if there is no response. Otherwise,
-		 * let a change to foward the response first.
+		/* Handle server aborts only if the response was not received
+		 * yet. Otherwise, let the response analyzer the responsibility
+		 * to handle the error. It is especially important to properly
+		 * handle L7-retries but also K/A silent close.
 		 */
-		if (htx_is_empty(htxbuf(&s->res.buf)))
+		if (txn->rsp.msg_state >= HTTP_MSG_BODY && htx_is_empty(htxbuf(&s->res.buf)))
 			goto return_srv_abort;
 	}
 
@@ -1062,24 +1100,24 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	return 0;
 
   return_cli_abort:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
-	_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->cli_aborts);
+	_HA_ATOMIC_INC(&s->be_tgcounters->cli_aborts);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->cli_aborts);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->cli_aborts);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.cli_aborts);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->cli_aborts);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= ((req->flags & CF_READ_TIMEOUT) ? SF_ERR_CLITO : SF_ERR_CLICL);
 	status = 400;
 	goto return_prx_cond;
 
   return_srv_abort:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.srv_aborts);
-	_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->srv_aborts);
+	_HA_ATOMIC_INC(&s->be_tgcounters->srv_aborts);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->srv_aborts);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->srv_aborts);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.srv_aborts);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->srv_aborts);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= ((req->flags & CF_WRITE_TIMEOUT) ? SF_ERR_SRVTO : SF_ERR_SRVCL);
 	status = 502;
@@ -1088,23 +1126,26 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
   return_int_err:
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
-	_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
+	_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	status = 500;
 	goto return_prx_cond;
 
   return_bad_req:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 	status = 400;
 	/* fall through */
 
   return_prx_cond:
+	http_set_term_flags(s);
 	if (txn->status > 0) {
 		/* Note: we don't send any error if some data were already sent */
 		http_reply_and_close(s, txn->status, NULL);
@@ -1112,7 +1153,6 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		txn->status = status;
 		http_reply_and_close(s, txn->status, http_error_message(s));
 	}
-	http_set_term_flags(s);
 	DBG_TRACE_DEVEL("leaving on error ",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 	return 0;
@@ -1125,7 +1165,7 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 	struct channel *req, *res;
 	int co_data;
 
-	if (s->conn_retries >= s->be->conn_retries)
+	if (s->conn_retries >= s->max_retries)
 		return -1;
 	s->conn_retries++;
 	if (objt_server(s->target)) {
@@ -1133,16 +1173,16 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 			s->flags &= ~SF_CURR_SESS;
 			_HA_ATOMIC_DEC(&__objt_server(s->target)->cur_sess);
 		}
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.retries);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->retries);
 	}
-	_HA_ATOMIC_INC(&s->be->be_counters.retries);
+	_HA_ATOMIC_INC(&s->be_tgcounters->retries);
 
 	req = &s->req;
 	res = &s->res;
 
 	/* Remove any write error from the request, and read error from the response */
 	s->scf->flags &= ~(SC_FL_EOS|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
-	req->flags &= ~CF_WRITE_TIMEOUT;
+	req->flags &= ~(CF_WRITE_TIMEOUT|CF_WROTE_DATA);
 	res->flags &= ~(CF_READ_TIMEOUT | CF_READ_EVENT);
 	res->analysers &= AN_RES_FLT_END;
 	s->conn_err_type = STRM_ET_NONE;
@@ -1155,8 +1195,7 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 
 	s->scb->flags &= ~(SC_FL_ERROR|SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED);
 	if (sc_reset_endp(s->scb) < 0) {
-		if (!(s->flags & SF_ERR_MASK))
-			s->flags |= SF_ERR_INTERNAL;
+		s->flags |= SF_ERR_INTERNAL;
 		return -1;
 	}
 
@@ -1204,8 +1243,11 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	htx = htxbuf(&rep->buf);
 
 	/* Parsing errors are caught here */
-	if (htx->flags & HTX_FL_PARSING_ERROR)
+	if (htx->flags & HTX_FL_PARSING_ERROR) {
+		if (objt_server(s->target))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
 		goto return_bad_res;
+	}
 	if (htx->flags & HTX_FL_PROCESSING_ERROR)
 		goto return_int_err;
 
@@ -1227,6 +1269,8 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		if (s->scb->flags & SC_FL_ERROR) {
 			struct connection *conn = sc_conn(s->scb);
 
+			if (!(s->flags & SF_SRV_REUSED) && objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_ERROR);
 
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_DISCONNECTED) &&
@@ -1245,14 +1289,12 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				return 0;
 			}
 
-			if (txn->flags & TX_NOT_FIRST)
+			if (s->flags & SF_SRV_REUSED)
 				goto abort_keep_alive;
 
-			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
-				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_ERROR);
-			}
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
+			if (objt_server(s->target))
+				_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
 
 			/* if the server refused the early data, just send a 425 */
 			if (conn && conn->err_code == CO_ER_SSL_EARLY_FAILED)
@@ -1263,11 +1305,12 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			}
 
 			s->scb->flags |= SC_FL_NOLINGER;
-			http_reply_and_close(s, txn->status, http_error_message(s));
 
 			if (!(s->flags & SF_ERR_MASK))
 				s->flags |= SF_ERR_SRVCL;
 			http_set_term_flags(s);
+
+			http_reply_and_close(s, txn->status, http_error_message(s));
 			DBG_TRACE_DEVEL("leaving on error",
 					STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 			return 0;
@@ -1275,6 +1318,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 2: read timeout : return a 504 to the client. */
 		else if (rep->flags & CF_READ_TIMEOUT) {
+			if (objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_TIMEOUT);
+
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_TIMEOUT)) {
 				if (co_data(rep) || do_l7_retry(s, s->scb) == 0) {
@@ -1283,20 +1329,19 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 					return 0;
 				}
 			}
-			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
-				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_TIMEOUT);
-			}
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
+			if (objt_server(s->target))
+				_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
 
 			txn->status = 504;
 			stream_inc_http_fail_ctr(s);
 			s->scb->flags |= SC_FL_NOLINGER;
-			http_reply_and_close(s, txn->status, http_error_message(s));
 
 			if (!(s->flags & SF_ERR_MASK))
 				s->flags |= SF_ERR_SRVTO;
 			http_set_term_flags(s);
+
+			http_reply_and_close(s, txn->status, http_error_message(s));
 			DBG_TRACE_DEVEL("leaving on error",
 					STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 			return 0;
@@ -1305,19 +1350,20 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		/* 3: client abort with an abortonclose */
 		else if ((s->scb->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) && (s->scb->flags & SC_FL_SHUT_DONE) &&
 			 (s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))) {
-			_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
-			_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
+			_HA_ATOMIC_INC(&sess->fe_tgcounters->cli_aborts);
+			_HA_ATOMIC_INC(&s->be_tgcounters->cli_aborts);
 			if (sess->listener && sess->listener->counters)
-				_HA_ATOMIC_INC(&sess->listener->counters->cli_aborts);
+				_HA_ATOMIC_INC(&sess->li_tgcounters->cli_aborts);
 			if (objt_server(s->target))
-				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.cli_aborts);
+				_HA_ATOMIC_INC(&s->sv_tgcounters->cli_aborts);
 
 			txn->status = 400;
-			http_reply_and_close(s, txn->status, http_error_message(s));
 
 			if (!(s->flags & SF_ERR_MASK))
 				s->flags |= SF_ERR_CLICL;
 			http_set_term_flags(s);
+
+			http_reply_and_close(s, txn->status, http_error_message(s));
 
 			/* process_stream() will take care of the error */
 			DBG_TRACE_DEVEL("leaving on error",
@@ -1327,6 +1373,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 4: close from server, capture the response if the server has started to respond */
 		else if (s->scb->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) {
+			if (!(s->flags & SF_SRV_REUSED) && objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_BROKEN_PIPE);
+
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_DISCONNECTED)) {
 				if (co_data(rep) || do_l7_retry(s, s->scb) == 0) {
@@ -1336,23 +1385,22 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				}
 			}
 
-			if (txn->flags & TX_NOT_FIRST)
+			if (s->flags & SF_SRV_REUSED)
 				goto abort_keep_alive;
 
-			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
-				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_BROKEN_PIPE);
-			}
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
+			if (objt_server(s->target))
+				_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
 
 			txn->status = 502;
 			stream_inc_http_fail_ctr(s);
 			s->scb->flags |= SC_FL_NOLINGER;
-			http_reply_and_close(s, txn->status, http_error_message(s));
 
 			if (!(s->flags & SF_ERR_MASK))
 				s->flags |= SF_ERR_SRVCL;
 			http_set_term_flags(s);
+
+			http_reply_and_close(s, txn->status, http_error_message(s));
 			DBG_TRACE_DEVEL("leaving on error",
 					STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 			return 0;
@@ -1360,12 +1408,12 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 5: write error to client (we don't send any message then) */
 		else if (sc_ep_test(s->scf, SE_FL_ERR_PENDING)) {
-			if (txn->flags & TX_NOT_FIRST)
+			if (s->flags & SF_SRV_REUSED)
 				goto abort_keep_alive;
 
-			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
 			if (objt_server(s->target))
-				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
+				_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
 			rep->analysers &= AN_RES_FLT_END;
 
 			if (!(s->flags & SF_ERR_MASK))
@@ -1373,6 +1421,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			http_set_term_flags(s);
 
 			/* process_stream() will take care of the error */
+			http_reply_and_close(s, txn->status, NULL);
 			DBG_TRACE_DEVEL("leaving on error",
 					STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 			return 0;
@@ -1392,6 +1441,17 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	BUG_ON(htx_get_first_type(htx) != HTX_BLK_RES_SL);
 	sl = http_get_stline(htx);
 
+	/* Adjust server's health based on status code. Note: status codes 501
+	 * and 505 are triggered on demand by client request, so we must not
+	 * count them as server failures.
+	 */
+	if (objt_server(s->target)) {
+		if (sl->info.res.status >= 100 && (sl->info.res.status < 500 || sl->info.res.status == 501 || sl->info.res.status == 505))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_OK);
+		else
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_STS);
+	}
+
 	/* Perform a L7 retry because of the status code */
 	if ((txn->flags & TX_L7_RETRY) &&
 	    l7_status_match(s->be, sl->info.res.status) &&
@@ -1399,9 +1459,6 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		DBG_TRACE_DEVEL("leaving on L7 retry", STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
 	}
-
-	/* Now, L7 buffer is useless, it can be released */
-	b_free(&txn->l7_buffer);
 
 	msg->msg_state = HTTP_MSG_BODY;
 
@@ -1429,7 +1486,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	}
 
 	/* 1: get the status code and the version. Also set HTTP flags */
-	txn->status = sl->info.res.status;
+	txn->server_status = txn->status = sl->info.res.status;
 	if (sl->flags & HTX_SL_F_VER_11)
                 msg->flags |= HTTP_MSGF_VER_11;
 	if (sl->flags & HTX_SL_F_XFER_LEN) {
@@ -1444,35 +1501,24 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	if (sl->flags & HTX_SL_F_CONN_UPG)
 		msg->flags |= HTTP_MSGF_CONN_UPG;
 
-	n = txn->status / 100;
-	if (n < 1 || n > 5)
-		n = 0;
-
 	/* when the client triggers a 4xx from the server, it's most often due
 	 * to a missing object or permission. These events should be tracked
 	 * because if they happen often, it may indicate a brute force or a
 	 * vulnerability scan.
 	 */
-	if (n == 4)
+	if (http_status_matches(http_err_status_codes, txn->status))
 		stream_inc_http_err_ctr(s);
 
-	if (n == 5 && txn->status != 501 && txn->status != 505)
+	if (http_status_matches(http_fail_status_codes, txn->status))
 		stream_inc_http_fail_ctr(s);
 
 	if (objt_server(s->target)) {
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.p.http.rsp[n]);
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.p.http.cum_req);
-	}
+		n = txn->status / 100;
+		if (n < 1 || n > 5)
+			n = 0;
 
-	/* Adjust server's health based on status code. Note: status codes 501
-	 * and 505 are triggered on demand by client request, so we must not
-	 * count them as server failures.
-	 */
-	if (objt_server(s->target)) {
-		if (txn->status >= 100 && (txn->status < 500 || txn->status == 501 || txn->status == 505))
-			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_OK);
-		else
-			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_STS);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->p.http.rsp[n]);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->p.http.cum_req);
 	}
 
 	/*
@@ -1488,7 +1534,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		htx->first = channel_htx_fwd_headers(rep, htx);
 		msg->msg_state = HTTP_MSG_RPBEFORE;
 		msg->flags = 0;
-		txn->status = 0;
+		txn->server_status = txn->status = 0;
 		s->logs.t_data = -1; /* was not a response yet */
 		s->scf->flags |= SC_FL_SND_ASAP; /* Send ASAP informational messages */
 		goto next_one;
@@ -1500,8 +1546,11 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 * header content. But it is probably stronger enough for now.
 	 */
 	if (txn->status == 101 &&
-	    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG)))
+	    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG))) {
+		if (objt_server(s->target))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
 		goto return_bad_res;
+	}
 
 	/*
 	 * 2: check for cacheability.
@@ -1557,11 +1606,17 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		txn->flags |= TX_CON_WANT_TUN;
 	}
 
-	/* check for NTML authentication headers in 401 (WWW-Authenticate) and
-	 * 407 (Proxy-Authenticate) responses and set the connection to private
+	/* Check for NTML authentication headers in 401 (WWW-Authenticate) and
+	 * 407 (Proxy-Authenticate) responses and set the connection to
+	 * private.
+	 *
+	 * Note that this is not performed when using a true multiplexer unless
+	 * connection is already attached to the session as nothing prevents it
+	 * from being shared already by several sessions here.
 	 */
 	srv_conn = sc_conn(s->scb);
-	if (srv_conn) {
+	if (srv_conn &&
+	    (LIST_INLIST(&srv_conn->sess_el) || strcmp(srv_conn->mux->name, "H1") == 0)) {
 		struct ist hdr;
 		struct http_hdr_ctx ctx;
 
@@ -1586,13 +1641,16 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				conn_set_owner(srv_conn, sess, NULL);
 				conn_set_private(srv_conn);
 				/* If it fail now, the same will be done in mux->detach() callback */
-				session_add_conn(srv_conn->owner, srv_conn, srv_conn->target);
+				session_add_conn(srv_conn->owner, srv_conn);
 				break;
 			}
 		}
 	}
 
   end:
+	/* Now, L7 buffer is useless, it can be released */
+	b_free(&txn->l7_buffer);
+
 	/* we want to have the response time before we start processing it */
 	s->logs.t_data = ns_to_ms(now_ns - s->logs.accept_ts);
 
@@ -1604,23 +1662,19 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	return 1;
 
  return_int_err:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
-	_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
+	_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->internal_errors);
 	txn->status = 500;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_prx_cond;
 
   return_bad_res:
-	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-	if (objt_server(s->target)) {
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
-	}
 	if ((s->be->retry_type & PR_RE_JUNK_REQUEST) &&
 	    (txn->flags & TX_L7_RETRY) &&
 	    do_l7_retry(s, s->scb) == 0) {
@@ -1628,13 +1682,19 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
 	}
+
+	_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
+	if (objt_server(s->target))
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
+
 	txn->status = 502;
 	stream_inc_http_fail_ctr(s);
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_cond:
-	http_reply_and_close(s, txn->status, http_error_message(s));
 	http_set_term_flags(s);
+	http_reply_and_close(s, txn->status, http_error_message(s));
 
 	s->scb->flags |= SC_FL_NOLINGER;
 	DBG_TRACE_DEVEL("leaving on error",
@@ -1669,6 +1729,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	struct htx *htx;
 	struct proxy *cur_proxy;
 	enum rule_result ret = HTTP_RULE_RES_CONT;
+	uint8_t do_log = 0;
 
 	if (unlikely(msg->msg_state < HTTP_MSG_BODY))	/* we need more data */
 		return 0;
@@ -1724,6 +1785,9 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 			case HTTP_RULE_RES_YIELD: /* some data miss, call the function later. */
 				goto return_prx_yield;
 
+			case HTTP_RULE_RES_FYIELD: /* we must try again after context-switch */
+				goto return_prx_fyield;
+
 			case HTTP_RULE_RES_CONT:
 			case HTTP_RULE_RES_STOP: /* nothing to do */
 				break;
@@ -1732,6 +1796,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 				goto deny;
 
 			case HTTP_RULE_RES_ABRT: /* abort request, response already sent */
+				stream_report_term_evt(s->scb, strm_tevt_type_intercepted);
 				goto return_prx_cond;
 
 			case HTTP_RULE_RES_DONE: /* OK, but terminate request processing (eg: redirect) */
@@ -1891,14 +1956,21 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	rep->analysers &= ~AN_RES_FLT_XFER_DATA;
 	rep->analysers |= AN_RES_HTTP_XFER_BODY;
 
+	if (sess->fe->to_log == LW_LOGSTEPS) {
+		if (log_orig_proxy(LOG_ORIG_TXN_RESPONSE, sess->fe))
+			do_log = 1;
+	}
+	else if ((!lf_expr_isempty(&sess->fe->logformat) && !(s->logs.logwait & LW_BYTES)))
+		do_log = 1;
+
 	/* if the user wants to log as soon as possible, without counting
 	 * bytes from the server, then this is the right moment. We have
 	 * to temporarily assign bytes_out to log what we currently have.
 	 */
-	if (!LIST_ISEMPTY(&sess->fe->logformat) && !(s->logs.logwait & LW_BYTES)) {
+	if (do_log) {
 		s->logs.t_close = s->logs.t_data; /* to get a valid end date */
 		s->logs.bytes_out = htx->data;
-		s->do_log(s);
+		s->do_log(s, log_orig(LOG_ORIG_TXN_RESPONSE, LOG_ORIG_FL_NONE));
 		s->logs.bytes_out = 0;
 	}
 
@@ -1910,55 +1982,58 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	return 1;
 
  deny:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_resp);
-	_HA_ATOMIC_INC(&s->be->be_counters.denied_resp);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->denied_resp);
+	_HA_ATOMIC_INC(&s->be_tgcounters->denied_resp);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->denied_resp);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->denied_resp);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.denied_resp);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->denied_resp);
+	stream_report_term_evt(s->scb, strm_tevt_type_intercepted);
 	goto return_prx_err;
 
  return_fail_rewrite:
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
-	_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
+	_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 	/* fall through */
 
  return_int_err:
 	txn->status = 500;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
-	_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
+	_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->internal_errors);
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_prx_err;
 
  return_bad_res:
+	s->logs.t_data = -1; /* was not a valid response */
 	txn->status = 502;
 	stream_inc_http_fail_ctr(s);
-	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
+	_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
 	if (objt_server(s->target)) {
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
 		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_RSP);
 	}
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_err:
+	http_set_term_flags(s);
 	http_reply_and_close(s, txn->status, http_error_message(s));
 	/* fall through */
 
  return_prx_cond:
-	s->logs.t_data = -1; /* was not a valid response */
 	s->scb->flags |= SC_FL_NOLINGER;
-
 	http_set_term_flags(s);
 
 	rep->analysers &= AN_RES_FLT_END;
@@ -1974,6 +2049,13 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	DBG_TRACE_DEVEL("waiting for more data",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 	return 0;
+
+ return_prx_fyield:
+	channel_dont_close(rep);
+	DBG_TRACE_DEVEL("forced yield",
+			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
+	return 0;
+
 }
 
 /* This function is an analyser which forwards response body (including chunk
@@ -2136,8 +2218,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	 * server abort.
 	 */
 	if (msg->msg_state < HTTP_MSG_ENDING && (s->scb->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))) {
-		if ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-		    (s->scb->flags & SC_FL_SHUT_DONE))
+		if ((s->scb->flags & (SC_FL_ABRT_DONE|SC_FL_SHUT_DONE)) == (SC_FL_ABRT_DONE|SC_FL_SHUT_DONE))
 			goto return_cli_abort;
 		/* If we have some pending data, we continue the processing */
 		if (htx_is_empty(htx))
@@ -2170,54 +2251,54 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	return 0;
 
   return_srv_abort:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.srv_aborts);
-	_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->srv_aborts);
+	_HA_ATOMIC_INC(&s->be_tgcounters->srv_aborts);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->srv_aborts);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->srv_aborts);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.srv_aborts);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->srv_aborts);
 	stream_inc_http_fail_ctr(s);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= ((res->flags & CF_READ_TIMEOUT) ? SF_ERR_SRVTO : SF_ERR_SRVCL);
 	goto return_error;
 
   return_cli_abort:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
-	_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->cli_aborts);
+	_HA_ATOMIC_INC(&s->be_tgcounters->cli_aborts);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->cli_aborts);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->cli_aborts);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.cli_aborts);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->cli_aborts);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= ((res->flags & CF_WRITE_TIMEOUT) ? SF_ERR_CLITO : SF_ERR_CLICL);
 	goto return_error;
 
   return_int_err:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
-	_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
+	_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->internal_errors);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_error;
 
   return_bad_res:
-	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
+	_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
 	if (objt_server(s->target)) {
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
 		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_RSP);
 	}
 	stream_inc_http_fail_ctr(s);
-	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_SRVCL;
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
    return_error:
 	/* don't send any error message as we're in the body */
-	http_reply_and_close(s, txn->status, NULL);
 	http_set_term_flags(s);
+	http_reply_and_close(s, txn->status, NULL);
 	stream_inc_http_fail_ctr(s);
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
@@ -2238,7 +2319,7 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 	struct buffer *chunk;
 	struct ist status, reason, location;
 	unsigned int flags;
-	int ret = 1, close = 0; /* Try to keep the connection alive byt default */
+	int ret = 1;
 
 	chunk = alloc_trash_chunk();
 	if (!chunk) {
@@ -2363,6 +2444,7 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 		}
 		case REDIRECT_TYPE_LOCATION:
 		default:
+			memset(chunk->area, 0x50, chunk->size);
 			if (rule->rdr_str) { /* this is an old "redirect" rule */
 				/* add location */
 				if (!chunk_memcat(chunk, rule->rdr_str, rule->rdr_len))
@@ -2379,6 +2461,36 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 				}
 
 				chunk->data += len;
+			}
+
+			if (rule->flags & REDIRECT_FLAG_KEEP_QS) {
+				struct ist path;
+				struct http_uri_parser parser;
+				char *ptr, *end;
+				char sep = '?';
+
+				ptr = memchr(chunk->area, '?', chunk->data);
+				if (ptr != NULL)
+					sep = ((ptr+1 != b_tail(chunk)) ? '&' : '\0');
+
+				sl = http_get_stline(htx);
+				parser = http_uri_parser_init(htx_sl_req_uri(sl));
+				path = http_parse_path(&parser);
+				ptr = istptr(path);
+				end = istend(path);
+
+				/* look up the '?' */
+				do {
+					if (ptr == end)
+						break;
+				} while (*ptr++ != '?');
+
+				if (ptr == end)
+					break;
+				if (sep != '\0' && !chunk_memcat(chunk, &sep, 1))
+					goto fail;
+				if (!chunk_memcat(chunk, ptr, end-ptr))
+					goto fail;
 			}
 			break;
 	}
@@ -2411,21 +2523,15 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 			break;
 	}
 
-	if (!(txn->req.flags & HTTP_MSGF_BODYLESS) && txn->req.msg_state != HTTP_MSG_DONE)
-		close = 1;
-
 	htx = htx_from_buf(&res->buf);
 	/* Trim any possible response */
 	channel_htx_truncate(&s->res, htx);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), status, reason);
 	if (!sl)
 		goto fail;
 	sl->info.res.status = rule->code;
 	s->txn->status = rule->code;
-
-	if (close && !htx_add_header(htx, ist("Connection"), ist("close")))
-		goto fail;
 
 	if (!htx_add_header(htx, ist("Content-length"), ist("0")) ||
 	    !htx_add_header(htx, ist("Location"), location))
@@ -2436,8 +2542,13 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 			goto fail;
 	}
 
-	if (rule->cookie_len) {
-		if (!htx_add_header(htx, ist("Set-Cookie"), ist2(rule->cookie_str, rule->cookie_len)))
+	if (rule->flags & REDIRECT_FLAG_COOKIE_FMT) {
+		trash.data = build_logline(s, trash.area, trash.size, &rule->cookie.fmt);
+		if (!htx_add_header(htx, ist("Set-Cookie"), ist2(trash.area, trash.data)))
+			goto fail;
+	}
+	else if (isttest(rule->cookie.str)) {
+		if (!htx_add_header(htx, ist("Set-Cookie"), rule->cookie.str))
 			goto fail;
 	}
 
@@ -2446,6 +2557,11 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 
 	htx->flags |= HTX_FL_EOM;
 	htx_to_buf(htx, &res->buf);
+
+	if (!(s->flags & SF_ERR_MASK))
+		s->flags |= SF_ERR_LOCAL;
+	http_set_term_flags(s);
+
 	if (!http_forward_proxy_resp(s, 1))
 		goto fail;
 
@@ -2455,12 +2571,8 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 		req->analysers &= AN_REQ_FLT_END;
 
 		if (s->sess->fe == s->be) /* report it if the request was intercepted by the frontend */
-			_HA_ATOMIC_INC(&s->sess->fe->fe_counters.intercepted_req);
+			_HA_ATOMIC_INC(&s->sess->fe_tgcounters->intercepted_req);
 	}
-
-	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_LOCAL;
-	http_set_term_flags(s);
 
   out:
 	free_trash_chunk(chunk);
@@ -2642,16 +2754,27 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 	enum rule_result rule_ret = HTTP_RULE_RES_CONT;
 	int act_opts = 0;
 
+	if ((s->scf->flags & SC_FL_ERROR) ||
+	    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
+	     (px->options & PR_O_ABRT_CLOSE)))
+		act_opts |= ACT_OPT_FINAL | ACT_OPT_FINAL_EARLY;
+
 	/* If "the current_rule_list" match the executed rule list, we are in
 	 * resume condition. If a resume is needed it is always in the action
 	 * and never in the ACL or converters. In this case, we initialise the
 	 * current rule, and go to the action execution point.
 	 */
 	if (s->current_rule) {
+		int forced = s->flags & SF_RULE_FYIELD;
+
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules))
+		s->flags &= ~SF_RULE_FYIELD;
+		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules)) {
+			if (forced)
+				goto resume_rule;
 			goto resume_execution;
+		}
 	}
 	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
 
@@ -2660,19 +2783,21 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 	txn->req.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	list_for_each_entry(rule, s->current_rule_list, list) {
-		/* check optional condition */
-		if (rule->cond) {
-			int ret;
-
-			ret = acl_exec_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			if (!ret) /* condition not matched */
-				continue;
+ resume_rule:
+		/* check if budget is exceeded and we need to continue on the next
+		 * polling loop, unless we know that we cannot yield
+		 */
+		if (s->rules_bcount++ >= global.tune.max_rules_at_once && !(act_opts & ACT_OPT_FINAL)) {
+			s->current_rule = rule;
+			s->flags |= SF_RULE_FYIELD;
+			rule_ret = HTTP_RULE_RES_FYIELD;
+			task_wakeup(s->task, TASK_WOKEN_MSG);
+			goto end;
 		}
+
+		/* check optional condition */
+		if (!acl_match_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
 		act_opts |= ACT_OPT_FIRST;
   resume_execution:
@@ -2681,49 +2806,60 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 
 		/* Always call the action function if defined */
 		if (rule->action_ptr) {
-			if ((s->scf->flags & SC_FL_ERROR) ||
-			    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-			     (px->options & PR_O_ABRT_CLOSE)))
-				act_opts |= ACT_OPT_FINAL;
+			if (!(s->scf->flags & SC_FL_ERROR) & !(s->req.flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) {
+				s->waiting_entity.type = STRM_ENTITY_NONE;
+				s->waiting_entity.ptr  = NULL;
+			}
 
 			switch (rule->action_ptr(rule, px, sess, s, act_opts)) {
 				case ACT_RET_CONT:
 					break;
 				case ACT_RET_STOP:
 					rule_ret = HTTP_RULE_RES_STOP;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_YIELD:
 					s->current_rule = rule;
+					if (act_opts & ACT_OPT_FINAL) {
+						send_log(s->be, LOG_WARNING,
+							 "Internal error: action yields while it is  no long allowed "
+							 "for the http-request actions.");
+						s->last_entity.type = STRM_ENTITY_RULE;
+						s->last_entity.ptr  = rule;
+						rule_ret = HTTP_RULE_RES_ERROR;
+						goto end;
+					}
+					s->waiting_entity.type = STRM_ENTITY_RULE;
+					s->waiting_entity.ptr  = rule;
 					rule_ret = HTTP_RULE_RES_YIELD;
 					goto end;
 				case ACT_RET_ERR:
 					rule_ret = HTTP_RULE_RES_ERROR;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_DONE:
 					rule_ret = HTTP_RULE_RES_DONE;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_DENY:
 					if (txn->status == -1)
 						txn->status = 403;
 					rule_ret = HTTP_RULE_RES_DENY;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_ABRT:
 					rule_ret = HTTP_RULE_RES_ABRT;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_INV:
 					rule_ret = HTTP_RULE_RES_BADREQ;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 			}
 			continue; /* eval the next rule */
@@ -2733,16 +2869,16 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 		switch (rule->action) {
 			case ACT_ACTION_ALLOW:
 				rule_ret = HTTP_RULE_RES_STOP;
-				s->last_rule_file = rule->conf.file;
-				s->last_rule_line = rule->conf.line;
+				s->last_entity.type = STRM_ENTITY_RULE;
+				s->last_entity.ptr  = rule;
 				goto end;
 
 			case ACT_ACTION_DENY:
 				txn->status = rule->arg.http_reply->status;
 				txn->http_reply = rule->arg.http_reply;
 				rule_ret = HTTP_RULE_RES_DENY;
-				s->last_rule_file = rule->conf.file;
-				s->last_rule_line = rule->conf.line;
+				s->last_entity.type = STRM_ENTITY_RULE;
+				s->last_entity.ptr  = rule;
 				goto end;
 
 			case ACT_HTTP_REQ_TARPIT:
@@ -2750,8 +2886,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 				txn->status = rule->arg.http_reply->status;
 				txn->http_reply = rule->arg.http_reply;
 				rule_ret = HTTP_RULE_RES_DENY;
-				s->last_rule_file = rule->conf.file;
-				s->last_rule_line = rule->conf.line;
+				s->last_entity.type = STRM_ENTITY_RULE;
+				s->last_entity.ptr  = rule;
 				goto end;
 
 			case ACT_HTTP_REDIR: {
@@ -2761,8 +2897,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 					break;
 
 				rule_ret = ret ? HTTP_RULE_RES_ABRT : HTTP_RULE_RES_ERROR;
-				s->last_rule_file = rule->conf.file;
-				s->last_rule_line = rule->conf.line;
+				s->last_entity.type = STRM_ENTITY_RULE;
+				s->last_entity.ptr  = rule;
 				goto end;
 			}
 
@@ -2779,7 +2915,7 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 
   end:
 	/* if the ruleset evaluation is finished reset the strict mode */
-	if (rule_ret != HTTP_RULE_RES_YIELD)
+	if (rule_ret != HTTP_RULE_RES_YIELD && rule_ret != HTTP_RULE_RES_FYIELD)
 		txn->req.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	/* we reached the end of the rules, nothing to report */
@@ -2787,8 +2923,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 }
 
 /* Executes the http-response rules <rules> for stream <s> and proxy <px>. It
- * returns one of 5 possible statuses: HTTP_RULE_RES_CONT, HTTP_RULE_RES_STOP,
- * HTTP_RULE_RES_DONE, HTTP_RULE_RES_YIELD, or HTTP_RULE_RES_BADREQ. If *CONT
+ * returns one of 6 possible statuses: HTTP_RULE_RES_CONT, HTTP_RULE_RES_STOP,
+ * HTTP_RULE_RES_DONE, HTTP_RULE_RES_(F)YIELD, or HTTP_RULE_RES_BADREQ. If *CONT
  * is returned, the process can continue the evaluation of next rule list. If
  * *STOP or *DONE is returned, the process must stop the evaluation. If *BADREQ
  * is returned, it means the operation could not be processed and a server error
@@ -2806,16 +2942,27 @@ static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct lis
 
 	if (final)
 		act_opts |= ACT_OPT_FINAL;
+	if ((s->scf->flags & SC_FL_ERROR) ||
+	    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
+	     (px->options & PR_O_ABRT_CLOSE)))
+		act_opts |= ACT_OPT_FINAL | ACT_OPT_FINAL_EARLY;
+
 	/* If "the current_rule_list" match the executed rule list, we are in
 	 * resume condition. If a resume is needed it is always in the action
 	 * and never in the ACL or converters. In this case, we initialise the
 	 * current rule, and go to the action execution point.
 	 */
 	if (s->current_rule) {
+		int forced = s->flags & SF_RULE_FYIELD;
+
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules))
+		s->flags &= ~SF_RULE_FYIELD;
+		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules)) {
+			if (forced)
+				goto resume_rule;
 			goto resume_execution;
+		}
 	}
 	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
 
@@ -2825,19 +2972,21 @@ static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct lis
 	txn->rsp.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	list_for_each_entry(rule, s->current_rule_list, list) {
-		/* check optional condition */
-		if (rule->cond) {
-			int ret;
-
-			ret = acl_exec_cond(rule->cond, px, sess, s, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			if (!ret) /* condition not matched */
-				continue;
+ resume_rule:
+		/* check if budget is exceeded and we need to continue on the next
+		 * polling loop, unless we know that we cannot yield
+		 */
+		if (s->rules_bcount++ >= global.tune.max_rules_at_once && !(act_opts & ACT_OPT_FINAL)) {
+			s->current_rule = rule;
+			s->flags |= SF_RULE_FYIELD;
+			rule_ret = HTTP_RULE_RES_YIELD;
+			task_wakeup(s->task, TASK_WOKEN_MSG);
+			goto end;
 		}
+
+		/* check optional condition */
+		if (!acl_match_cond(rule->cond, px, sess, s, SMP_OPT_DIR_RES|SMP_OPT_FINAL))
+			continue;
 
 		act_opts |= ACT_OPT_FIRST;
 resume_execution:
@@ -2846,49 +2995,60 @@ resume_execution:
 
 		/* Always call the action function if defined */
 		if (rule->action_ptr) {
-			if ((s->scf->flags & SC_FL_ERROR) ||
-			    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-			     (px->options & PR_O_ABRT_CLOSE)))
-				act_opts |= ACT_OPT_FINAL;
+			if (!(s->scb->flags & SC_FL_ERROR) & !(s->res.flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) {
+				s->waiting_entity.type = STRM_ENTITY_NONE;
+				s->waiting_entity.ptr  = NULL;
+			}
 
 			switch (rule->action_ptr(rule, px, sess, s, act_opts)) {
 				case ACT_RET_CONT:
 					break;
 				case ACT_RET_STOP:
 					rule_ret = HTTP_RULE_RES_STOP;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_YIELD:
 					s->current_rule = rule;
+					if (act_opts & ACT_OPT_FINAL) {
+						send_log(s->be, LOG_WARNING,
+							 "Internal error: action yields while it is no long allowed "
+							 "for the http-response/http-after-response actions.");
+						s->last_entity.type = STRM_ENTITY_RULE;
+						s->last_entity.ptr  = rule;
+						rule_ret = HTTP_RULE_RES_ERROR;
+						goto end;
+					}
+					s->waiting_entity.type = STRM_ENTITY_RULE;
+					s->waiting_entity.ptr  = rule;
 					rule_ret = HTTP_RULE_RES_YIELD;
 					goto end;
 				case ACT_RET_ERR:
 					rule_ret = HTTP_RULE_RES_ERROR;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_DONE:
 					rule_ret = HTTP_RULE_RES_DONE;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_DENY:
 					if (txn->status == -1)
 						txn->status = 502;
 					rule_ret = HTTP_RULE_RES_DENY;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_ABRT:
 					rule_ret = HTTP_RULE_RES_ABRT;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 				case ACT_RET_INV:
 					rule_ret = HTTP_RULE_RES_BADREQ;
-					s->last_rule_file = rule->conf.file;
-					s->last_rule_line = rule->conf.line;
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
 					goto end;
 			}
 			continue; /* eval the next rule */
@@ -2898,16 +3058,16 @@ resume_execution:
 		switch (rule->action) {
 			case ACT_ACTION_ALLOW:
 				rule_ret = HTTP_RULE_RES_STOP; /* "allow" rules are OK */
-				s->last_rule_file = rule->conf.file;
-				s->last_rule_line = rule->conf.line;
+				s->last_entity.type = STRM_ENTITY_RULE;
+				s->last_entity.ptr  = rule;
 				goto end;
 
 			case ACT_ACTION_DENY:
 				txn->status = rule->arg.http_reply->status;
 				txn->http_reply = rule->arg.http_reply;
 				rule_ret = HTTP_RULE_RES_DENY;
-				s->last_rule_file = rule->conf.file;
-				s->last_rule_line = rule->conf.line;
+				s->last_entity.type = STRM_ENTITY_RULE;
+				s->last_entity.ptr  = rule;
 				goto end;
 
 			case ACT_HTTP_REDIR: {
@@ -2917,8 +3077,8 @@ resume_execution:
 					break;
 
 				rule_ret = ret ? HTTP_RULE_RES_ABRT : HTTP_RULE_RES_ERROR;
-				s->last_rule_file = rule->conf.file;
-				s->last_rule_line = rule->conf.line;
+				s->last_entity.type = STRM_ENTITY_RULE;
+				s->last_entity.ptr  = rule;
 				goto end;
 			}
 			/* other flags exists, but normally, they never be matched. */
@@ -2934,7 +3094,7 @@ resume_execution:
 
   end:
 	/* if the ruleset evaluation is finished reset the strict mode */
-	if (rule_ret != HTTP_RULE_RES_YIELD)
+	if (rule_ret != HTTP_RULE_RES_YIELD && rule_ret != HTTP_RULE_RES_FYIELD)
 		txn->rsp.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	/* we reached the end of the rules, nothing to report */
@@ -2958,8 +3118,7 @@ int http_eval_after_res_rules(struct stream *s)
 
 	/* prune the request variables if not already done and swap to the response variables. */
 	if (s->vars_reqres.scope != SCOPE_RES) {
-		if (!LIST_ISEMPTY(&s->vars_reqres.head))
-			vars_prune(&s->vars_reqres, s->sess, s);
+		vars_prune(&s->vars_reqres, s->sess, s);
 		vars_init_head(&s->vars_reqres, SCOPE_RES);
 	}
 
@@ -3287,7 +3446,7 @@ static void http_manage_client_side_cookies(struct stream *s, struct channel *re
 							txn->flags &= ~TX_CK_MASK;
 							txn->flags |= (srv->cur_state != SRV_ST_STOPPED) ? TX_CK_VALID : TX_CK_DOWN;
 							s->flags |= SF_DIRECT | SF_ASSIGNED;
-							s->target = &srv->obj_type;
+							stream_set_srv_target(s, srv);
 							break;
 						} else {
 							/* we found a server, but it's down,
@@ -3814,16 +3973,16 @@ void http_check_response_for_cacheability(struct stream *s, struct channel *res)
 
 /*
  * In a GET, HEAD or POST request, check if the requested URI matches the stats uri
- * for the current backend.
+ * for the current proxy.
  *
  * It is assumed that the request is either a HEAD, GET, or POST and that the
  * uri_auth field is valid.
  *
  * Returns 1 if stats should be provided, otherwise 0.
  */
-static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *backend)
+static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct proxy *px)
 {
-	struct uri_auth *uri_auth = backend->uri_auth;
+	struct uri_auth *uri_auth = px->uri_auth;
 	struct htx *htx;
 	struct htx_sl *sl;
 	struct ist uri;
@@ -3860,13 +4019,13 @@ static int http_stats_check_uri(struct stream *s, struct http_txn *txn, struct p
  * s->target which is supposed to already point to the stats applet. The caller
  * is expected to have already assigned an appctx to the stream.
  */
-static int http_handle_stats(struct stream *s, struct channel *req)
+static int http_handle_stats(struct stream *s, struct channel *req, struct proxy *px)
 {
 	struct stats_admin_rule *stats_admin_rule;
 	struct session *sess = s->sess;
 	struct http_txn *txn = s->txn;
 	struct http_msg *msg = &txn->req;
-	struct uri_auth *uri_auth = s->be->uri_auth;
+	struct uri_auth *uri_auth = px->uri_auth;
 	const char *h, *lookup, *end;
 	struct appctx *appctx = __sc_appctx(s->scb);
 	struct show_stat_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
@@ -3876,10 +4035,12 @@ static int http_handle_stats(struct stream *s, struct channel *req)
 	appctx->st1 = 0;
 	ctx->state = STAT_STATE_INIT;
 	ctx->st_code = STAT_STATUS_INIT;
+	ctx->http_px = px;
 	ctx->flags |= uri_auth->flags;
-	ctx->flags |= STAT_FMT_HTML; /* assume HTML mode by default */
+	ctx->flags |= STAT_F_FMT_HTML; /* assume HTML mode by default */
 	if ((msg->flags & HTTP_MSGF_VER_11) && (txn->meth != HTTP_METH_HEAD))
-		ctx->flags |= STAT_CHUNKED;
+		ctx->flags |= STAT_F_CHUNKED;
+	watcher_init(&ctx->srv_watch, &ctx->obj2, offsetof(struct server, watcher_list));
 
 	htx = htxbuf(&req->buf);
 	sl = http_get_stline(htx);
@@ -3888,14 +4049,14 @@ static int http_handle_stats(struct stream *s, struct channel *req)
 
 	for (h = lookup; h <= end - 3; h++) {
 		if (memcmp(h, ";up", 3) == 0) {
-			ctx->flags |= STAT_HIDE_DOWN;
+			ctx->flags |= STAT_F_HIDE_DOWN;
 			break;
 		}
 	}
 
 	for (h = lookup; h <= end - 9; h++) {
 		if (memcmp(h, ";no-maint", 9) == 0) {
-			ctx->flags |= STAT_HIDE_MAINT;
+			ctx->flags |= STAT_F_HIDE_MAINT;
 			break;
 		}
 	}
@@ -3903,7 +4064,7 @@ static int http_handle_stats(struct stream *s, struct channel *req)
 	if (uri_auth->refresh) {
 		for (h = lookup; h <= end - 10; h++) {
 			if (memcmp(h, ";norefresh", 10) == 0) {
-				ctx->flags |= STAT_NO_REFRESH;
+				ctx->flags |= STAT_F_NO_REFRESH;
 				break;
 			}
 		}
@@ -3911,31 +4072,31 @@ static int http_handle_stats(struct stream *s, struct channel *req)
 
 	for (h = lookup; h <= end - 4; h++) {
 		if (memcmp(h, ";csv", 4) == 0) {
-			ctx->flags &= ~(STAT_FMT_MASK|STAT_JSON_SCHM);
+			ctx->flags &= ~(STAT_F_FMT_MASK|STAT_F_JSON_SCHM);
 			break;
 		}
 	}
 
 	for (h = lookup; h <= end - 6; h++) {
 		if (memcmp(h, ";typed", 6) == 0) {
-			ctx->flags &= ~(STAT_FMT_MASK|STAT_JSON_SCHM);
-			ctx->flags |= STAT_FMT_TYPED;
+			ctx->flags &= ~(STAT_F_FMT_MASK|STAT_F_JSON_SCHM);
+			ctx->flags |= STAT_F_FMT_TYPED;
 			break;
 		}
 	}
 
 	for (h = lookup; h <= end - 5; h++) {
 		if (memcmp(h, ";json", 5) == 0) {
-			ctx->flags &= ~(STAT_FMT_MASK|STAT_JSON_SCHM);
-			ctx->flags |= STAT_FMT_JSON;
+			ctx->flags &= ~(STAT_F_FMT_MASK|STAT_F_JSON_SCHM);
+			ctx->flags |= STAT_F_FMT_JSON;
 			break;
 		}
 	}
 
 	for (h = lookup; h <= end - 12; h++) {
 		if (memcmp(h, ";json-schema", 12) == 0) {
-			ctx->flags &= ~STAT_FMT_MASK;
-			ctx->flags |= STAT_JSON_SCHM;
+			ctx->flags &= ~STAT_F_FMT_MASK;
+			ctx->flags |= STAT_F_JSON_SCHM;
 			break;
 		}
 	}
@@ -3993,40 +4154,32 @@ static int http_handle_stats(struct stream *s, struct channel *req)
 
 	/* now check whether we have some admin rules for this request */
 	list_for_each_entry(stats_admin_rule, &uri_auth->admin_rules, list) {
-		int ret = 1;
+		if (!acl_match_cond(stats_admin_rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
-		if (stats_admin_rule->cond) {
-			ret = acl_exec_cond(stats_admin_rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (stats_admin_rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-		}
-
-		if (ret) {
-			/* no rule, or the rule matches */
-			ctx->flags |= STAT_ADMIN;
-			break;
-		}
+		/* no rule, or the rule matches */
+		ctx->flags |= STAT_F_ADMIN;
+		break;
 	}
 
 	if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 		appctx->st0 = STAT_HTTP_HEAD;
 	else if (txn->meth == HTTP_METH_POST) {
-		if (ctx->flags & STAT_ADMIN) {
+		if (ctx->flags & STAT_F_ADMIN) {
 			appctx->st0 = STAT_HTTP_POST;
 			if (msg->msg_state < HTTP_MSG_DATA)
 				req->analysers |= AN_REQ_HTTP_BODY;
 		}
 		else {
 			/* POST without admin level */
-			ctx->flags &= ~STAT_CHUNKED;
+			ctx->flags &= ~STAT_F_CHUNKED;
 			ctx->st_code = STAT_STATUS_DENY;
 			appctx->st0 = STAT_HTTP_LAST;
 		}
 	}
 	else {
 		/* Unsupported method */
-		ctx->flags &= ~STAT_CHUNKED;
+		ctx->flags &= ~STAT_F_CHUNKED;
 		ctx->st_code = STAT_STATUS_IVAL;
 		appctx->st0 = STAT_HTTP_LAST;
 	}
@@ -4120,6 +4273,7 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	return ret;
 
   abort:
+	http_set_term_flags(s);
 	http_reply_and_close(s, txn->status, http_error_message(s));
 	ret = HTTP_RULE_RES_ABRT;
 	goto end;
@@ -4128,9 +4282,9 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	txn->status = 408;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_CLITO;
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
 	goto abort;
 
   abort_res:
@@ -4181,7 +4335,7 @@ void http_perform_server_redirect(struct stream *s, struct stconn *sc)
 	 * Create the 302 response
 	 */
 	htx = htx_from_buf(&res->buf);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags,
 			    ist("HTTP/1.1"), ist("302"), ist("Found"));
 	if (!sl)
@@ -4190,7 +4344,6 @@ void http_perform_server_redirect(struct stream *s, struct stconn *sc)
 	s->txn->status = 302;
 
         if (!htx_add_header(htx, ist("Cache-Control"), ist("no-cache")) ||
-	    !htx_add_header(htx, ist("Connection"), ist("close")) ||
 	    !htx_add_header(htx, ist("Content-length"), ist("0")) ||
 	    !htx_add_header(htx, ist("Location"), location))
 		goto fail;
@@ -4200,6 +4353,12 @@ void http_perform_server_redirect(struct stream *s, struct stconn *sc)
 
 	htx->flags |= HTX_FL_EOM;
 	htx_to_buf(htx, &res->buf);
+
+	if (!(s->flags & SF_ERR_MASK))
+		s->flags |= SF_ERR_LOCAL;
+	if (!(s->flags & SF_FINST_MASK))
+		s->flags |= SF_FINST_C;
+
 	if (!http_forward_proxy_resp(s, 1))
 		goto fail;
 
@@ -4209,10 +4368,6 @@ void http_perform_server_redirect(struct stream *s, struct stconn *sc)
 	s->conn_err_type = STRM_ET_NONE;
 	sc->state = SC_ST_CLO;
 
-	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_LOCAL;
-	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= SF_FINST_C;
 
 	/* FIXME: we should increase a counter of redirects per server and per backend. */
 	srv_inc_sess_ctr(srv);
@@ -4314,7 +4469,7 @@ static void http_end_request(struct stream *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shut_wanted to take effect.
 		 */
-		if (channel_is_empty(chn)) {
+		if (!co_data(chn)) {
 			txn->req.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}
@@ -4417,7 +4572,7 @@ static void http_end_response(struct stream *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shut_wanted to take effect.
 		 */
-		if (channel_is_empty(chn)) {
+		if (!co_data(chn)) {
 			txn->rsp.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}
@@ -4470,7 +4625,8 @@ int http_forward_proxy_resp(struct stream *s, int final)
 	size_t data;
 
 	if (final) {
-		htx->flags |= HTX_FL_PROXY_RESP;
+		if (s->txn->server_status == -1)
+			s->txn->server_status = 0;
 
 		if (!htx_is_empty(htx) && !http_eval_after_res_rules(s))
 			return 0;
@@ -4505,11 +4661,12 @@ int http_forward_proxy_resp(struct stream *s, int final)
 void http_server_error(struct stream *s, struct stconn *sc, int err,
 		       int finst, struct http_reply *msg)
 {
-	http_reply_and_close(s, s->txn->status, msg);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= err;
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= finst;
+
+	http_reply_and_close(s, s->txn->status, msg);
 }
 
 void http_reply_and_close(struct stream *s, short status, struct http_reply *msg)
@@ -5036,6 +5193,7 @@ struct http_txn *http_create_txn(struct stream *s)
 	txn->meth = HTTP_METH_OTHER;
 	txn->flags = ((sc && sc_ep_test(sc, SE_FL_NOT_FIRST)) ? TX_NOT_FIRST : 0);
 	txn->status = -1;
+	txn->server_status = -1;
 	txn->http_reply = NULL;
 	txn->l7_buffer = BUF_NULL;
 	write_u32(txn->cache_hash, 0);
@@ -5079,10 +5237,8 @@ void http_destroy_txn(struct stream *s)
 	txn->srv_cookie = NULL;
 	txn->cli_cookie = NULL;
 
-	if (!LIST_ISEMPTY(&s->vars_txn.head))
-		vars_prune(&s->vars_txn, s->sess, s);
-	if (!LIST_ISEMPTY(&s->vars_reqres.head))
-		vars_prune(&s->vars_reqres, s->sess, s);
+	vars_prune(&s->vars_txn, s->sess, s);
+	vars_prune(&s->vars_reqres, s->sess, s);
 
 	b_free(&txn->l7_buffer);
 
@@ -5138,7 +5294,7 @@ void http_set_term_flags(struct stream *s)
 }
 
 
-DECLARE_POOL(pool_head_http_txn, "http_txn", sizeof(struct http_txn));
+DECLARE_TYPED_POOL(pool_head_http_txn, "http_txn", struct http_txn);
 
 /*
  * Local variables:

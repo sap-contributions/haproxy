@@ -11,15 +11,10 @@ permissions:
 jobs:
   h2spec:
     name: h2spec
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-        - TARGET: linux-glibc
-          CC: gcc
-          os: ubuntu-latest
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'haproxy' || github.event_name == 'workflow_dispatch' }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Install h2spec
       id: install-h2spec
       run: |
@@ -28,13 +23,13 @@ jobs:
         tar xvf h2spec.tar.gz
         sudo install -m755 h2spec /usr/local/bin/h2spec
         echo "version=${H2SPEC_VERSION}" >> $GITHUB_OUTPUT
-    - name: Compile HAProxy with ${{ matrix.CC }}
+    - name: Compile HAProxy with gcc
       run: |
         make -j$(nproc) all \
           ERR=1 \
-          TARGET=${{ matrix.TARGET }} \
-          CC=${{ matrix.CC }} \
-          DEBUG="-DDEBUG_STRICT -DDEBUG_MEMORY_POOLS -DDEBUG_POOL_INTEGRITY" \
+          TARGET=linux-glibc \
+          CC=gcc \
+          DEBUG="-DDEBUG_POOL_INTEGRITY" \
           USE_OPENSSL=1
         sudo make install
     - name: Show HAProxy version

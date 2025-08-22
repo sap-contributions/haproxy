@@ -58,215 +58,6 @@ static int resolvers_disabled = 0;
 static int httpclient_retries = CONN_RETRIES;
 static int httpclient_timeout_connect = MS_TO_TICKS(5000);
 
-/* --- This part of the file implement an HTTP client over the CLI ---
- * The functions will be  starting by "hc_cli" for "httpclient cli"
- */
-
-/* the CLI context for the httpclient command */
-struct hcli_svc_ctx {
-	struct httpclient *hc;  /* the httpclient instance */
-	uint flags;             /* flags from HC_CLI_F_* above */
-};
-
-/* These are the callback used by the HTTP Client when it needs to notify new
- * data, we only sets a flag in the IO handler via the svcctx.
- */
-void hc_cli_res_stline_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct hcli_svc_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_STLINE;
-	appctx_wakeup(appctx);
-}
-
-void hc_cli_res_headers_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct hcli_svc_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_HDR;
-	appctx_wakeup(appctx);
-}
-
-void hc_cli_res_body_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct hcli_svc_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_BODY;
-	appctx_wakeup(appctx);
-}
-
-void hc_cli_res_end_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct hcli_svc_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_END;
-	appctx_wakeup(appctx);
-}
-
-/*
- * Parse an httpclient keyword on the cli:
- * httpclient <ID> <method> <URI>
- */
-static int hc_cli_parse(char **args, char *payload, struct appctx *appctx, void *private)
-{
-	struct hcli_svc_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
-	struct httpclient *hc;
-	char *err = NULL;
-	enum http_meth_t meth;
-	char *meth_str;
-	struct ist uri;
-	struct ist body = IST_NULL;
-
-	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
-		return 1;
-
-	if (!*args[1] || !*args[2]) {
-		memprintf(&err, ": not enough parameters");
-		goto err;
-	}
-
-	meth_str = args[1];
-	uri = ist(args[2]);
-
-	if (payload)
-		body = ist(payload);
-
-	meth = find_http_meth(meth_str, strlen(meth_str));
-
-	hc = httpclient_new(appctx, meth, uri);
-	if (!hc) {
-		goto err;
-	}
-
-	/* update the httpclient callbacks */
-	hc->ops.res_stline = hc_cli_res_stline_cb;
-	hc->ops.res_headers = hc_cli_res_headers_cb;
-	hc->ops.res_payload = hc_cli_res_body_cb;
-	hc->ops.res_end = hc_cli_res_end_cb;
-
-	ctx->hc = hc; /* store the httpclient ptr in the applet */
-	ctx->flags = 0;
-
-	if (httpclient_req_gen(hc, hc->req.url, hc->req.meth, NULL, body) != ERR_NONE)
-		goto err;
-
-
-	if (!httpclient_start(hc))
-		goto err;
-
-	return 0;
-
-err:
-	memprintf(&err, "Can't start the HTTP client%s.\n", err ? err : "");
-	return cli_err(appctx, err);
-}
-
-/* This function dumps the content of the httpclient receive buffer
- * on the CLI output
- *
- * Return 1 when the processing is finished
- * return 0 if it needs to be called again
- */
-static int hc_cli_io_handler(struct appctx *appctx)
-{
-	struct hcli_svc_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
-	struct httpclient *hc = ctx->hc;
-	struct http_hdr *hdrs, *hdr;
-
-	if (ctx->flags & HC_F_RES_STLINE) {
-		chunk_printf(&trash, "%.*s %d %.*s\n", (unsigned int)istlen(hc->res.vsn), istptr(hc->res.vsn),
-			     hc->res.status, (unsigned int)istlen(hc->res.reason), istptr(hc->res.reason));
-		if (applet_putchk(appctx, &trash) == -1)
-			goto more;
-		ctx->flags &= ~HC_F_RES_STLINE;
-	}
-
-	if (ctx->flags & HC_F_RES_HDR) {
-		chunk_reset(&trash);
-		hdrs = hc->res.hdrs;
-		for (hdr = hdrs; isttest(hdr->v); hdr++) {
-			if (!h1_format_htx_hdr(hdr->n, hdr->v, &trash))
-				goto too_many_hdrs;
-		}
-		if (!chunk_memcat(&trash, "\r\n", 2))
-			goto too_many_hdrs;
-		if (applet_putchk(appctx, &trash) == -1)
-			goto more;
-		ctx->flags &= ~HC_F_RES_HDR;
-	}
-
-	if (ctx->flags & HC_F_RES_BODY) {
-		int ret;
-
-		ret = httpclient_res_xfer(hc, sc_ib(sc));
-		channel_add_input(sc_ic(sc), ret); /* forward what we put in the buffer channel */
-
-		/* remove the flag if the buffer was emptied */
-		if (httpclient_data(hc))
-			goto more;
-		ctx->flags &= ~HC_F_RES_BODY;
-	}
-
-	/* we must close only if F_END is the last flag */
-	if (ctx->flags ==  HC_F_RES_END) {
-		ctx->flags &= ~HC_F_RES_END;
-		goto end;
-	}
-
-more:
-	if (!ctx->flags)
-		applet_have_no_more_data(appctx);
-	return 0;
-end:
-	return 1;
-
-too_many_hdrs:
-	return cli_err(appctx, "Too many headers.\n");
-}
-
-static void hc_cli_release(struct appctx *appctx)
-{
-	struct hcli_svc_ctx *ctx = appctx->svcctx;
-	struct httpclient *hc = ctx->hc;
-
-	/* Everything possible was printed on the CLI, we can destroy the client */
-	httpclient_stop_and_destroy(hc);
-
-	return;
-}
-
-/* register cli keywords */
-static struct cli_kw_list cli_kws = {{ },{
-	{ { "httpclient", NULL }, "httpclient <method> <URI>               : launch an HTTP request", hc_cli_parse, hc_cli_io_handler, hc_cli_release,  NULL, ACCESS_EXPERT},
-	{ { NULL }, NULL, NULL, NULL }
-}};
-
-INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
-
-
-/* --- This part of the file implements the actual HTTP client API --- */
-
 /*
  * Generate a simple request and fill the httpclient request buffer with it.
  * The request contains a request line generated from the absolute <url> and
@@ -281,11 +72,14 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 	struct htx *htx;
 	int err_code = 0;
 	struct ist meth_ist, vsn;
-	unsigned int flags = HTX_SL_F_VER_11 | HTX_SL_F_NORMALIZED_URI | HTX_SL_F_HAS_SCHM;
+	unsigned int flags = HTX_SL_F_VER_11 | HTX_SL_F_HAS_SCHM | HTX_SL_F_HAS_AUTHORITY;
 	int i;
 	int foundhost = 0, foundaccept = 0, foundua = 0;
 
-	if (!b_alloc(&hc->req.buf))
+	if (!(hc->options & HTTPCLIENT_O_HTTPPROXY))
+		flags |= HTX_SL_F_NORMALIZED_URI;
+
+	if (!b_alloc(&hc->req.buf, DB_CHANNEL))
 		goto error;
 
 	if (meth >= HTTP_METH_OTHER)
@@ -342,13 +136,20 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 			goto error;
 	}
 
+	if (isttest(payload) && istlen(payload)) {
+		/* add the Content-Length of the payload when not using the callback */
+
+		if (!htx_add_header(htx, ist("Content-Length"), ist(ultoa(istlen(payload)))))
+			goto error;
+
+	}
 
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto error;
 
 	if (isttest(payload) && istlen(payload)) {
-		/* add the payload if it can feat in the buffer, no need to set
-		 * the Content-Length, the data will be sent chunked */
+		/* add the payload if it can feat in the buffer, Content-Length was added before */
+
 		if (!htx_add_data_atonce(htx, payload))
 			goto error;
 	}
@@ -378,10 +179,11 @@ int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst)
 	int ret;
 
 	ret = b_force_xfer(dst, &hc->res.buf, MIN(room, b_data(&hc->res.buf)));
+
 	/* call the client once we consumed all data */
 	if (!b_data(&hc->res.buf)) {
 		b_free(&hc->res.buf);
-		if (hc->appctx)
+		if (ret && hc->appctx)
 			appctx_wakeup(hc->appctx);
 	}
 	return ret;
@@ -403,18 +205,21 @@ int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
 	int ret = 0;
 	struct htx *htx;
 
-	if (!b_alloc(&hc->req.buf))
-		goto error;
+	if (hc->flags & HTTPCLIENT_FA_DRAIN_REQ) {
+		ret = istlen(src);
+		goto end;
+	}
+
+	if (!b_alloc(&hc->req.buf, DB_CHANNEL))
+		goto end;
 
 	htx = htx_from_buf(&hc->req.buf);
 	if (!htx)
-		goto error;
-
-	if (hc->appctx)
-		appctx_wakeup(hc->appctx);
-
+		goto end;
 	ret += htx_add_data(htx, src);
 
+	if (ret && hc->appctx)
+		appctx_wakeup(hc->appctx);
 
 	/* if we copied all the data and the end flag is set */
 	if ((istlen(src) == ret) && end) {
@@ -426,13 +231,13 @@ int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
 		 */
 		if (htx_is_empty(htx)) {
 			if (!htx_add_endof(htx, HTX_BLK_EOT))
-				goto error;
+				goto end;
 		}
 		htx->flags |= HTX_FL_EOM;
 	}
 	htx_to_buf(htx, &hc->req.buf);
 
-error:
+  end:
 
 	return ret;
 }
@@ -455,8 +260,8 @@ int httpclient_set_dst(struct httpclient *hc, const char *dst)
 
 	sockaddr_free(&hc->dst);
 	/* 'sk' is statically allocated (no need to be freed). */
-	sk = str2sa_range(dst, NULL, NULL, NULL, NULL, NULL,
-	                  &errmsg, NULL, NULL,
+	sk = str2sa_range(dst, NULL, NULL, NULL, NULL, NULL, NULL,
+	                  &errmsg, NULL, NULL, NULL,
 	                  PA_O_PORT_OK | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
 	if (!sk) {
 		ha_alert("httpclient: Failed to parse destination address in %s\n", errmsg);
@@ -603,16 +408,20 @@ void httpclient_destroy(struct httpclient *hc)
 	/* request */
 	istfree(&hc->req.url);
 	b_free(&hc->req.buf);
-	/* response */
-	istfree(&hc->res.vsn);
-	istfree(&hc->res.reason);
-	hdrs = hc->res.hdrs;
-	while (hdrs && isttest(hdrs->n)) {
-		istfree(&hdrs->n);
-		istfree(&hdrs->v);
-		hdrs++;
+
+	if (!(hc->options & HTTPCLIENT_O_RES_HTX)) {
+		/* response */
+		istfree(&hc->res.vsn);
+		istfree(&hc->res.reason);
+		hdrs = hc->res.hdrs;
+		while (hdrs && isttest(hdrs->n)) {
+			istfree(&hdrs->n);
+			istfree(&hdrs->v);
+			hdrs++;
+		}
+		ha_free(&hc->res.hdrs);
 	}
-	ha_free(&hc->res.hdrs);
+
 	b_free(&hc->res.buf);
 	sockaddr_free(&hc->dst);
 
@@ -628,6 +437,9 @@ void httpclient_destroy(struct httpclient *hc)
 struct httpclient *httpclient_new(void *caller, enum http_meth_t meth, struct ist url)
 {
 	struct httpclient *hc;
+
+	if (!httpclient_proxy)
+		return NULL;
 
 	hc = calloc(1, sizeof(*hc));
 	if (!hc)
@@ -655,6 +467,9 @@ err:
 struct httpclient *httpclient_new_from_proxy(struct proxy *px, void *caller, enum http_meth_t meth, struct ist url)
 {
 	struct httpclient *hc;
+
+	if (!px)
+		return NULL;
 
 	hc = httpclient_new(caller, meth, url);
 	if (!hc)
@@ -690,151 +505,186 @@ int httpclient_set_proxy(struct httpclient *hc, struct proxy *px)
 	return 0;
 }
 
-static void httpclient_applet_io_handler(struct appctx *appctx)
+void httpclient_applet_io_handler(struct appctx *appctx)
 {
 	struct httpclient *hc = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
-	struct stream *s = __sc_strm(sc);
-	struct channel *req = &s->req;
-	struct channel *res = &s->res;
+	struct buffer *outbuf, *inbuf;
 	struct htx_blk *blk = NULL;
 	struct htx *htx;
 	struct htx_sl *sl = NULL;
 	uint32_t hdr_num;
-	uint32_t sz;
 	int ret;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
-		if (co_data(res)) {
-			htx = htx_from_buf(&res->buf);
-			co_htx_skip(res, htx, co_data(res));
-			htx_to_buf(htx, &res->buf);
-		}
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
+		applet_reset_input(appctx);
 		goto out;
 	}
+
 	/* The IO handler could be called after the release, so we need to
 	 * check if hc is still there to run the IO handler */
 	if (!hc)
 		goto out;
 
 	while (1) {
-
 		/* required to stop */
 		if (hc->flags & HTTPCLIENT_FA_STOP)
 			goto error;
 
 		switch(appctx->st0) {
-
 			case HTTPCLIENT_S_REQ:
+				outbuf = applet_get_outbuf(appctx);
+				if (outbuf == NULL) {
+					applet_have_more_data(appctx);
+					goto out;
+				}
+
 				/* we know that the buffer is empty here, since
 				 * it's the first call, we can freely copy the
 				 * request from the httpclient buffer */
-				ret = b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
+				ret = b_xfer(outbuf, &hc->req.buf, b_data(&hc->req.buf));
 				if (!ret) {
-					sc_need_room(sc, 0);
+					applet_have_more_data(appctx);
 					goto out;
 				}
 
 				if (!b_data(&hc->req.buf))
 					b_free(&hc->req.buf);
 
-				htx = htx_from_buf(&req->buf);
-				if (!htx) {
-					sc_need_room(sc, 0);
+				htx = htxbuf(outbuf);
+				if (htx_is_empty(htx)) {
+					applet_have_more_data(appctx);
 					goto out;
 				}
 
-				channel_add_input(req, htx->data);
-
-				if (htx->flags & HTX_FL_EOM) /* check if a body need to be added */
+				if (htx->flags & HTX_FL_EOM) { /* check if a body need to be added */
 					appctx->st0 = HTTPCLIENT_S_RES_STLINE;
-				else
-					appctx->st0 = HTTPCLIENT_S_REQ_BODY;
+					applet_set_eoi(appctx);
+					goto out; /* we need to leave the IO handler once we wrote the request */
+				}
 
-				goto out; /* we need to leave the IO handler once we wrote the request */
-				break;
+				applet_have_more_data(appctx);
+				appctx->st0 = HTTPCLIENT_S_REQ_BODY;
+				__fallthrough;
 
 			case HTTPCLIENT_S_REQ_BODY:
+				outbuf = applet_get_outbuf(appctx);
+				if (outbuf == NULL) {
+					applet_have_more_data(appctx);
+					goto out;
+				}
+
 				/* call the payload callback */
-				{
-					if (hc->ops.req_payload) {
-						struct htx *hc_htx;
+				if (hc->ops.req_payload) {
+					struct htx *hc_htx;
 
-						/* call the request callback */
-						hc->ops.req_payload(hc);
-
-						hc_htx = htxbuf(&hc->req.buf);
-						if (htx_is_empty(hc_htx))
-							goto out;
-
-						htx = htx_from_buf(&req->buf);
-						if (htx_is_empty(htx)) {
-							size_t data = hc_htx->data;
-
-							/* Here htx_to_buf() will set buffer data to 0 because
-							 * the HTX is empty, and allow us to do an xfer.
-							 */
-							htx_to_buf(hc_htx, &hc->req.buf);
-							htx_to_buf(htx, &req->buf);
-							b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
-							channel_add_input(req, data);
-						} else {
-							struct htx_ret ret;
-
-							ret = htx_xfer_blks(htx, hc_htx, htx_used_space(hc_htx), HTX_BLK_UNUSED);
-							channel_add_input(req, ret.ret);
-
-							/* we must copy the EOM if we empty the buffer */
-							if (htx_is_empty(hc_htx)) {
-								htx->flags |= (hc_htx->flags & HTX_FL_EOM);
-							}
-							htx_to_buf(htx, &req->buf);
-							htx_to_buf(hc_htx, &hc->req.buf);
-						}
-
-
-						if (!b_data(&hc->req.buf))
-							b_free(&hc->req.buf);
+					if (applet_input_data(appctx)) {
+						/* A response was received but we are still process the request.
+						 * It is unexpected and not really supported with the current API.
+						 * So lets drain the request to avoid any issue.
+						 */
+						b_reset(outbuf);
+						hc->flags |= HTTPCLIENT_FA_DRAIN_REQ;
+						appctx->st0 = HTTPCLIENT_S_RES_STLINE;
+						break;
 					}
 
-					htx = htxbuf(&req->buf);
+					/* call the request callback */
+					hc->ops.req_payload(hc);
 
-					/* if the request contains the HTX_FL_EOM, we finished the request part. */
-					if (htx->flags & HTX_FL_EOM)
-						appctx->st0 = HTTPCLIENT_S_RES_STLINE;
+					hc_htx = htxbuf(&hc->req.buf);
+					if (htx_is_empty(hc_htx))
+						goto out;
 
-					goto process_data; /* we need to leave the IO handler once we wrote the request */
+					htx = htx_from_buf(outbuf);
+					if (htx_is_empty(htx)) {
+						/* Here htx_to_buf() will set buffer data to 0 because
+						 * the HTX is empty, and allow us to do an xfer.
+						 */
+						htx_to_buf(hc_htx, &hc->req.buf);
+						htx_to_buf(htx, outbuf);
+						b_xfer(outbuf, &hc->req.buf, b_data(&hc->req.buf));
+					} else {
+						struct htx_ret ret;
+
+						ret = htx_xfer_blks(htx, hc_htx, htx_used_space(hc_htx), HTX_BLK_UNUSED);
+						if (!ret.ret) {
+							applet_have_more_data(appctx);
+							goto out;
+						}
+
+						/* we must copy the EOM if we empty the buffer */
+						if (htx_is_empty(hc_htx)) {
+							htx->flags |= (hc_htx->flags & HTX_FL_EOM);
+						}
+						htx_to_buf(htx, outbuf);
+						htx_to_buf(hc_htx, &hc->req.buf);
+					}
+
+					if (!b_data(&hc->req.buf))
+						b_free(&hc->req.buf);
 				}
-				break;
+
+				htx = htxbuf(outbuf);
+
+				/* if the request contains the HTX_FL_EOM, we finished the request part. */
+				if (htx->flags & HTX_FL_EOM) {
+					appctx->st0 = HTTPCLIENT_S_RES_STLINE;
+					applet_set_eoi(appctx);
+					goto out; /* we need to leave the IO handler once we wrote the request */
+				}
+
+				applet_have_more_data(appctx);
+				goto out;
 
 			case HTTPCLIENT_S_RES_STLINE:
-				/* Request is finished, report EOI */
-				se_fl_set(appctx->sedesc, SE_FL_EOI);
+				applet_will_consume(appctx);
+				inbuf = applet_get_inbuf(appctx);
+				if (inbuf == NULL || !applet_input_data(appctx)) {
+					applet_need_more_data(appctx);
+					goto out;
+				}
+
+				/* in HTX mode, don't try to copy the stline
+				 * alone, we must copy the headers with it */
+                                if (hc->options & HTTPCLIENT_O_RES_HTX) {
+					appctx->st0 = HTTPCLIENT_S_RES_HDR;
+					break;
+				}
 
 				/* copy the start line in the hc structure,then remove the htx block */
-				if (!co_data(res))
-					goto out;
-				htx = htxbuf(&res->buf);
-				if (htx_is_empty(htx))
-					goto out;
-				blk = htx_get_head_blk(htx);
-				if (blk && (htx_get_blk_type(blk) == HTX_BLK_RES_SL))
-					sl = htx_get_blk_ptr(htx, blk);
-				if (!sl || (!(sl->flags & HTX_SL_F_IS_RESP)))
-					goto out;
+				htx = htxbuf(inbuf);
+				if (htx_get_first_type(htx) != HTX_BLK_RES_SL)
+					goto error;
+				blk = DISGUISE(htx_get_head_blk(htx));
+				sl = htx_get_blk_ptr(htx, blk);
+
+				/* Skipp any 1XX interim responses */
+				if (sl->info.res.status < 200) {
+					/* Upgrade are not supported. Report an error */
+					if (sl->info.res.status == 101)
+						goto error;
+
+					while (blk) {
+						enum htx_blk_type type = htx_get_blk_type(blk);
+
+						blk = htx_remove_blk(htx, blk);
+						if (type == HTX_BLK_EOH) {
+							htx_to_buf(htx, inbuf);
+							break;
+						}
+					}
+					break;
+				}
 
 				/* copy the status line in the httpclient */
 				hc->res.status = sl->info.res.status;
 				hc->res.vsn = istdup(htx_sl_res_vsn(sl));
 				hc->res.reason = istdup(htx_sl_res_reason(sl));
-				sz = htx_get_blksz(blk);
-				c_rew(res, sz);
 				htx_remove_blk(htx, blk);
+
 				/* caller callback */
 				if (hc->ops.res_stline)
 					hc->ops.res_stline(hc);
-
-				htx_to_buf(htx, &res->buf);
 
 				/* if there is no HTX data anymore and the EOM flag is
 				 * set, leave (no body) */
@@ -843,30 +693,58 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				else
 					appctx->st0 = HTTPCLIENT_S_RES_HDR;
 
+				applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+				htx_to_buf(htx, inbuf);
 				break;
 
 			case HTTPCLIENT_S_RES_HDR:
+				applet_will_consume(appctx);
+				inbuf = applet_get_inbuf(appctx);
+				if (inbuf == NULL || !applet_input_data(appctx)) {
+					applet_need_more_data(appctx);
+					goto out;
+				}
+
+				htx = htxbuf(inbuf);
+				BUG_ON(htx_is_empty(htx));
+
+				if (hc->options & HTTPCLIENT_O_RES_HTX) {
+					/* HTX mode transfers the header to the hc buffer */
+					struct htx *hc_htx;
+					struct htx_ret ret;
+
+					if (!b_alloc(&hc->res.buf, DB_MUX_TX)) {
+						applet_wont_consume(appctx);
+						goto out;
+					}
+					hc_htx = htxbuf(&hc->res.buf);
+
+					/* xfer the headers */
+					ret = htx_xfer_blks(hc_htx, htx, htx_used_space(htx), HTX_BLK_EOH);
+					if (!ret.ret) {
+						applet_need_more_data(appctx);
+						goto out;
+					}
+					else
+						applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+
+					if (htx->flags & HTX_FL_EOM)
+						hc_htx->flags |= HTX_FL_EOM;
+
+					htx_to_buf(hc_htx, &hc->res.buf);
+
+				} else {
 				/* first copy the headers in a local hdrs
 				 * structure, once we the total numbers of the
 				 * header we allocate the right size and copy
 				 * them. The htx block of the headers are
 				 * removed each time one is read  */
-				{
 					struct http_hdr hdrs[global.tune.max_http_hdr];
-
-					if (!co_data(res))
-						goto out;
-					htx = htxbuf(&res->buf);
-					if (htx_is_empty(htx))
-						goto out;
 
 					hdr_num = 0;
 					blk = htx_get_head_blk(htx);
 					while (blk) {
 						enum htx_blk_type type = htx_get_blk_type(blk);
-						uint32_t sz = htx_get_blksz(blk);
-
-						c_rew(res, sz);
 
 						if (type == HTX_BLK_HDR) {
 							hdrs[hdr_num].n = istdup(htx_get_blk_name(htx, blk));
@@ -882,7 +760,6 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 						}
 						blk = htx_remove_blk(htx, blk);
 					}
-					htx_to_buf(htx, &res->buf);
 
 					if (hdr_num) {
 						/* alloc and copy the headers in the httpclient struct */
@@ -890,122 +767,129 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 						if (!hc->res.hdrs)
 							goto error;
 						memcpy(hc->res.hdrs, hdrs, sizeof(struct http_hdr) * (hdr_num + 1));
-
-						/* caller callback */
-						if (hc->ops.res_headers)
-							hc->ops.res_headers(hc);
-					}
-
-					/* if there is no HTX data anymore and the EOM flag is
-					 * set, leave (no body) */
-					if (htx_is_empty(htx) && htx->flags & HTX_FL_EOM) {
-						appctx->st0 = HTTPCLIENT_S_RES_END;
-					} else {
-						appctx->st0 = HTTPCLIENT_S_RES_BODY;
+						applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
 					}
 				}
+				/* caller callback */
+				if (hc->ops.res_headers)
+					hc->ops.res_headers(hc);
+
+				/* if there is no HTX data anymore and the EOM flag is
+				 * set, leave (no body) */
+				if (htx_is_empty(htx) && htx->flags & HTX_FL_EOM) {
+					appctx->st0 = HTTPCLIENT_S_RES_END;
+				} else {
+					appctx->st0 = HTTPCLIENT_S_RES_BODY;
+				}
+
+				htx_to_buf(htx, inbuf);
 				break;
 
 			case HTTPCLIENT_S_RES_BODY:
+				applet_will_consume(appctx);
+				inbuf = applet_get_inbuf(appctx);
+				if (inbuf == NULL || !applet_input_data(appctx)) {
+					applet_need_more_data(appctx);
+					goto out;
+				}
+
 				/*
 				 * The IO handler removes the htx blocks in the response buffer and
 				 * push them in the hc->res.buf buffer in a raw format.
 				 */
-				if (!co_data(res))
+				htx = htxbuf(inbuf);
+				if (htx_is_empty(htx)) {
+					applet_need_more_data(appctx);
 					goto out;
+				}
 
-				htx = htxbuf(&res->buf);
-				if (htx_is_empty(htx))
+				if (!b_alloc(&hc->res.buf, DB_MUX_TX)) {
+					applet_wont_consume(appctx);
 					goto out;
+				}
 
-				if (!b_alloc(&hc->res.buf))
-					goto out;
+				if (hc->options & HTTPCLIENT_O_RES_HTX) {
+					/* HTX mode transfers the header to the hc buffer */
+					struct htx *hc_htx;
+					struct htx_ret ret;
 
-				if (b_full(&hc->res.buf))
-					goto process_data;
+					hc_htx = htxbuf(&hc->res.buf);
 
-				/* decapsule the htx data to raw data */
-				blk = htx_get_head_blk(htx);
-				while (blk) {
-					enum htx_blk_type type = htx_get_blk_type(blk);
-					size_t count = co_data(res);
-					uint32_t blksz = htx_get_blksz(blk);
-					uint32_t room = b_room(&hc->res.buf);
-					uint32_t vlen;
+					ret = htx_xfer_blks(hc_htx, htx, htx_used_space(htx), HTX_BLK_UNUSED);
+					if (!ret.ret)
+						applet_wont_consume(appctx);
+					else
+						applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
 
-					/* we should try to copy the maximum output data in a block, which fit
-					 * the destination buffer */
-					vlen = MIN(count, blksz);
-					vlen = MIN(vlen, room);
+					if (htx_is_empty(htx) && (htx->flags & HTX_FL_EOM))
+						hc_htx->flags |= HTX_FL_EOM;
 
-					if (vlen == 0) {
-						htx_to_buf(htx, &res->buf);
-						goto process_data;
-					}
+					htx_to_buf(hc_htx, &hc->res.buf);
+				} else {
 
-					if (type == HTX_BLK_DATA) {
-						struct ist v = htx_get_blk_value(htx, blk);
+					/* decapsule the htx data to raw data */
+					blk = htx_get_head_blk(htx);
+					while (blk) {
+						enum htx_blk_type type = htx_get_blk_type(blk);
 
-						__b_putblk(&hc->res.buf, v.ptr, vlen);
-						c_rew(res, vlen);
+						/* we should try to copy the maximum output data in a block, which fit
+						 * the destination buffer */
+						if (type == HTX_BLK_DATA) {
+							struct ist v = htx_get_blk_value(htx, blk);
+							uint32_t room = b_room(&hc->res.buf);
+							uint32_t vlen;
 
-						if (vlen == blksz)
+							vlen = MIN(v.len, room);
+							__b_putblk(&hc->res.buf, v.ptr, vlen);
+
+							if (vlen == v.len)
+								blk = htx_remove_blk(htx, blk);
+							else {
+								htx_cut_data_blk(htx, blk, vlen);
+								/* cannot copy everything, need to process */
+								applet_wont_consume(appctx);
+								break;
+							}
+						} else {
+							/* remove any block which is not a data block */
 							blk = htx_remove_blk(htx, blk);
-						else
-							htx_cut_data_blk(htx, blk, vlen);
-
-						/* the data must be processed by the caller in the receive phase */
-						if (hc->ops.res_payload)
-							hc->ops.res_payload(hc);
-
-						/* cannot copy everything, need to process */
-						if (vlen != blksz) {
-							htx_to_buf(htx, &res->buf);
-							goto process_data;
 						}
-					} else {
-						if (vlen != blksz) {
-							htx_to_buf(htx, &res->buf);
-							goto process_data;
-						}
-
-						/* remove any block which is not a data block */
-						c_rew(res, blksz);
-						blk = htx_remove_blk(htx, blk);
 					}
 				}
 
-				htx_to_buf(htx, &res->buf);
+				applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+
+				/* the data must be processed by the caller in the receive phase */
+				if (hc->ops.res_payload)
+					hc->ops.res_payload(hc);
 
 				/* if not finished, should be called again */
-				if (!(htx_is_empty(htx) && (htx->flags & HTX_FL_EOM)))
-					goto out;
+				if ((htx_is_empty(htx) && (htx->flags & HTX_FL_EOM))) {
+					appctx->st0 = HTTPCLIENT_S_RES_END;
+					htx_to_buf(htx, inbuf);
+					break;
+				}
 
-
-				/* end of message, we should quit */
-				appctx->st0 = HTTPCLIENT_S_RES_END;
-				break;
+				htx_to_buf(htx, inbuf);
+				applet_need_more_data(appctx);
+				goto out;
 
 			case HTTPCLIENT_S_RES_END:
-				se_fl_set(appctx->sedesc, SE_FL_EOS);
+				applet_set_eos(appctx);
 				goto out;
-				break;
 		}
 	}
 
 out:
 	return;
 
-process_data:
-	sc_will_read(sc);
-	goto out;
-
 error:
-	se_fl_set(appctx->sedesc, SE_FL_ERROR);
+	applet_set_eos(appctx);
+	applet_set_error(appctx);
 	goto out;
 }
 
-static int httpclient_applet_init(struct appctx *appctx)
+int httpclient_applet_init(struct appctx *appctx)
 {
 	struct httpclient *hc = appctx->svcctx;
 	struct stream *s;
@@ -1067,6 +951,9 @@ static int httpclient_applet_init(struct appctx *appctx)
 
 	s = appctx_strm(appctx);
 	s->target = target;
+	if (objt_server(s->target))
+		s->sv_tgcounters = __objt_server(s->target)->counters.shared.tg[tgid - 1];
+
 	/* set the "timeout server" */
 	s->scb->ioto = hc->timeout_server;
 
@@ -1093,7 +980,12 @@ static int httpclient_applet_init(struct appctx *appctx)
 	/* The request was transferred when the stream was created. So switch
 	 * directly to REQ_BODY or RES_STLINE state
 	 */
-	appctx->st0 = (hc->ops.req_payload ? HTTPCLIENT_S_REQ_BODY : HTTPCLIENT_S_RES_STLINE);
+	if (hc->ops.req_payload)
+		appctx->st0 = HTTPCLIENT_S_REQ_BODY;
+	else {
+		appctx->st0 =  HTTPCLIENT_S_RES_STLINE;
+		applet_set_eoi(appctx);
+	}
 	return 0;
 
  out_free_addr:
@@ -1102,7 +994,7 @@ static int httpclient_applet_init(struct appctx *appctx)
 	return -1;
 }
 
-static void httpclient_applet_release(struct appctx *appctx)
+void httpclient_applet_release(struct appctx *appctx)
 {
 	struct httpclient *hc = appctx->svcctx;
 
@@ -1130,8 +1022,11 @@ static void httpclient_applet_release(struct appctx *appctx)
 /* HTTP client applet */
 static struct applet httpclient_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<HTTPCLIENT>",
 	.fct = httpclient_applet_io_handler,
+	.rcv_buf = appctx_htx_rcv_buf,
+	.snd_buf = appctx_htx_snd_buf,
 	.init = httpclient_applet_init,
 	.release = httpclient_applet_release,
 };
@@ -1203,7 +1098,8 @@ struct proxy *httpclient_create_proxy(const char *id)
 	struct server *srv_ssl = NULL;
 #endif
 
-	if (global.mode & MODE_MWORKER_WAIT)
+	/* the httpclient is not usable in the master process */
+	if (master)
 		return ERR_NONE;
 
 	px = alloc_new_proxy(id, PR_CAP_LISTEN|PR_CAP_INT|PR_CAP_HTTPCLIENT, &errmsg);
@@ -1212,8 +1108,6 @@ struct proxy *httpclient_create_proxy(const char *id)
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err;
 	}
-
-	proxy_preset_defaults(px);
 
 	px->options |= PR_O_WREQ_BODY;
 	px->retry_type |= PR_RE_CONN_FAILED | PR_RE_DISCONNECTED | PR_RE_TIMEOUT;
@@ -1224,8 +1118,9 @@ struct proxy *httpclient_create_proxy(const char *id)
 	px->conn_retries = httpclient_retries;
 	px->timeout.connect = httpclient_timeout_connect;
 	px->timeout.client = TICK_ETERNITY;
-	/* The HTTP Client use the "option httplog" with the global log server */
-	px->conf.logformat_string = httpclient_log_format;
+	/* The HTTP Client use the "option httplog" with the global loggers */
+	px->logformat.str = httpclient_log_format;
+	px->logformat.conf.file = strdup("httpclient");
 	px->http_needed = 1;
 
 	/* clear HTTP server */
@@ -1236,7 +1131,7 @@ struct proxy *httpclient_create_proxy(const char *id)
 		goto err;
 	}
 
-	srv_settings_cpy(srv_raw, &px->defsrv, 0);
+	srv_settings_cpy(srv_raw, px->defsrv, 0);
 	srv_raw->iweight = 0;
 	srv_raw->uweight = 0;
 	srv_raw->xprt = xprt_get(XPRT_RAW);
@@ -1256,7 +1151,7 @@ struct proxy *httpclient_create_proxy(const char *id)
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err;
 	}
-	srv_settings_cpy(srv_ssl, &px->defsrv, 0);
+	srv_settings_cpy(srv_ssl, px->defsrv, 0);
 	srv_ssl->iweight = 0;
 	srv_ssl->uweight = 0;
 	srv_ssl->xprt = xprt_get(XPRT_SSL);
@@ -1290,6 +1185,7 @@ struct proxy *httpclient_create_proxy(const char *id)
 				goto err;
 			} else {
 				ha_free(&srv_ssl->ssl_ctx.ca_file);
+				srv_detach(srv_ssl);
 				srv_drop(srv_ssl);
 				srv_ssl = NULL;
 			}
@@ -1308,26 +1204,10 @@ struct proxy *httpclient_create_proxy(const char *id)
 		goto err;
 	}
 
-	/* link the 2 servers in the proxy */
-	srv_raw->next = px->srv;
-	px->srv = srv_raw;
-
-#ifdef USE_OPENSSL
-	if (srv_ssl) {
-		srv_ssl->next = px->srv;
-		px->srv = srv_ssl;
-	}
-#endif
-
-
 err:
 	if (err_code & ERR_CODE) {
 		ha_alert("httpclient: cannot initialize: %s\n", errmsg);
 		free(errmsg);
-		srv_drop(srv_raw);
-#ifdef USE_OPENSSL
-		srv_drop(srv_ssl);
-#endif
 		free_proxy(px);
 
 		return NULL;
@@ -1341,54 +1221,46 @@ err:
  */
 static int httpclient_precheck()
 {
-	/* initialize the default httpclient_proxy which is used for the CLI and the lua */
+	/* the httpclient is not usable in the master process */
+	if (master)
+		return ERR_NONE;
 
+	/* initialize the default httpclient_proxy which is used for the CLI and the lua */
 	httpclient_proxy = httpclient_create_proxy("<HTTPCLIENT>");
 	if (!httpclient_proxy)
-		return 1;
+		return ERR_RETRYABLE;
 
-	return 0;
+	return ERR_NONE;
 }
 
 /* Initialize the logs for every proxy dedicated to the httpclient */
 static int httpclient_postcheck_proxy(struct proxy *curproxy)
 {
 	int err_code = ERR_NONE;
-	struct logsrv *logsrv;
+	struct logger *logger;
 	char *errmsg = NULL;
 #ifdef USE_OPENSSL
 	struct server *srv = NULL;
 	struct server *srv_ssl = NULL;
 #endif
 
-	if (global.mode & MODE_MWORKER_WAIT)
+	/* the httpclient is not usable in the master process */
+	if (master)
 		return ERR_NONE;
 
 	if (!(curproxy->cap & PR_CAP_HTTPCLIENT))
 		return ERR_NONE; /* nothing to do */
 
 	/* copy logs from "global" log list */
-	list_for_each_entry(logsrv, &global.logsrvs, list) {
-		struct logsrv *node = dup_logsrv(logsrv);
+	list_for_each_entry(logger, &global.loggers, list) {
+		struct logger *node = dup_logger(logger);
 
 		if (!node) {
 			memprintf(&errmsg, "out of memory.");
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
-		LIST_APPEND(&curproxy->logsrvs, &node->list);
-	}
-	if (curproxy->conf.logformat_string) {
-		curproxy->conf.args.ctx = ARGC_LOG;
-		if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
-					    LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-					    SMP_VAL_FE_LOG_END, &errmsg)) {
-			memprintf(&errmsg, "failed to parse log-format : %s.", errmsg);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto err;
-		}
-		curproxy->conf.args.file = NULL;
-		curproxy->conf.args.line = 0;
+		LIST_APPEND(&curproxy->loggers, &node->list);
 	}
 
 #ifdef USE_OPENSSL
@@ -1403,9 +1275,22 @@ static int httpclient_postcheck_proxy(struct proxy *curproxy)
 		/* init the SNI expression */
 		/* always use the host header as SNI, without the port */
 		srv_ssl->sni_expr = strdup("req.hdr(host),field(1,:)");
-		err_code |= server_parse_sni_expr(srv_ssl, curproxy, &errmsg);
-		if (err_code & ERR_CODE) {
-			memprintf(&errmsg, "failed to configure sni: %s.", errmsg);
+		srv_ssl->ssl_ctx.sni = _parse_srv_expr(srv_ssl->sni_expr,
+		                                       &curproxy->conf.args,
+		                                       NULL, 0, NULL);
+		if (!srv_ssl->ssl_ctx.sni) {
+			memprintf(&errmsg, "failed to configure sni.");
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		srv_ssl->pool_conn_name = strdup(srv_ssl->sni_expr);
+		srv_ssl->pool_conn_name_expr = _parse_srv_expr(srv_ssl->pool_conn_name,
+		                                               &curproxy->conf.args,
+		                                               NULL, 0, NULL);
+		if (!srv_ssl->pool_conn_name_expr) {
+			memprintf(&errmsg, "failed to configure pool-conn-name.");
+			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
 	}

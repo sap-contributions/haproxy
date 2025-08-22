@@ -35,6 +35,7 @@
 
 #include <haproxy/action.h>
 #include <haproxy/api.h>
+#include <haproxy/backend.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/check.h>
 #include <haproxy/chunk.h>
@@ -54,6 +55,7 @@
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
+#include <haproxy/spoe.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
 #include <haproxy/task.h>
@@ -70,31 +72,18 @@
 struct eb_root shared_tcpchecks = EB_ROOT;
 
 
-DECLARE_POOL(pool_head_tcpcheck_rule, "tcpcheck_rule", sizeof(struct tcpcheck_rule));
+DECLARE_TYPED_POOL(pool_head_tcpcheck_rule, "tcpcheck_rule", struct tcpcheck_rule);
 
 /**************************************************************************/
 /*************** Init/deinit tcp-check rules and ruleset ******************/
 /**************************************************************************/
-/* Releases memory allocated for a log-format string */
-static void free_tcpcheck_fmt(struct list *fmt)
-{
-	struct logformat_node *lf, *lfb;
-
-	list_for_each_entry_safe(lf, lfb, fmt, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-}
-
 /* Releases memory allocated for an HTTP header used in a tcp-check send rule */
 void free_tcpcheck_http_hdr(struct tcpcheck_http_hdr *hdr)
 {
 	if (!hdr)
 		return;
 
-	free_tcpcheck_fmt(&hdr->value);
+	lf_expr_deinit(&hdr->value);
 	istfree(&hdr->name);
 	free(hdr);
 }
@@ -131,28 +120,28 @@ void free_tcpcheck(struct tcpcheck_rule *rule, int in_pool)
 			break;
 		case TCPCHK_SEND_STRING_LF:
 		case TCPCHK_SEND_BINARY_LF:
-			free_tcpcheck_fmt(&rule->send.fmt);
+			lf_expr_deinit(&rule->send.fmt);
 			break;
 		case TCPCHK_SEND_HTTP:
 			free(rule->send.http.meth.str.area);
 			if (!(rule->send.http.flags & TCPCHK_SND_HTTP_FL_URI_FMT))
 				istfree(&rule->send.http.uri);
 			else
-				free_tcpcheck_fmt(&rule->send.http.uri_fmt);
+				lf_expr_deinit(&rule->send.http.uri_fmt);
 			istfree(&rule->send.http.vsn);
 			free_tcpcheck_http_hdrs(&rule->send.http.hdrs);
 			if (!(rule->send.http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT))
 				istfree(&rule->send.http.body);
 			else
-				free_tcpcheck_fmt(&rule->send.http.body_fmt);
+				lf_expr_deinit(&rule->send.http.body_fmt);
 			break;
 		case TCPCHK_SEND_UNDEF:
 			break;
 		}
 		break;
 	case TCPCHK_ACT_EXPECT:
-		free_tcpcheck_fmt(&rule->expect.onerror_fmt);
-		free_tcpcheck_fmt(&rule->expect.onsuccess_fmt);
+		lf_expr_deinit(&rule->expect.onerror_fmt);
+		lf_expr_deinit(&rule->expect.onsuccess_fmt);
 		release_sample_expr(rule->expect.status_expr);
 		switch (rule->expect.type) {
 		case TCPCHK_EXPECT_HTTP_STATUS:
@@ -172,20 +161,20 @@ void free_tcpcheck(struct tcpcheck_rule *rule, int in_pool)
 		case TCPCHK_EXPECT_STRING_LF:
 		case TCPCHK_EXPECT_BINARY_LF:
 		case TCPCHK_EXPECT_HTTP_BODY_LF:
-			free_tcpcheck_fmt(&rule->expect.fmt);
+			lf_expr_deinit(&rule->expect.fmt);
 			break;
 		case TCPCHK_EXPECT_HTTP_HEADER:
 			if (rule->expect.flags & TCPCHK_EXPT_FL_HTTP_HNAME_REG)
 				regex_free(rule->expect.hdr.name_re);
 			else if (rule->expect.flags & TCPCHK_EXPT_FL_HTTP_HNAME_FMT)
-				free_tcpcheck_fmt(&rule->expect.hdr.name_fmt);
+				lf_expr_deinit(&rule->expect.hdr.name_fmt);
 			else
 				istfree(&rule->expect.hdr.name);
 
 			if (rule->expect.flags & TCPCHK_EXPT_FL_HTTP_HVAL_REG)
 				regex_free(rule->expect.hdr.value_re);
 			else if (rule->expect.flags & TCPCHK_EXPT_FL_HTTP_HVAL_FMT)
-				free_tcpcheck_fmt(&rule->expect.hdr.value_fmt);
+				lf_expr_deinit(&rule->expect.hdr.value_fmt);
 			else if (!(rule->expect.flags & TCPCHK_EXPT_FL_HTTP_HVAL_NONE))
 				istfree(&rule->expect.hdr.value);
 			break;
@@ -434,7 +423,7 @@ static void tcpcheck_expect_onerror_message(struct buffer *msg, struct check *ch
 		chunk_istcat(msg, info);
 		goto comment;
 	}
-	else if (!LIST_ISEMPTY(&rule->expect.onerror_fmt)) {
+	else if (!lf_expr_isempty(&rule->expect.onerror_fmt)) {
 		msg->data += sess_build_logline(check->sess, NULL, b_tail(msg), b_room(msg), &rule->expect.onerror_fmt);
 		goto comment;
 	}
@@ -529,7 +518,7 @@ static void tcpcheck_expect_onsuccess_message(struct buffer *msg, struct check *
 	 */
 	if (istlen(info))
 		chunk_istcat(msg, info);
-	if (!LIST_ISEMPTY(&rule->expect.onsuccess_fmt))
+	if (!lf_expr_isempty(&rule->expect.onsuccess_fmt))
 		msg->data += sess_build_logline(check->sess, NULL, b_tail(msg), b_room(msg),
 						&rule->expect.onsuccess_fmt);
 	else if (check->type == PR_O2_TCPCHK_CHK &&
@@ -772,32 +761,176 @@ enum tcpcheck_eval_ret tcpcheck_ldap_expect_bindrsp(struct check *check, struct 
 	goto out;
 }
 
-/* Custom tcp-check expect function to parse and validate the SPOP hello agent
- * frame. Returns TCPCHK_EVAL_WAIT to wait for more data, TCPCHK_EVAL_CONTINUE
- * to evaluate the next rule or TCPCHK_EVAL_STOP if an error occurred.
+/* Custom tcp-check expect function to parse and validate the SPOP HELLO
+ * response packet. Returns TCPCHK_EVAL_WAIT to wait for more data,
+ * TCPCHK_EVAL_CONTINUE to evaluate the next rule or TCPCHK_EVAL_STOP if an
+ * error occurred.
  */
-enum tcpcheck_eval_ret tcpcheck_spop_expect_agenthello(struct check *check, struct tcpcheck_rule *rule, int last_read)
+enum tcpcheck_eval_ret tcpcheck_spop_expect_hello(struct check *check, struct tcpcheck_rule *rule, int last_read)
 {
 	enum tcpcheck_eval_ret ret = TCPCHK_EVAL_CONTINUE;
 	enum healthcheck_status status;
 	struct buffer *msg = NULL;
 	struct ist desc = IST_NULL;
-	unsigned int framesz;
+	char *ptr, *end;
+	unsigned int type, flags, flen = 0;
+	int vsn, max_frame_size, caps;
+
 
 	TRACE_ENTER(CHK_EV_TCPCHK_EXP, check);
 
-	memcpy(&framesz, b_head(&check->bi), 4);
-	framesz = ntohl(framesz);
+	/* 4 Bytes for the packet length, 1 byte for the frame type, 4bytes for flags, 2 bytes for the stream and frame id */
+	if (b_data(&check->bi) < 11)
+		goto too_short;
 
-	if (!last_read && b_data(&check->bi) < (4+framesz))
-		goto wait_more_data;
+	ptr = b_head(&check->bi);
+	flen = read_n32(ptr);
+	type = (unsigned int)*(ptr+4);
+	flags = read_n32(ptr+5);
+	if (type != 101 && type != 102) {
+		/* Frame type must be AGENT-HELLO or AGENT-DISCONNECT*/
+		goto invalid_frame;
+	}
+	if (flags != 0x01) {
+		/* Only FIN must be set */
+		goto invalid_frame;
+	}
+	if (*(ptr+9) != 0 || *(ptr+10) != 0)
+		goto invalid_frame;
 
-	memset(b_orig(&trash), 0, b_size(&trash));
-	if (spoe_handle_healthcheck_response(b_peek(&check->bi, 4), framesz, b_orig(&trash), HCHK_DESC_LEN) == -1) {
-		status = HCHK_STATUS_L7RSP;
-		desc = ist2(b_orig(&trash), strlen(b_orig(&trash)));
+	if (b_data(&check->bi) < 4 + flen)
+		goto too_short;
+
+	ptr += 11;
+	end = b_tail(&check->bi);
+	if (*ptr == 102) {
+		/* AGENT-DISCONNECT frame*/
+		while (ptr < end) {
+			char  *str;
+			uint64_t sz;
+			int ret;
+
+			/* Decode the item key */
+			ret = spoe_decode_buffer(&ptr, end, &str, &sz);
+			if (ret == -1 || !sz)
+				goto invalid_frame;
+
+			/* Check "status-code" K/V item */
+			if (isteq(ist2(str, sz), ist("status-code"))) {
+				int type = *ptr++;
+
+				/* The value must be an integer */
+				if ((type & SPOP_DATA_T_MASK) != SPOP_DATA_T_INT32 &&
+				    (type & SPOP_DATA_T_MASK) != SPOP_DATA_T_INT64 &&
+				    (type & SPOP_DATA_T_MASK) != SPOP_DATA_T_UINT32 &&
+				    (type & SPOP_DATA_T_MASK) != SPOP_DATA_T_UINT64)
+					goto invalid_frame;
+				if (decode_varint(&ptr, end, &sz) == -1)
+					goto invalid_frame;
+				check->code = sz;
+			}
+
+			/* Check "message" K/V item */
+			else if (isteq(ist2(str, sz), ist("message"))) {
+				int type = *ptr++;
+
+				/* The value must be a string */
+				if ((type & SPOP_DATA_T_MASK) != SPOP_DATA_T_STR)
+					goto invalid_frame;
+				ret = spoe_decode_buffer(&ptr, end, &str, &sz);
+				if (ret == -1 || sz > 255)
+					goto invalid_frame;
+				desc = ist2(str, sz);
+			}
+			else {
+				/* Silently ignore unknown item */
+				if (spoe_skip_data(&ptr, end) == -1)
+					goto invalid_frame;
+			}
+		}
 		goto error;
 	}
+
+	/* AGENT-HELLO frame*/
+        vsn = max_frame_size = caps = 0;
+        while (ptr < end) {
+                char  *str;
+                uint64_t sz;
+                int ret;
+
+                /* Decode the item key */
+                ret = spoe_decode_buffer(&ptr, end, &str, &sz);
+                if (ret == -1 || !sz)
+			goto invalid_frame;
+
+                /* Check "version" K/V item */
+		if (isteq(ist2(str, sz), ist("version"))) {
+                        int type = *ptr++;
+
+                        /* The value must be a string */
+                        if ((type & SPOP_DATA_T_MASK) != SPOP_DATA_T_STR)
+				goto invalid_frame;
+                        if (spoe_decode_buffer(&ptr, end, &str, &sz) == -1)
+				goto invalid_frame;
+
+                        vsn = spoe_str_to_vsn(str, sz);
+                        if (vsn == -1) {
+				check->code = SPOP_ERR_INVALID;
+				goto error;
+                        }
+                        if (spoe_check_vsn(vsn) == -1) {
+				check->code = SPOP_ERR_BAD_VSN;
+				goto error;
+                        }
+		}
+                /* Check "max-frame-size" K/V item */
+                else if (isteq(ist2(str, sz), ist("max-frame-size"))) {
+                        int type = *ptr++;
+
+                        /* The value must be integer */
+                        if ((type & SPOP_DATA_T_MASK) != SPOP_DATA_T_INT32 &&
+                            (type & SPOP_DATA_T_MASK) != SPOP_DATA_T_INT64 &&
+                            (type & SPOP_DATA_T_MASK) != SPOP_DATA_T_UINT32 &&
+                            (type & SPOP_DATA_T_MASK) != SPOP_DATA_T_UINT64)
+				goto invalid_frame;
+                        if (decode_varint(&ptr, end, &sz) == -1)
+				goto invalid_frame;
+                        if (sz < SPOP_MIN_FRAME_SIZE || sz > SPOP_MAX_FRAME_SIZE) {
+                                check->code = SPOP_ERR_BAD_FRAME_SIZE;
+                                goto error;
+                        }
+                        max_frame_size = sz;
+		}
+		/* Check "capabilities" K/V item */
+                else if (isteq(ist2(str, sz), ist("capabilities"))) {
+                        int type = *ptr++;
+
+                        /* The value must be a string */
+                        if ((type & SPOP_DATA_T_MASK) != SPOP_DATA_T_STR)
+				goto invalid_frame;
+                        if (spoe_decode_buffer(&ptr, end, &str, &sz) == -1)
+				goto invalid_frame;
+			/* Capabilities value not checked */
+			caps = 1;
+                }
+                else {
+                        /* Silently ignore unknown item */
+                        if (spoe_skip_data(&ptr, end) == -1)
+				goto invalid_frame;
+                }
+        }
+	if (!vsn) {
+                check->code = SPOP_ERR_NO_VSN;
+		goto error;
+        }
+        else if (!max_frame_size) {
+                check->code = SPOP_ERR_NO_FRAME_SIZE;
+                goto error;
+        }
+        else if (!caps) {
+                check->code = SPOP_ERR_NO_CAP;
+                goto error;
+        }
 
 	status = ((rule->expect.ok_status != HCHK_STATUS_UNKNOWN) ? rule->expect.ok_status : HCHK_STATUS_L7OKD);
 	set_server_check_status(check, status, "SPOA server is ok");
@@ -809,11 +942,25 @@ enum tcpcheck_eval_ret tcpcheck_spop_expect_agenthello(struct check *check, stru
 
   error:
 	ret = TCPCHK_EVAL_STOP;
+	status = HCHK_STATUS_L7RSP;
 	msg = alloc_trash_chunk();
-	if (msg)
+	if (msg) {
+		if (!isttest(desc))
+			desc = spop_err_reasons[check->code];
 		tcpcheck_expect_onerror_message(msg, check, rule, 0, desc);
+	}
 	set_server_check_status(check, status, (msg ? b_head(msg) : NULL));
 	goto out;
+
+  invalid_frame:
+	check->code = SPOP_ERR_INVALID;
+	goto error;
+
+  too_short:
+	if (!last_read)
+		goto wait_more_data;
+	/* invalid length or truncated response */
+	goto invalid_frame;
 
   wait_more_data:
 	TRACE_DEVEL("waiting for more data", CHK_EV_TCPCHK_EXP, check);
@@ -944,6 +1091,10 @@ enum tcpcheck_eval_ret tcpcheck_agent_expect_reply(struct check *check, struct t
 		else if (strncasecmp(cmd, "maxconn:", strlen("maxconn:")) == 0) {
 			sc = cmd;
 		}
+		/* try to parse a maxconn here */
+		else if (strncasecmp(cmd, "weight:", strlen("weight:")) == 0) {
+			ps = cmd + strlen("weight:");
+		}
 		else {
 			/* keep a copy of the first error */
 			if (!err)
@@ -1056,6 +1207,20 @@ enum tcpcheck_eval_ret tcpcheck_agent_expect_reply(struct check *check, struct t
 	goto out;
 }
 
+/* Returns true if <check> or <connect> rule uses any specific connect options
+ * which may differ from their underlying server counterparts.
+ */
+static inline int tcpcheck_use_nondefault_connect(const struct check *check,
+                                                  const struct tcpcheck_connect *connect)
+{
+	return check->mux_proto || connect->mux_proto ||
+	  is_addr(&check->addr) || is_addr(&connect->addr) ||
+	  check->port || connect->port || connect->port_expr ||
+	  check->use_ssl || check->alpn_len || connect->alpn_len ||
+	  check->send_proxy || check->via_socks4 ||
+	  (connect->options & TCPCHK_MASK_OPTS_CONNECT);
+}
+
 /* Evaluates a TCPCHK_ACT_CONNECT rule. Returns TCPCHK_EVAL_WAIT to wait the
  * connection establishment, TCPCHK_EVAL_CONTINUE to evaluate the next rule or
  * TCPCHK_EVAL_STOP if an error occurred.
@@ -1098,6 +1263,40 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	/* Always release input and output buffer when a new connect is evaluated */
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
+
+	if (!(check->state & CHK_ST_AGENT) && check->reuse_pool &&
+	    !tcpcheck_use_nondefault_connect(check, connect)) {
+		struct ist pool_conn_name = IST_NULL;
+		int64_t hash;
+		int conn_err;
+
+		TRACE_DEVEL("trying connection reuse for check", CHK_EV_TCPCHK_CONN, check);
+
+		if (check->pool_conn_name)
+			pool_conn_name = ist(check->pool_conn_name);
+		else if (connect->sni)
+			pool_conn_name = ist(connect->sni);
+		else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && check->sni)
+			pool_conn_name = ist(check->sni);
+
+		hash = be_calculate_conn_hash(s, NULL, check->sess, NULL, NULL, pool_conn_name);
+		conn_err = be_reuse_connection(hash, check->sess, s->proxy, s,
+		                               check->sc, &s->obj_type, 0);
+		if (conn_err == SF_ERR_INTERNAL) {
+			TRACE_ERROR("error during connection reuse", CHK_EV_TCPCHK_CONN|CHK_EV_TCPCHK_ERR, check);
+			set_server_check_status(check, HCHK_STATUS_SOCKERR, trash.area);
+			ret = TCPCHK_EVAL_STOP;
+			goto out;
+		}
+		else if (conn_err == SF_ERR_NONE) {
+			TRACE_STATE("check performed with connection reuse", CHK_EV_TCPCHK_CONN, check);
+			conn = __sc_conn(check->sc);
+			conn_set_owner(conn, check->sess, NULL);
+			/* connection will be reinsert in idle conn pool due to missing conn_set_private(). */
+			status = SF_ERR_NONE;
+			goto skip_connect;
+		}
+	}
 
 	/* No connection, prepare a new one */
 	conn = conn_new((s ? &s->obj_type : &proxy->obj_type));
@@ -1252,9 +1451,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 		else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && check->mux_proto)
 			mux_ops = check->mux_proto->mux;
 		else {
-			int mode = ((check->tcpcheck_rules->flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_HTTP_CHK
-				    ? PROTO_MODE_HTTP
-				    : PROTO_MODE_TCP);
+			int mode = tcpchk_rules_type_to_proto_mode(check->tcpcheck_rules->flags);
 
 			mux_ops = conn_get_best_mux(conn, IST_NULL, PROTO_SIDE_BE, mode);
 		}
@@ -1266,6 +1463,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	}
 
   fail_check:
+  skip_connect:
 	/* It can return one of :
 	 *  - SF_ERR_NONE if everything's OK
 	 *  - SF_ERR_SRVTO if there are no more servers
@@ -1421,7 +1619,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_send(struct check *check, struct tcpcheck_r
 		if ((istlen(vsn) == 6 && *(vsn.ptr+5) == '2') ||
 		    (istlen(vsn) == 8 && (*(vsn.ptr+5) > '1' || (*(vsn.ptr+5) == '1' && *(vsn.ptr+7) >= '1'))))
 			slflags |= HTX_SL_F_VER_11;
-		slflags |= (HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN);
+		slflags |= HTX_SL_F_XFER_LEN;
 		if (!(send->http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT) && !isttest(send->http.body))
 			slflags |= HTX_SL_F_BODYLESS;
 
@@ -1480,6 +1678,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_send(struct check *check, struct tcpcheck_r
 			clen = ist((!istlen(body) ? "0" : ultoa(istlen(body))));
 			if (!htx_add_header(htx, ist("Content-length"), clen))
 				goto error_htx;
+			sl->flags |= HTX_SL_F_CLEN;
 		}
 
 		if (!htx_add_endof(htx, HTX_BLK_EOH) ||
@@ -1697,7 +1896,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_expect_http(struct check *check, struct tcp
 
 		/* Set status and description in case of error */
 		status = ((status != HCHK_STATUS_UNKNOWN) ? status : HCHK_STATUS_L7STS);
-		if (LIST_ISEMPTY(&expect->onerror_fmt))
+		if (lf_expr_isempty(&expect->onerror_fmt))
 			desc = htx_sl_res_reason(sl);
 		break;
 	case TCPCHK_EXPECT_HTTP_STATUS_REGEX:
@@ -1705,7 +1904,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_expect_http(struct check *check, struct tcp
 
 		/* Set status and description in case of error */
 		status = ((status != HCHK_STATUS_UNKNOWN) ? status : HCHK_STATUS_L7STS);
-		if (LIST_ISEMPTY(&expect->onerror_fmt))
+		if (lf_expr_isempty(&expect->onerror_fmt))
 			desc = htx_sl_res_reason(sl);
 		break;
 
@@ -1836,7 +2035,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_expect_http(struct check *check, struct tcp
 
 	  end_of_match:
 		status = ((status != HCHK_STATUS_UNKNOWN) ? status : HCHK_STATUS_L7STS);
-		if (LIST_ISEMPTY(&expect->onerror_fmt))
+		if (lf_expr_isempty(&expect->onerror_fmt))
 			desc = htx_sl_res_reason(sl);
 		break;
 	}
@@ -1863,7 +2062,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_expect_http(struct check *check, struct tcp
 				goto wait_more_data;
 			}
 			status = ((status != HCHK_STATUS_UNKNOWN) ? status : HCHK_STATUS_L7RSP);
-			if (LIST_ISEMPTY(&expect->onerror_fmt))
+			if (lf_expr_isempty(&expect->onerror_fmt))
 				desc = ist("HTTP content check could not find a response body");
 			TRACE_ERROR("no response boduy found while expected", CHK_EV_TCPCHK_EXP|CHK_EV_TCPCHK_ERR, check);
 			goto error;
@@ -1912,7 +2111,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_expect_http(struct check *check, struct tcp
 
 		/* Set status and description in case of error */
 		status = ((status != HCHK_STATUS_UNKNOWN) ? status : HCHK_STATUS_L7RSP);
-		if (LIST_ISEMPTY(&expect->onerror_fmt))
+		if (lf_expr_isempty(&expect->onerror_fmt))
 			desc = (inverse
 				? ist("HTTP check matched unwanted content")
 				: ist("HTTP content check did not match"));
@@ -2413,8 +2612,9 @@ struct tcpcheck_rule *parse_tcpcheck_connect(char **args, int cur_arg, struct pr
 				goto error;
 			}
 
-			sk = str2sa_range(args[cur_arg+1], NULL, &port1, &port2, NULL, NULL,
-			                  errmsg, NULL, NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_STREAM | PA_O_CONNECT);
+			sk = str2sa_range(args[cur_arg+1], NULL, &port1, &port2, NULL, NULL, NULL,
+			                  errmsg, NULL, NULL, NULL,
+			                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_STREAM | PA_O_CONNECT);
 			if (!sk) {
 				memprintf(errmsg, "'%s' : %s.", args[cur_arg], *errmsg);
 				goto error;
@@ -2649,7 +2849,7 @@ struct tcpcheck_rule *parse_tcpcheck_send(char **args, int cur_arg, struct proxy
 	}
 	case TCPCHK_SEND_STRING_LF:
 	case TCPCHK_SEND_BINARY_LF:
-		LIST_INIT(&chk->send.fmt);
+		lf_expr_init(&chk->send.fmt);
 		px->conf.args.ctx = ARGC_SRV;
 		if (!parse_logformat_string(data, px, &chk->send.fmt, 0, SMP_VAL_BE_CHK_RUL, errmsg)) {
 			memprintf(errmsg, "'%s' invalid log-format string (%s).\n", data, *errmsg);
@@ -2790,7 +2990,7 @@ struct tcpcheck_rule *parse_tcpcheck_send_http(char **args, int cur_arg, struct 
 	}
 	if (uri) {
 		if (chk->send.http.flags & TCPCHK_SND_HTTP_FL_URI_FMT) {
-			LIST_INIT(&chk->send.http.uri_fmt);
+			lf_expr_init(&chk->send.http.uri_fmt);
 			px->conf.args.ctx = ARGC_SRV;
 			if (!parse_logformat_string(uri, px, &chk->send.http.uri_fmt, 0, SMP_VAL_BE_CHK_RUL, errmsg)) {
 				memprintf(errmsg, "'%s' invalid log-format string (%s).\n", uri, *errmsg);
@@ -2818,7 +3018,7 @@ struct tcpcheck_rule *parse_tcpcheck_send_http(char **args, int cur_arg, struct 
 			memprintf(errmsg, "out of memory");
 			goto error;
 		}
-		LIST_INIT(&hdr->value);
+		lf_expr_init(&hdr->value);
 		hdr->name = istdup(hdrs[i].n);
 		if (!isttest(hdr->name)) {
 			memprintf(errmsg, "out of memory");
@@ -2834,7 +3034,7 @@ struct tcpcheck_rule *parse_tcpcheck_send_http(char **args, int cur_arg, struct 
 
 	if (body) {
 		if (chk->send.http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT) {
-			LIST_INIT(&chk->send.http.body_fmt);
+			lf_expr_init(&chk->send.http.body_fmt);
 			px->conf.args.ctx = ARGC_SRV;
 			if (!parse_logformat_string(body, px, &chk->send.http.body_fmt, 0, SMP_VAL_BE_CHK_RUL, errmsg)) {
 				memprintf(errmsg, "'%s' invalid log-format string (%s).\n", body, *errmsg);
@@ -3301,8 +3501,8 @@ struct tcpcheck_rule *parse_tcpcheck_expect(char **args, int cur_arg, struct pro
 		goto error;
 	}
 	chk->action  = TCPCHK_ACT_EXPECT;
-	LIST_INIT(&chk->expect.onerror_fmt);
-	LIST_INIT(&chk->expect.onsuccess_fmt);
+	lf_expr_init(&chk->expect.onerror_fmt);
+	lf_expr_init(&chk->expect.onsuccess_fmt);
 	chk->comment = comment; comment = NULL;
 	chk->expect.type = type;
 	chk->expect.min_recv = min_recv;
@@ -3395,7 +3595,7 @@ struct tcpcheck_rule *parse_tcpcheck_expect(char **args, int cur_arg, struct pro
 	case TCPCHK_EXPECT_STRING_LF:
 	case TCPCHK_EXPECT_BINARY_LF:
 	case TCPCHK_EXPECT_HTTP_BODY_LF:
-		LIST_INIT(&chk->expect.fmt);
+		lf_expr_init(&chk->expect.fmt);
 		px->conf.args.ctx = ARGC_SRV;
 		if (!parse_logformat_string(pattern, px, &chk->expect.fmt, 0, SMP_VAL_BE_CHK_RUL, errmsg)) {
 			memprintf(errmsg, "'%s' invalid log-format string (%s).\n", pattern, *errmsg);
@@ -3415,7 +3615,7 @@ struct tcpcheck_rule *parse_tcpcheck_expect(char **args, int cur_arg, struct pro
 		}
 		else if (chk->expect.flags & TCPCHK_EXPT_FL_HTTP_HNAME_FMT) {
 			px->conf.args.ctx = ARGC_SRV;
-			LIST_INIT(&chk->expect.hdr.name_fmt);
+			lf_expr_init(&chk->expect.hdr.name_fmt);
 			if (!parse_logformat_string(npat, px, &chk->expect.hdr.name_fmt, 0, SMP_VAL_BE_CHK_RUL, errmsg)) {
 				memprintf(errmsg, "'%s' invalid log-format string (%s).\n", npat, *errmsg);
 				goto error;
@@ -3445,9 +3645,9 @@ struct tcpcheck_rule *parse_tcpcheck_expect(char **args, int cur_arg, struct pro
 		}
 		else if (chk->expect.flags & TCPCHK_EXPT_FL_HTTP_HVAL_FMT) {
 			px->conf.args.ctx = ARGC_SRV;
-			LIST_INIT(&chk->expect.hdr.value_fmt);
+			lf_expr_init(&chk->expect.hdr.value_fmt);
 			if (!parse_logformat_string(vpat, px, &chk->expect.hdr.value_fmt, 0, SMP_VAL_BE_CHK_RUL, errmsg)) {
-				memprintf(errmsg, "'%s' invalid log-format string (%s).\n", npat, *errmsg);
+				memprintf(errmsg, "'%s' invalid log-format string (%s).\n", vpat, *errmsg);
 				goto error;
 			}
 		}
@@ -3497,7 +3697,6 @@ struct tcpcheck_rule *parse_tcpcheck_expect(char **args, int cur_arg, struct pro
  */
 void tcpcheck_overwrite_send_http_rule(struct tcpcheck_rule *old, struct tcpcheck_rule *new)
 {
-	struct logformat_node *lf, *lfb;
 	struct tcpcheck_http_hdr *hdr, *bhdr;
 
 
@@ -3513,22 +3712,19 @@ void tcpcheck_overwrite_send_http_rule(struct tcpcheck_rule *old, struct tcpchec
 		if (!(old->send.http.flags & TCPCHK_SND_HTTP_FL_URI_FMT))
 			istfree(&old->send.http.uri);
 		else
-			free_tcpcheck_fmt(&old->send.http.uri_fmt);
+			lf_expr_deinit(&old->send.http.uri_fmt);
 		old->send.http.flags &= ~TCPCHK_SND_HTTP_FL_URI_FMT;
 		old->send.http.uri = new->send.http.uri;
 		new->send.http.uri = IST_NULL;
 	}
-	else if ((new->send.http.flags & TCPCHK_SND_HTTP_FL_URI_FMT) && !LIST_ISEMPTY(&new->send.http.uri_fmt)) {
+	else if ((new->send.http.flags & TCPCHK_SND_HTTP_FL_URI_FMT) && !lf_expr_isempty(&new->send.http.uri_fmt)) {
 		if (!(old->send.http.flags & TCPCHK_SND_HTTP_FL_URI_FMT))
 			istfree(&old->send.http.uri);
 		else
-			free_tcpcheck_fmt(&old->send.http.uri_fmt);
+			lf_expr_deinit(&old->send.http.uri_fmt);
 		old->send.http.flags |= TCPCHK_SND_HTTP_FL_URI_FMT;
-		LIST_INIT(&old->send.http.uri_fmt);
-		list_for_each_entry_safe(lf, lfb, &new->send.http.uri_fmt, list) {
-			LIST_DELETE(&lf->list);
-			LIST_APPEND(&old->send.http.uri_fmt, &lf->list);
-		}
+		lf_expr_init(&old->send.http.uri_fmt);
+		lf_expr_xfer(&new->send.http.uri_fmt, &old->send.http.uri_fmt);
 	}
 
 	if (isttest(new->send.http.vsn)) {
@@ -3549,22 +3745,19 @@ void tcpcheck_overwrite_send_http_rule(struct tcpcheck_rule *old, struct tcpchec
 		if (!(old->send.http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT))
 			istfree(&old->send.http.body);
 		else
-			free_tcpcheck_fmt(&old->send.http.body_fmt);
+			lf_expr_deinit(&old->send.http.body_fmt);
 		old->send.http.flags &= ~TCPCHK_SND_HTTP_FL_BODY_FMT;
 		old->send.http.body = new->send.http.body;
 		new->send.http.body = IST_NULL;
 	}
-	else if ((new->send.http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT) && !LIST_ISEMPTY(&new->send.http.body_fmt)) {
+	else if ((new->send.http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT) && !lf_expr_isempty(&new->send.http.body_fmt)) {
 		if (!(old->send.http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT))
 			istfree(&old->send.http.body);
 		else
-			free_tcpcheck_fmt(&old->send.http.body_fmt);
+			lf_expr_deinit(&old->send.http.body_fmt);
 		old->send.http.flags |= TCPCHK_SND_HTTP_FL_BODY_FMT;
-		LIST_INIT(&old->send.http.body_fmt);
-		list_for_each_entry_safe(lf, lfb, &new->send.http.body_fmt, list) {
-			LIST_DELETE(&lf->list);
-			LIST_APPEND(&old->send.http.body_fmt, &lf->list);
-		}
+		lf_expr_init(&old->send.http.body_fmt);
+		lf_expr_xfer(&new->send.http.body_fmt, &old->send.http.body_fmt);
 	}
 }
 
@@ -3815,8 +4008,8 @@ int add_tcpcheck_expect_str(struct tcpcheck_rules *rules, const char *str)
 
 	expect = &tcpcheck->expect;
 	expect->type = TCPCHK_EXPECT_STRING;
-	LIST_INIT(&expect->onerror_fmt);
-	LIST_INIT(&expect->onsuccess_fmt);
+	lf_expr_init(&expect->onerror_fmt);
+	lf_expr_init(&expect->onsuccess_fmt);
 	expect->ok_status = HCHK_STATUS_L7OKD;
 	expect->err_status = HCHK_STATUS_L7RSP;
 	expect->tout_status = HCHK_STATUS_L7TOUT;
@@ -3877,9 +4070,9 @@ int add_tcpcheck_send_strs(struct tcpcheck_rules *rules, const char * const *str
 }
 
 /* Parses the "tcp-check" proxy keyword */
-static int proxy_parse_tcpcheck(char **args, int section, struct proxy *curpx,
-				const struct proxy *defpx, const char *file, int line,
-				char **errmsg)
+int proxy_parse_tcpcheck(char **args, int section, struct proxy *curpx,
+                         const struct proxy *defpx, const char *file, int line,
+                         char **errmsg)
 {
 	struct tcpcheck_ruleset *rs = NULL;
 	struct tcpcheck_rule *chk = NULL;
@@ -4270,7 +4463,7 @@ int proxy_parse_smtpchk_opt(char **args, int cur_arg, struct proxy *curpx, const
 	    (strcmp(args[cur_arg], "EHLO") == 0 || strcmp(args[cur_arg], "HELO") == 0)) {
 		/* <EHLO|HELO> + space (1) + <host> + null byte (1) */
 		size_t len = strlen(args[cur_arg]) + 1 + strlen(args[cur_arg+1]) + 1;
-		cmd = calloc(len, 1);
+		cmd = calloc(1, len);
 		if (cmd)
 			snprintf(cmd, len, "%s %s", args[cur_arg], args[cur_arg+1]);
 	}
@@ -4860,12 +5053,18 @@ int proxy_parse_ldap_check_opt(char **args, int cur_arg, struct proxy *curpx, co
 int proxy_parse_spop_check_opt(char **args, int cur_arg, struct proxy *curpx, const struct proxy *defpx,
 			       const char *file, int line)
 {
+	static char *spop_req =
+		"0000004e0100000001" /* frame length (4-bytes) + type (1-bytes) + flags (4-bytes)*/
+		"0000" /* stream-id + frame-id (unset, 2-bytes) */
+		"12737570706f727465642d76657273696f6e730803322e30"
+		"0e6d61782d6672616d652d73697a6503fcf0060c63617061"
+		"62696c697469657308000b6865616c7468636865636b11";
+
 	struct tcpcheck_ruleset *rs = NULL;
 	struct tcpcheck_rules *rules = &curpx->tcpcheck_rules;
 	struct tcpcheck_rule *chk;
-	char *spop_req = NULL;
 	char *errmsg = NULL;
-	int spop_len = 0, err_code = 0;
+	int err_code = 0;
 
 	if (warnifnotcap(curpx, PR_CAP_BE, file, line, args[cur_arg+1], NULL))
 		err_code |= ERR_WARN;
@@ -4880,7 +5079,6 @@ int proxy_parse_spop_check_opt(char **args, int cur_arg, struct proxy *curpx, co
 	rules->list  = NULL;
 	rules->flags = 0;
 
-
 	rs = find_tcpcheck_ruleset("*spop-check");
 	if (rs)
 		goto ruleset_found;
@@ -4891,16 +5089,8 @@ int proxy_parse_spop_check_opt(char **args, int cur_arg, struct proxy *curpx, co
 		goto error;
 	}
 
-	if (spoe_prepare_healthcheck_request(&spop_req, &spop_len) == -1) {
-		ha_alert("parsing [%s:%d] : out of memory.\n", file, line);
-		goto error;
-	}
-	chunk_reset(&trash);
-	dump_binary(&trash, spop_req, spop_len);
-	trash.area[trash.data] = '\0';
-
-	chk = parse_tcpcheck_send((char *[]){"tcp-check", "send-binary", b_head(&trash), ""},
-				  1, curpx, &rs->rules, file, line, &errmsg);
+	chk = parse_tcpcheck_connect((char *[]){"tcp-check", "connect", "default", "proto", "none", ""},
+				     1, curpx, &rs->rules, file, line, &errmsg);
 	if (!chk) {
 		ha_alert("parsing [%s:%d] : %s\n", file, line, errmsg);
 		goto error;
@@ -4908,14 +5098,23 @@ int proxy_parse_spop_check_opt(char **args, int cur_arg, struct proxy *curpx, co
 	chk->index = 0;
 	LIST_APPEND(&rs->rules, &chk->list);
 
-	chk = parse_tcpcheck_expect((char *[]){"tcp-check", "expect", "custom", "min-recv", "4", ""},
+	chk = parse_tcpcheck_send((char *[]){"tcp-check", "send-binary", spop_req, ""},
+				  1, curpx, &rs->rules, file, line, &errmsg);
+	if (!chk) {
+		ha_alert("parsing [%s:%d] : %s\n", file, line, errmsg);
+		goto error;
+	}
+	chk->index = 1;
+	LIST_APPEND(&rs->rules, &chk->list);
+
+	chk = parse_tcpcheck_expect((char *[]){"tcp-check", "expect", "custom", ""},
 		                    1, curpx, &rs->rules, TCPCHK_RULES_SPOP_CHK, file, line, &errmsg);
 	if (!chk) {
 		ha_alert("parsing [%s:%d] : %s\n", file, line, errmsg);
 		goto error;
 	}
-	chk->expect.custom = tcpcheck_spop_expect_agenthello;
-	chk->index = 1;
+	chk->expect.custom = tcpcheck_spop_expect_hello;
+	chk->index = 2;
 	LIST_APPEND(&rs->rules, &chk->list);
 
   ruleset_found:
@@ -4924,8 +5123,6 @@ int proxy_parse_spop_check_opt(char **args, int cur_arg, struct proxy *curpx, co
 	rules->flags |= TCPCHK_RULES_SPOP_CHK;
 
   out:
-	free(spop_req);
-	free(errmsg);
 	return err_code;
 
   error:
@@ -4939,7 +5136,7 @@ static struct tcpcheck_rule *proxy_parse_httpchk_req(char **args, int cur_arg, s
 {
 	struct tcpcheck_rule *chk = NULL;
 	struct tcpcheck_http_hdr *hdr = NULL;
-	char *meth = NULL, *uri = NULL, *vsn = NULL;
+	char *meth = NULL, *uri = NULL, *vsn = NULL, *host = NULL;
 	char *hdrs, *body;
 
 	hdrs = (*args[cur_arg+2] ? strstr(args[cur_arg+2], "\r\n") : NULL);
@@ -4972,6 +5169,8 @@ static struct tcpcheck_rule *proxy_parse_httpchk_req(char **args, int cur_arg, s
 		uri = args[cur_arg+1];
 	if (*args[cur_arg+2])
 		vsn = args[cur_arg+2];
+	if (*args[cur_arg+3])
+		host = args[cur_arg+3];
 
 	if (meth) {
 		chk->send.http.meth.meth = find_http_meth(meth, strlen(meth));
@@ -4996,6 +5195,24 @@ static struct tcpcheck_rule *proxy_parse_httpchk_req(char **args, int cur_arg, s
 			goto error;
 		}
 	}
+	if (host) {
+		hdr = calloc(1, sizeof(*hdr));
+		if (!hdr) {
+			memprintf(errmsg, "out of memory");
+			goto error;
+		}
+		lf_expr_init(&hdr->value);
+		hdr->name = istdup(ist("host"));
+		if (!isttest(hdr->name)) {
+			memprintf(errmsg, "out of memory");
+			goto error;
+		}
+
+		if (!parse_logformat_string(host, px, &hdr->value, 0, SMP_VAL_BE_CHK_RUL, errmsg))
+			goto error;
+		LIST_APPEND(&chk->send.http.hdrs, &hdr->list);
+		hdr = NULL;
+	}
 
 	return chk;
 
@@ -5018,7 +5235,7 @@ int proxy_parse_httpchk_opt(char **args, int cur_arg, struct proxy *curpx, const
 	if (warnifnotcap(curpx, PR_CAP_BE, file, line, args[cur_arg+1], NULL))
 		err_code |= ERR_WARN;
 
-	if (alertif_too_many_args_idx(3, 1, file, line, args, &err_code))
+	if (alertif_too_many_args_idx(4, 1, file, line, args, &err_code))
 		goto out;
 
 	chk = proxy_parse_httpchk_req(args, cur_arg+2, curpx, &errmsg);

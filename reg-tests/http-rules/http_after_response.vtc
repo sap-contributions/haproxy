@@ -1,5 +1,4 @@
 varnishtest "Test HTTP response manipulation under the http-after-response rulesets"
-#REQUIRE_VERSION=2.2
 
 # This config tests various http-after-response rules for HTTP responses from a
 # server and the stats applet, but also for internal responses
@@ -20,6 +19,11 @@ server s1 {
 } -repeat 2 -start
 
 haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         mode http
         timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"

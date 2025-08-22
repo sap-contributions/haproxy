@@ -331,6 +331,25 @@ static inline struct ist istzero(const struct ist ist, size_t size)
 	return ret;
 }
 
+/* Remove trailing newline characters if present in <ist> by reducing its
+ * length. Both '\n', '\r' and '\n\r' match. Return the modified ist.
+ */
+static inline struct ist iststrip(const struct ist ist)
+{
+	struct ist ret = ist;
+
+	if (ret.len) {
+		if (ret.ptr[ret.len - 1] == '\n')
+			--ret.len;
+	}
+	if (ret.len) {
+		if (ret.ptr[ret.len - 1] == '\r')
+			--ret.len;
+	}
+
+	return ret;
+}
+
 /* returns the ordinal difference between two strings :
  *    < 0 if ist1 < ist2
  *    = 0 if ist1 == ist2
@@ -939,15 +958,12 @@ static inline void istfree(struct ist *ist)
  */
 static inline struct ist istdup(const struct ist src)
 {
-	const size_t src_size = src.len;
-
-	/* Allocate at least 1 byte to allow duplicating an empty string with
-	 * malloc implementations that return NULL for a 0-size allocation.
-	 */
-	struct ist dst = istalloc(src_size ? src_size : 1);
+	/* Allocate 1 extra byte to add an extra \0 delimiter. */
+	struct ist dst = istalloc(src.len + 1);
 
 	if (isttest(dst)) {
-		istcpy(&dst, src, src_size);
+		istcpy(&dst, src, src.len);
+		dst.ptr[dst.len] = '\0';
 	}
 
 	return dst;

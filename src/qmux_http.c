@@ -33,8 +33,10 @@ size_t qcs_http_rcv_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 	cs_htx = htx_from_buf(buf);
 	if (htx_is_empty(cs_htx) && htx_used_space(qcs_htx) <= count) {
 		/* EOM will be copied to cs_htx via b_xfer(). */
-		if (qcs_htx->flags & HTX_FL_EOM)
+		if ((qcs_htx->flags & HTX_FL_EOM) &&
+		    !(qcs->flags & QC_SF_EOI_SUSPENDED)) {
 			*fin = 1;
+		}
 
 		htx_to_buf(cs_htx, buf);
 		htx_to_buf(qcs_htx, &qcs->rx.app_buf);
@@ -48,7 +50,8 @@ size_t qcs_http_rcv_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 	/* Copy EOM from src to dst buffer if all data copied. */
 	if (htx_is_empty(qcs_htx) && (qcs_htx->flags & HTX_FL_EOM)) {
 		cs_htx->flags |= HTX_FL_EOM;
-		*fin = 1;
+		if (!(qcs->flags & QC_SF_EOI_SUSPENDED))
+			*fin = 1;
 	}
 
 	cs_htx->extra = qcs_htx->extra ? (qcs_htx->data + qcs_htx->extra) : 0;
@@ -60,6 +63,27 @@ size_t qcs_http_rcv_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 	TRACE_LEAVE(QMUX_EV_STRM_RECV, qcs->qcc->conn, qcs);
 
 	return ret;
+}
+
+int qcs_http_handle_standalone_fin(struct qcs *qcs)
+{
+	struct buffer *appbuf;
+	struct htx *htx;
+	int eom;
+
+	if (!(appbuf = qcc_get_stream_rxbuf(qcs)))
+		goto err;
+
+	htx = htx_from_buf(appbuf);
+	eom = htx_set_eom(htx);
+	htx_to_buf(htx, appbuf);
+	if (!eom)
+		goto err;
+
+	return 0;
+
+ err:
+	return -1;
 }
 
 /* QUIC MUX snd_buf operation using HTX data. HTX data will be transferred from
@@ -76,37 +100,19 @@ size_t qcs_http_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	htx = htx_from_buf(buf);
+	htx = htxbuf(buf);
 
+	/* Extra care required for HTTP/1 responses without Content-Length nor
+	 * chunked encoding. In this case, shutw callback will be use to signal
+	 * the end of the message. QC_SF_UNKNOWN_PL_LENGTH is set to prevent a
+	 * RESET_STREAM emission in this case.
+	 */
 	if (htx->extra && htx->extra == HTX_UNKOWN_PAYLOAD_LENGTH)
 		qcs->flags |= QC_SF_UNKNOWN_PL_LENGTH;
 
-	ret = qcs->qcc->app_ops->snd_buf(qcs, htx, count);
-	*fin = (htx->flags & HTX_FL_EOM) && htx_is_empty(htx);
-
-	htx_to_buf(htx, buf);
+	ret = qcs->qcc->app_ops->snd_buf(qcs, buf, count, fin);
 
 	TRACE_LEAVE(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
 	return ret;
-}
-
-/* QUIC MUX snd_buf reset. HTX data stored in <buf> of length <count> will be
- * cleared. This can be used when data should not be transmitted any longer.
- *
- * Return the size in bytes of cleared data.
- */
-size_t qcs_http_reset_buf(struct qcs *qcs, struct buffer *buf, size_t count)
-{
-	struct htx *htx;
-
-	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
-
-	htx = htx_from_buf(buf);
-	htx_reset(htx);
-	htx_to_buf(htx, buf);
-
-	TRACE_LEAVE(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
-
-	return count;
 }

@@ -26,6 +26,7 @@
 #include <haproxy/arg.h>
 #include <haproxy/chunk.h>
 #include <haproxy/connection.h>
+#include <haproxy/counters.h>
 #include <haproxy/fd.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
@@ -54,12 +55,16 @@ int frontend_accept(struct stream *s)
 	struct proxy *fe = sess->fe;
 
 	if ((fe->mode == PR_MODE_TCP || fe->mode == PR_MODE_HTTP)
-	    && (!LIST_ISEMPTY(&fe->logsrvs))) {
-		if (likely(!LIST_ISEMPTY(&fe->logformat))) {
+	    && (!LIST_ISEMPTY(&fe->loggers))) {
+		if (fe->to_log == LW_LOGSTEPS) {
+			if (log_orig_proxy(LOG_ORIG_TXN_ACCEPT, fe))
+				s->do_log(s, log_orig(LOG_ORIG_TXN_ACCEPT, LOG_ORIG_FL_NONE));
+		}
+		else if (likely(!lf_expr_isempty(&fe->logformat))) {
 			/* we have the client ip */
 			if (s->logs.logwait & LW_CLIP)
 				if (!(s->logs.logwait &= ~(LW_CLIP|LW_INIT)))
-					s->do_log(s);
+					s->do_log(s, log_orig(LOG_ORIG_TXN_ACCEPT, LOG_ORIG_FL_NONE));
 		}
 		else if (conn) {
 			src = sc_src(s->scf);
@@ -87,6 +92,8 @@ int frontend_accept(struct stream *s)
 						 fe->id, (fe->mode == PR_MODE_HTTP) ? "HTTP" : "TCP");
 					break;
 				case AF_UNIX:
+				case AF_CUST_ABNS:
+				case AF_CUST_ABNSZ:
 					/* UNIX socket, only the destination is known */
 					send_log(fe, LOG_INFO, "Connect to unix:%d (%s/%s)\n",
 						 l->luid,
@@ -127,6 +134,8 @@ int frontend_accept(struct stream *s)
 			             pn, get_host_port(src), alpn);
 			break;
 		case AF_UNIX:
+		case AF_CUST_ABNS:
+		case AF_CUST_ABNSZ:
 			/* UNIX socket, only the destination is known */
 			chunk_printf(&trash, "%08x:%s.accept(%04x)=%04x from [unix:%d] ALPN=%s\n",
 			             s->uniq_id, fe->id, (unsigned short)l->rx.fd, (unsigned short)conn->handle.fd,
@@ -163,6 +172,33 @@ int frontend_accept(struct stream *s)
 	pool_free(fe->req_cap_pool, s->req_cap);
  out_return:
 	return -1;
+}
+
+/* Increment current active connection counter. This ensures that global
+ * maxconn is not reached or exceeded. This must be done for every new frontend
+ * connection allocation.
+ *
+ * Returns the new actconn global value. If maxconn reached or exceeded, 0 is
+ * returned : the connection allocation should be cancelled.
+ */
+int increment_actconn()
+{
+	unsigned int count, next_actconn;
+
+	do {
+		count = actconn;
+		if (unlikely(count >= global.maxconn)) {
+			/* maxconn reached */
+			next_actconn = 0;
+			goto end;
+		}
+
+		/* try to increment actconn */
+		next_actconn = count + 1;
+	} while (!_HA_ATOMIC_CAS(&actconn, (int *)(&count), next_actconn) && __ha_cpu_relax());
+
+ end:
+	return next_actconn;
 }
 
 /************************************************************************/
@@ -225,7 +261,7 @@ smp_fetch_fe_req_rate(const struct arg *args, struct sample *smp, const char *kw
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = read_freq_ctr(&px->fe_req_per_sec);
+	smp->data.u.sint = COUNTERS_SHARED_TOTAL(px->fe_counters.shared.tg, req_per_sec, read_freq_ctr);
 	return 1;
 }
 
@@ -245,7 +281,7 @@ smp_fetch_fe_sess_rate(const struct arg *args, struct sample *smp, const char *k
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = read_freq_ctr(&px->fe_sess_per_sec);
+	smp->data.u.sint = COUNTERS_SHARED_TOTAL(px->fe_counters.shared.tg, sess_per_sec, read_freq_ctr);
 	return 1;
 }
 

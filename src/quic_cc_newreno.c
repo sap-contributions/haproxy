@@ -51,11 +51,11 @@ static int quic_cc_nr_init(struct quic_cc *cc)
 /* Re-enter slow start state. */
 static void quic_cc_nr_slow_start(struct quic_cc *cc)
 {
-	struct quic_path *path;
+	struct quic_cc_path *path;
 	struct nr *nr = quic_cc_priv(cc);
 
-	path = container_of(cc, struct quic_path, cc);
-	path->cwnd = path->min_cwnd;
+	path = container_of(cc, struct quic_cc_path, cc);
+	quic_cc_path_reset(path);
 	/* Re-entering slow start state. */
 	nr->state = QUIC_CC_ST_SS;
 	/* Recovery start time reset */
@@ -65,29 +65,28 @@ static void quic_cc_nr_slow_start(struct quic_cc *cc)
 /* Enter a recovery period. */
 static void quic_cc_nr_enter_recovery(struct quic_cc *cc)
 {
-	struct quic_path *path;
+	struct quic_cc_path *path;
 	struct nr *nr = quic_cc_priv(cc);
 
-	path = container_of(cc, struct quic_path, cc);
+	path = container_of(cc, struct quic_cc_path, cc);
 	nr->recovery_start_time = now_ms;
 	nr->ssthresh = path->cwnd >> 1;
-	path->cwnd = QUIC_MAX(nr->ssthresh, (uint32_t)path->min_cwnd);
+	quic_cc_path_set(path, nr->ssthresh);
 	nr->state = QUIC_CC_ST_RP;
 }
 
 /* Slow start callback. */
 static void quic_cc_nr_ss_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 {
-	struct quic_path *path;
+	struct quic_cc_path *path;
 	struct nr *nr = quic_cc_priv(cc);
 
 	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
 	TRACE_PROTO("CC reno", QUIC_EV_CONN_CC, cc->qc, ev);
-	path = container_of(cc, struct quic_path, cc);
+	path = container_of(cc, struct quic_cc_path, cc);
 	switch (ev->type) {
 	case QUIC_CC_EVT_ACK:
-		path->cwnd += ev->ack.acked;
-		path->mcwnd = QUIC_MAX(path->cwnd, path->mcwnd);
+		quic_cc_path_inc(path, ev->ack.acked);
 		/* Exit to congestion avoidance if slow start threshold is reached. */
 		if (path->cwnd > nr->ssthresh)
 			nr->state = QUIC_CC_ST_CA;
@@ -108,12 +107,12 @@ static void quic_cc_nr_ss_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 /* Congestion avoidance callback. */
 static void quic_cc_nr_ca_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 {
-	struct quic_path *path;
+	struct quic_cc_path *path;
 	struct nr *nr = quic_cc_priv(cc);
 
 	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
 	TRACE_PROTO("CC reno", QUIC_EV_CONN_CC, cc->qc, ev);
-	path = container_of(cc, struct quic_path, cc);
+	path = container_of(cc, struct quic_cc_path, cc);
 	switch (ev->type) {
 	case QUIC_CC_EVT_ACK:
 	{
@@ -123,8 +122,7 @@ static void quic_cc_nr_ca_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 		 */
 		acked = ev->ack.acked * path->mtu + nr->remain_acked;
 		nr->remain_acked = acked % path->cwnd;
-		path->cwnd += acked / path->cwnd;
-		path->mcwnd = QUIC_MAX(path->cwnd, path->mcwnd);
+		quic_cc_path_inc(path, acked / path->cwnd);
 		break;
 	}
 
@@ -145,12 +143,12 @@ static void quic_cc_nr_ca_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 /*  Recovery period callback. */
 static void quic_cc_nr_rp_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 {
-	struct quic_path *path;
+	struct quic_cc_path *path;
 	struct nr *nr = quic_cc_priv(cc);
 
 	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
 	TRACE_PROTO("CC reno", QUIC_EV_CONN_CC, cc->qc, ev);
-	path = container_of(cc, struct quic_path, cc);
+	path = container_of(cc, struct quic_cc_path, cc);
 	switch (ev->type) {
 	case QUIC_CC_EVT_ACK:
 		/* RFC 9022 7.3.2. Recovery
@@ -164,7 +162,7 @@ static void quic_cc_nr_rp_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 
 		nr->state = QUIC_CC_ST_CA;
 		nr->recovery_start_time = TICK_ETERNITY;
-		path->cwnd = nr->ssthresh;
+		quic_cc_path_set(path, nr->ssthresh);
 		break;
 	case QUIC_CC_EVT_LOSS:
 		/* Do nothing */
@@ -180,18 +178,22 @@ static void quic_cc_nr_rp_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 }
 static void quic_cc_nr_state_trace(struct buffer *buf, const struct quic_cc *cc)
 {
-	struct quic_path *path;
+	struct quic_cc_path *path;
 	struct nr *nr = quic_cc_priv(cc);
 
-	path = container_of(cc, struct quic_path, cc);
-	chunk_appendf(buf, " state=%s cwnd=%llu mcwnd=%llu ssthresh=%ld rpst=%dms pktloss=%llu",
+	path = container_of(cc, struct quic_cc_path, cc);
+	chunk_appendf(buf, " state=%s cwnd=%llu cwnd_last_max=%llu ssthresh=%ld rpst=%dms pktloss=%llu",
 	              quic_cc_state_str(nr->state),
 	              (unsigned long long)path->cwnd,
-	              (unsigned long long)path->mcwnd,
+	              (unsigned long long)path->cwnd_last_max,
 	              (long)nr->ssthresh,
 	              !tick_isset(nr->recovery_start_time) ? -1 :
 	              TICKS_TO_MS(tick_remain(nr->recovery_start_time, now_ms)),
 	              (unsigned long long)path->loss.nb_lost_pkt);
+}
+
+static void quic_cc_nr_hystart_start_round(struct quic_cc *cc, uint64_t pn)
+{
 }
 
 static void (*quic_cc_nr_state_cbs[])(struct quic_cc *cc,
@@ -210,9 +212,20 @@ static void quic_cc_nr_event(struct quic_cc *cc, struct quic_cc_event *ev)
 
 struct quic_cc_algo quic_cc_algo_nr = {
 	.type        = QUIC_CC_ALGO_TP_NEWRENO,
+	.flags       = QUIC_CC_ALGO_FL_OPT_PACING,
 	.init        = quic_cc_nr_init,
 	.event       = quic_cc_nr_event,
 	.slow_start  = quic_cc_nr_slow_start,
+	.hystart_start_round = quic_cc_nr_hystart_start_round,
+	.pacing_inter = quic_cc_default_pacing_inter,
+	.pacing_burst = NULL,
 	.state_trace = quic_cc_nr_state_trace,
 };
 
+void quic_cc_nr_check(void)
+{
+	struct quic_cc *cc;
+	BUG_ON_HOT(sizeof(struct nr) > sizeof(cc->priv));
+}
+
+INITCALL0(STG_REGISTER, quic_cc_nr_check);

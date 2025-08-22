@@ -1,7 +1,5 @@
 varnishtest "Check the Accept-Encoding processing implemented in the Vary mechanism"
 
-#REQUIRE_VERSION=2.4
-
 feature ignore_unknown_macro
 
 server s1 {
@@ -93,6 +91,10 @@ server s1 {
 
 haproxy h1 -conf {
        global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
                # WT: limit false-positives causing "HTTP header incomplete" due to
                # idle server connections being randomly used and randomly expiring
                # under us.

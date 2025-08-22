@@ -35,6 +35,7 @@ struct proto_fam proto_fam_inet4 = {
 	.name = "inet4",
 	.sock_domain = PF_INET,
 	.sock_family = AF_INET,
+	.real_family = AF_INET,
 	.sock_addrlen = sizeof(struct sockaddr_in),
 	.l3_addrlen = 32/8,
 	.addrcmp = sock_inet4_addrcmp,
@@ -48,6 +49,7 @@ struct proto_fam proto_fam_inet6 = {
 	.name = "inet6",
 	.sock_domain = PF_INET6,
 	.sock_family = AF_INET6,
+	.real_family = AF_INET6,
 	.sock_addrlen = sizeof(struct sockaddr_in6),
 	.l3_addrlen = 128/8,
 	.addrcmp = sock_inet6_addrcmp,
@@ -76,6 +78,16 @@ int sock_inet6_v6only_default = 0;
 /* Default TCPv4/TCPv6 MSS settings. -1=unknown. */
 int sock_inet_tcp_maxseg_default = -1;
 int sock_inet6_tcp_maxseg_default = -1;
+
+/* indicate whether v6 looks reachable (this is only a hint) */
+int sock_inet6_seems_reachable = 0;
+uint last_inet6_check = TICK_ETERNITY;
+
+/* Default MPTCPv4/MPTCPv6 MSS settings. -1=unknown. */
+#ifdef HA_HAVE_MPTCP
+int sock_inet_mptcp_maxseg_default = -1;
+int sock_inet6_mptcp_maxseg_default = -1;
+#endif
 
 /* Compares two AF_INET sockaddr addresses. Returns 0 if they match or non-zero
  * if they do not match.
@@ -461,6 +473,45 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	goto bind_return;
 }
 
+
+/* Detects IPv6 reachability: for this we perform a UDP connect to address
+ * 2001:: on port 53. No packet will be sent, it will just check the routing
+ * table towards this prefix for the majority of public addresses. In case of
+ * error we assume no IPv6 connectivity.
+ *
+ * Returns non-zero if inet6 looks reachable, otherwise zero. This considers
+ * the last result if it ages less than 30s, otherwise triggers a new test
+ * which updates <sock_inet6_seems_reachable> and <last_inet6_check>.
+ */
+int is_inet6_reachable(void)
+{
+	uint last_check = HA_ATOMIC_LOAD(&last_inet6_check);
+	struct sockaddr_in6 dest = { };
+	int ret = 0;
+	int fd;
+
+	if (tick_isset(last_check) &&
+	    !tick_is_expired(tick_add(last_check, INET6_CONNECTIVITY_CACHE_TIME), HA_ATOMIC_LOAD(global_now_ms)))
+		return HA_ATOMIC_LOAD(&sock_inet6_seems_reachable);
+
+	/* update the test date to ensure nobody else does it in parallel */
+	HA_ATOMIC_STORE(&last_inet6_check, HA_ATOMIC_LOAD(global_now_ms));
+
+	fd = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (fd >= 0) {
+		dest.sin6_family = AF_INET6;
+		dest.sin6_addr.s6_addr[0] = 0x20;
+		dest.sin6_addr.s6_addr[1] = 0x01;
+		dest.sin6_port = htons(53);
+		if (connect(fd, (struct sockaddr*)&dest, sizeof(dest)) == 0)
+			ret = 1;
+		close(fd);
+	}
+
+	HA_ATOMIC_STORE(&sock_inet6_seems_reachable, ret);
+	return ret;
+}
+
 static void sock_inet_prepare()
 {
 	int fd, val;
@@ -494,6 +545,30 @@ static void sock_inet_prepare()
 #endif
 		close(fd);
 	}
+
+#ifdef HA_HAVE_MPTCP
+	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+	if (fd >= 0) {
+#ifdef TCP_MAXSEG
+		/* retrieve the OS' default mss for MPTCPv4 */
+		len = sizeof(val);
+		if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &val, &len) == 0)
+			sock_inet_mptcp_maxseg_default = val;
+#endif
+		close(fd);
+	}
+
+	fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_MPTCP);
+	if (fd >= 0) {
+#ifdef TCP_MAXSEG
+		/* retrieve the OS' default mss for MPTCPv6 */
+		len = sizeof(val);
+		if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &val, &len) == 0)
+			sock_inet6_mptcp_maxseg_default = val;
+#endif
+		close(fd);
+	}
+#endif
 }
 
 INITCALL0(STG_PREPARE, sock_inet_prepare);

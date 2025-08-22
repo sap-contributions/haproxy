@@ -30,12 +30,31 @@
 #include <haproxy/stream-t.h>
 #include <haproxy/time.h>
 
+struct server *get_server_sh(struct proxy *px, const char *addr, int len, const struct server *avoid);
+struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, const struct server *avoid);
+struct server *get_server_ph(struct proxy *px, const char *uri, int uri_len, const struct server *avoid);
+struct server *get_server_ph_post(struct stream *s, const struct server *avoid);
+struct server *get_server_hh(struct stream *s, const struct server *avoid);
+struct server *get_server_rch(struct stream *s, const struct server *avoid);
+struct server *get_server_expr(struct stream *s, const struct server *avoid);
+struct server *get_server_rnd(struct stream *s, const struct server *avoid);
+
 int assign_server(struct stream *s);
 int assign_server_address(struct stream *s);
 int assign_server_and_queue(struct stream *s);
 int alloc_bind_address(struct sockaddr_storage **ss,
                        struct server *srv, struct proxy *be,
                        struct stream *s);
+
+int64_t be_calculate_conn_hash(struct server *srv, struct stream *strm,
+                               struct session *sess,
+                               struct sockaddr_storage *src,
+                               struct sockaddr_storage *dst,
+                               struct ist name);
+int be_reuse_connection(int64_t hash, struct session *sess,
+                        struct proxy *be, struct server *srv,
+                        struct stconn *sc, enum obj_type *target, int not_first_req);
+
 int srv_redispatch_connect(struct stream *t);
 void back_try_conn_req(struct stream *s);
 void back_handle_st_req(struct stream *s);
@@ -50,7 +69,6 @@ int tcp_persist_rdp_cookie(struct stream *s, struct channel *req, int an_bit);
 int be_downtime(struct proxy *px);
 void recount_servers(struct proxy *px);
 void update_backend_weight(struct proxy *px);
-int be_lastsession(const struct proxy *be);
 
 /* Returns number of usable servers in backend */
 static inline int be_usable_srv(struct proxy *be)
@@ -68,7 +86,7 @@ static inline int be_usable_srv(struct proxy *be)
 /* set the time of last session on the backend */
 static inline void be_set_sess_last(struct proxy *be)
 {
-	be->be_counters.last_sess = ns_to_sec(now_ns);
+	HA_ATOMIC_STORE(&be->be_counters.shared.tg[tgid - 1]->last_sess, ns_to_sec(now_ns));
 }
 
 /* This function returns non-zero if the designated server will be
@@ -145,6 +163,8 @@ static inline int srv_lb_status_changed(const struct server *srv)
  * change date.
  */
 void set_backend_down(struct proxy *be);
+
+unsigned int gen_hash(const struct proxy* px, const char* key, unsigned long len);
 
 #endif /* _HAPROXY_BACKEND_H */
 

@@ -31,7 +31,7 @@
 #include <haproxy/check-t.h>
 #include <haproxy/connection-t.h>
 #include <haproxy/counters-t.h>
-#include <haproxy/freq_ctr-t.h>
+#include <haproxy/guid-t.h>
 #include <haproxy/listener-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/queue-t.h>
@@ -41,6 +41,8 @@
 #include <haproxy/task-t.h>
 #include <haproxy/thread-t.h>
 #include <haproxy/event_hdl-t.h>
+#include <haproxy/log-t.h>
+#include <haproxy/tools-t.h>
 
 
 /* server states. Only SRV_ST_STOPPED indicates a down server. */
@@ -75,13 +77,18 @@ enum srv_state {
 enum srv_admin {
 	SRV_ADMF_FMAINT    = 0x01,        /* the server was explicitly forced into maintenance */
 	SRV_ADMF_IMAINT    = 0x02,        /* the server has inherited the maintenance status from a tracked server */
-	SRV_ADMF_MAINT     = 0x23,        /* mask to check if any maintenance flag is present */
-	SRV_ADMF_CMAINT    = 0x04,        /* the server is in maintenance because of the configuration */
+	SRV_ADMF_CMAINT    = 0x04,        /* the server is in maintenance because of the configuration (separate) */
 	SRV_ADMF_FDRAIN    = 0x08,        /* the server was explicitly forced into drain state */
 	SRV_ADMF_IDRAIN    = 0x10,        /* the server has inherited the drain status from a tracked server */
 	SRV_ADMF_DRAIN     = 0x18,        /* mask to check if any drain flag is present */
 	SRV_ADMF_RMAINT    = 0x20,        /* the server is down because of an IP address resolution failure */
-	SRV_ADMF_HMAINT    = 0x40,        /* the server FQDN has been set from socket stats */
+
+	SRV_ADMF_MAINT     = 0x23,        /* mask to check if any maintenance flag except CMAINT is present */
+
+	SRV_ADMF_FQDN_CHANGED = 0x40,     /* Special value: set (and never removed) if the server fqdn has
+	                                   * changed (from cli or resolvers) since its initial value from
+	                                   * config. This flag is exported and restored through state-file
+					   */
 } __attribute__((packed));
 
 /* options for servers' "init-addr" parameter
@@ -97,6 +104,17 @@ enum srv_initaddr {
 	SRV_IADDR_LIBC     = 2,           /* address set using the libc DNS resolver */
 	SRV_IADDR_LAST     = 3,           /* we set the IP address found in state-file for this server */
 	SRV_IADDR_IP       = 4,           /* we set an arbitrary IP address to the server */
+} __attribute__((packed));
+
+/* options for servers' "init-state" parameter this parameter may be
+ * used to drive HAProxy's behavior when determining a server's status
+ * at start up time.
+ */
+enum srv_init_state {
+	SRV_INIT_STATE_FULLY_DOWN = 0,     /* the server should initially be considered DOWN until it passes all health checks. Please keep set to zero. */
+	SRV_INIT_STATE_DOWN,               /* the server should initially be considered DOWN until it passes one health check. */
+	SRV_INIT_STATE_UP,                 /* the server should initially be considered UP, but will go DOWN if it fails one health check. */
+	SRV_INIT_STATE_FULLY_UP,           /* the server should initially be considered UP, but will go DOWN if it fails all health checks. */
 } __attribute__((packed));
 
 /* server-state-file version */
@@ -141,7 +159,7 @@ enum srv_initaddr {
 #define SRV_F_NON_STICK    0x0004        /* never add connections allocated to this server to a stick table */
 #define SRV_F_USE_NS_FROM_PP 0x0008      /* use namespace associated with connection if present */
 #define SRV_F_FORCED_ID    0x0010        /* server's ID was forced in the configuration */
-#define SRV_F_REVERSE      0x0020        /* reverse connect server which requires idle connection for transfers */
+#define SRV_F_RHTTP        0x0020        /* reverse HTTP server which requires idle connection for transfers */
 #define SRV_F_AGENTPORT    0x0040        /* this server has a agent port configured */
 #define SRV_F_AGENTADDR    0x0080        /* this server has a agent addr configured */
 #define SRV_F_COOKIESET    0x0100        /* this server has a cookie configured, so don't generate dynamic cookies */
@@ -152,10 +170,13 @@ enum srv_initaddr {
 #define SRV_F_NON_PURGEABLE 0x2000       /* this server cannot be removed at runtime */
 #define SRV_F_DEFSRV_USE_SSL 0x4000      /* default-server uses SSL */
 #define SRV_F_DELETED 0x8000             /* srv is deleted but not yet purged */
+#define SRV_F_STRICT_MAXCONN 0x10000     /* maxconn is to be strictly enforced, as a limit of outbound connections */
+#define SRV_F_CHECKED      0x20000       /* set once server was postparsed */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
 #define SRV_PP_V2               0x0002   /* proxy protocol version 2 */
+#define SRV_PP_ENABLED          0x0003   /* proxy protocol version 1 or version 2 */
 #define SRV_PP_V2_SSL           0x0004   /* proxy protocol version 2 with SSL */
 #define SRV_PP_V2_SSL_CN        0x0008   /* proxy protocol version 2 with CN */
 #define SRV_PP_V2_SSL_KEY_ALG   0x0010   /* proxy protocol version 2 with cert key algorithm */
@@ -183,6 +204,7 @@ enum srv_initaddr {
 #define SRV_SSL_O_NO_TLS_TICKETS 0x0100 /* disable session resumption tickets */
 #define SRV_SSL_O_NO_REUSE       0x200  /* disable session reuse */
 #define SRV_SSL_O_EARLY_DATA     0x400  /* Allow using early data */
+#define SRV_SSL_O_KTLS           0x800  /* Use kTLS if available */
 
 /* log servers ring's protocols options */
 enum srv_log_proto {
@@ -222,6 +244,13 @@ struct pid_list {
 	int exited;
 };
 
+/* srv methods of computing chash keys */
+enum srv_hash_key {
+	SRV_HASH_KEY_ID = 0,         /* derived from server puid */
+	SRV_HASH_KEY_ADDR,           /* derived from server address */
+	SRV_HASH_KEY_ADDR_PORT       /* derived from server address and port */
+};
+
 /* A tree occurrence is a descriptor of a place in a tree, with a pointer back
  * to the server itself.
  */
@@ -246,8 +275,18 @@ struct srv_per_thread {
 
 /* Each server will have one occurrence of this structure per thread group */
 struct srv_per_tgroup {
+	struct queue queue;			/* pending connections */
+	struct server *server;                  /* pointer to the corresponding server */
+	struct eb32_node lb_node;               /* node used for tree-based load balancing */
+	struct server *next_full;               /* next server in the temporary full list */
+	unsigned int last_other_tgrp_served;	/* Last other tgrp we dequeued from */
+	unsigned int self_served;		/* Number of connection we dequeued from our own queue */
+	unsigned int dequeuing;                 /* non-zero = dequeuing in progress (atomic) */
 	unsigned int next_takeover;             /* thread ID to try to steal connections from next time */
-};
+	struct eb_root *lb_tree;                 /* For LB algos with split between thread groups, the tree to be used, for each group */
+	unsigned npos, lpos;			/* next and last positions in the LB tree, protected by LB lock */
+	unsigned rweight;			/* remainder of weight in the current LB tree */
+} THREAD_ALIGNED(64);
 
 /* Configure the protocol selection for websocket */
 enum __attribute__((__packed__)) srv_ws_mode {
@@ -256,30 +295,51 @@ enum __attribute__((__packed__)) srv_ws_mode {
 	SRV_WS_H2,
 };
 
+/* Server-side TLV list, contains the types of the TLVs that should be sent out.
+ * Additionally, it can contain a format string, if specified in the config.
+ */
+struct srv_pp_tlv_list {
+	struct list list;
+	struct lf_expr fmt;
+	char *fmt_string;
+	unsigned char type;
+};
+
+/* Renegotiate mode */
+enum renegotiate_mode {
+	SSL_RENEGOTIATE_DFLT = 0,	/* Use the SSL library's default behavior */
+	SSL_RENEGOTIATE_OFF,		/* Disable secure renegotiation */
+	SSL_RENEGOTIATE_ON		/* Enable secure renegotiation */
+};
+
 struct proxy;
 struct server {
 	/* mostly config or admin stuff, doesn't change often */
 	enum obj_type obj_type;                 /* object type == OBJ_TYPE_SERVER */
+	enum srv_init_state init_state;         /* server's initial state among SRV_INIT_STATE */
 	enum srv_state next_state, cur_state;   /* server state among SRV_ST_* */
 	enum srv_admin next_admin, cur_admin;   /* server maintenance status : SRV_ADMF_* */
 	signed char use_ssl;		        /* ssl enabled (1: on, 0: disabled, -1 forced off)  */
 	unsigned int flags;                     /* server flags (SRV_F_*) */
 	unsigned int pp_opts;                   /* proxy protocol options (SRV_PP_*) */
-	struct list global_list;                /* attach point in the global servers_list */
+	struct mt_list global_list;             /* attach point in the global servers_list */
 	struct server *next;
-	struct mt_list prev_deleted;            /* deleted servers with 'next' ptr pointing to us */
 	int cklen;				/* the len of the cookie, to speed up checks */
 	int rdr_len;				/* the length of the redirection prefix */
 	char *cookie;				/* the id set in the cookie */
 	char *rdr_pfx;				/* the redirection prefix */
 
 	struct proxy *proxy;			/* the proxy this server belongs to */
-	const struct mux_proto_list *mux_proto;       /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
+	const struct mux_proto_list *mux_proto; /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
+	struct net_addr_type addr_type;         /* server address type (socket and transport hints) */
+	struct log_target *log_target;          /* when 'mode log' is enabled, target facility used to transport log messages */
 	unsigned maxconn, minconn;		/* max # of active sessions (0 = unlimited), min# for dynamic limit. */
 	struct srv_per_thread *per_thr;         /* array of per-thread stuff such as connections lists */
-	struct srv_per_tgroup *per_tgrp;        /* array of per-tgroup stuff such as idle conns */
+	struct srv_per_tgroup *per_tgrp;        /* array of per-tgroup stuff such as idle conns and queues */
 	unsigned int *curr_idle_thr;            /* Current number of orphan idling connections per thread */
 
+	char *pool_conn_name;
+	struct sample_expr *pool_conn_name_expr;
 	unsigned int pool_purge_delay;          /* Delay before starting to purge the idle conns pool */
 	unsigned int low_idle_conns;            /* min idle connection count to start picking from other threads */
 	unsigned int max_idle_conns;            /* Max number of connection allowed in the orphan connections list */
@@ -295,69 +355,84 @@ struct server {
 	short onmarkeddown;			/* what to do when marked down: one of HANA_ONMARKEDDOWN_* */
 	short onmarkedup;			/* what to do when marked up: one of HANA_ONMARKEDUP_* */
 	int slowstart;				/* slowstart time in seconds (ms in the conf) */
+	int idle_ping;				/* MUX idle-ping interval in ms */
+	unsigned long last_change;              /* internal use only (not for stats purpose): last time the server state was changed, doesn't change often, not updated atomically on purpose */
 
 	char *id;				/* just for identification */
 	uint32_t rid;				/* revision: if id has been reused for a new server, rid won't match */
 	unsigned iweight,uweight, cur_eweight;	/* initial weight, user-specified weight, and effective weight */
 	unsigned wscore;			/* weight score, used during srv map computation */
 	unsigned next_eweight;			/* next pending eweight to commit */
-	unsigned rweight;			/* remainder of weight in the current LB tree */
 	unsigned cumulative_weight;		/* weight of servers prior to this one in the same group, for chash balancing */
 	int maxqueue;				/* maximum number of pending connections allowed */
+	unsigned int queueslength;		/* Sum of the length of each queue */
 	int shard;				/* shard (in peers protocol context only) */
+	int log_bufsize;			/* implicit ring bufsize (for log server only - in log backend) */
 
 	enum srv_ws_mode ws;                    /* configure the protocol selection for websocket */
 	/* 3 bytes hole here */
 
+	struct mt_list watcher_list;		/* list of elems which currently references this server instance */
 	uint refcount;                          /* refcount used to remove a server at runtime */
 
 	/* The elements below may be changed on every single request by any
 	 * thread, and generally at the same time.
 	 */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 	struct eb32_node idle_node;             /* When to next do cleanup in the idle connections */
 	unsigned int curr_idle_conns;           /* Current number of orphan idling connections, both the idle and the safe lists */
 	unsigned int curr_idle_nb;              /* Current number of connections in the idle list */
 	unsigned int curr_safe_nb;              /* Current number of connections in the safe list */
 	unsigned int curr_used_conns;           /* Current number of used connections */
+	unsigned int curr_total_conns;          /* Current number of total connections to the server, used or idle, only calculated if strict-maxconn is used */
 	unsigned int max_used_conns;            /* Max number of used connections (the counter is reset at each connection purges */
 	unsigned int est_need_conns;            /* Estimate on the number of needed connections (max of curr and previous max_used) */
 
-	struct queue queue;			/* pending connections */
+	struct mt_list sess_conns;		/* list of private conns managed by a session on this server */
 
 	/* Element below are usd by LB algorithms and must be doable in
 	 * parallel to other threads reusing connections above.
 	 */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 	__decl_thread(HA_SPINLOCK_T lock);      /* may enclose the proxy's lock, must not be taken under */
-	unsigned npos, lpos;			/* next and last positions in the LB tree, protected by LB lock */
-	struct eb32_node lb_node;               /* node used for tree-based load balancing */
-	struct server *next_full;               /* next server in the temporary full list */
+	union {
+		struct eb32_node lb_node;       /* node used for tree-based load balancing */
+		struct list lb_list;            /* elem used for list-based load balancing */
+		struct {
+			struct fwlc_tree_elt *tree_elt; /* pointer to the element stored in tree, protected by lb_lock  */
+			struct fwlc_tree_elt *free_elt; /* A free element, so that we don't have to allocate one, protected by lb_lock */
+			struct mt_list lb_mt_list;      /* elem used for mt list-based load balancing, protected by lb_lock */
+			int lb_lock;                    /* make sure we are the only one updating the server */
+		};
+	};
 
 	/* usually atomically updated by any thread during parsing or on end of request */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 	int cur_sess;				/* number of currently active sessions (including syn_sent) */
 	int served;				/* # of active sessions currently being served (ie not pending) */
 	int consecutive_errors;			/* current number of consecutive errors */
-	struct freq_ctr sess_per_sec;		/* sessions per second on this server */
 	struct be_counters counters;		/* statistics counters */
 
 	/* Below are some relatively stable settings, only changed under the lock */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 
 	struct eb_root *lb_tree;                /* we want to know in what tree the server is */
 	struct tree_occ *lb_nodes;              /* lb_nodes_tot * struct tree_occ */
+	struct tasklet *requeue_tasklet;        /* tasklet to call to asynchronously requeue the server */
 	unsigned lb_nodes_tot;                  /* number of allocated lb_nodes (C-HASH) */
 	unsigned lb_nodes_now;                  /* number of lb_nodes placed in the tree (C-HASH) */
+	enum srv_hash_key hash_key;             /* method to compute node hash (C-HASH) */
+	unsigned lb_server_key;                 /* hash of the values indicated by "hash_key" (C-HASH) */
 
 	const struct netns_entry *netns;        /* contains network namespace name or NULL. Network namespace comes from configuration */
 	struct xprt_ops *xprt;                  /* transport-layer operations */
+	int alt_proto;                          /* alternate protocol to use in protocol_lookup */
 	unsigned int svc_port;                  /* the port to connect to (for relevant families) */
 	unsigned down_time;			/* total time the server was down */
-	time_t last_change;			/* last time, when the state was changed */
 
 	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo */
 	int tcp_ut;                             /* for TCP, user timeout */
+	char *tcp_md5sig;                       /* TCP MD5 signature password (RFC2385) */
 
 	int do_check;                           /* temporary variable used during parsing to denote if health checks must be enabled */
 	int do_agent;                           /* temporary variable used during parsing to denote if an auxiliary agent check must be enabled */
@@ -370,11 +445,11 @@ struct server {
 	char *lastaddr;				/* the address string provided by the server-state file */
 	struct resolv_options resolv_opts;
 	int hostname_dn_len;			/* string length of the server hostname in Domain Name format */
-	char *hostname_dn;			/* server hostname in Domain Name format */
+	char *hostname_dn;			/* server hostname in Domain Name format (name is lower cased) */
 	char *hostname;				/* server hostname */
 	struct sockaddr_storage init_addr;	/* plain IP address specified on the init-addr line */
 	unsigned int init_addr_methods;		/* initial address setting, 3-bit per method, ends at 0, enough to store 10 entries */
-	enum srv_log_proto log_proto;		/* used proto to emit messages on server lines from ring section */
+	enum srv_log_proto log_proto;		/* used proto to emit messages on server lines from log or ring section */
 
 	char *sni_expr;             /* Temporary variable to store a sample expression for SNI */
 	struct {
@@ -412,15 +487,16 @@ struct server {
 		int npn_len;                    /* NPN protocol string length */
 		char *alpn_str;                 /* ALPN protocol string */
 		int alpn_len;                   /* ALPN protocol string length */
+		int renegotiate;		/* Renegotiate mode (SSL_RENEGOTIATE_ flag) */
 	} ssl_ctx;
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters */
-	struct eb_root cids;        /* QUIC connections IDs. */
 #endif
 	struct resolv_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
 	struct list srv_rec_item;		/* to attach server to a srv record item */
 	struct list ip_rec_item;		/* to attach server to a A or AAAA record item */
 	struct ebpt_node host_dn;		/* hostdn store for srvrq and state file matching*/
+	struct list pp_tlvs;			/* to send out PROXY protocol v2 TLVs */
 	struct task *srvrq_check;               /* Task testing SRV record expiration date for this server */
 	struct {
 		const char *file;		/* file where the section appears */
@@ -441,6 +517,8 @@ struct server {
 
 	event_hdl_sub_list e_subs;		/* event_hdl: server's subscribers list (atomically updated) */
 
+	struct guid_node guid;			/* GUID global tree node */
+
 	/* warning, these structs are huge, keep them at the bottom */
 	struct conn_src conn_src;               /* connection source settings */
 	struct sockaddr_storage addr;           /* the address to connect to, doesn't include the port */
@@ -459,6 +537,7 @@ struct event_hdl_cb_data_server {
 	 *   EVENT_HDL_SUB_SERVER_STATE
 	 *   EVENT_HDL_SUB_SERVER_ADMIN
 	 *   EVENT_HDL_SUB_SERVER_CHECK
+	 *   EVENT_HDL_SUB_SERVER_INETADDR
 	 */
 	struct {
 		/* safe data can be safely used from both
@@ -497,7 +576,7 @@ struct event_hdl_cb_data_server_checkres {
 	} reason;
 	struct {
 		int cur;              /* dynamic (= check->health) */
-		int rise, fall;       /* config dependant */
+		int rise, fall;       /* config dependent */
 	} health;                     /* check's health, see check-t.h */
 };
 
@@ -576,6 +655,90 @@ struct event_hdl_cb_data_server_check {
 	struct {
 		struct check *ptr;                              /* check ptr */
 	} unsafe;
+};
+
+/* struct to store server address and port information in INET
+ * context
+ */
+struct server_inetaddr {
+	int family; /* AF_UNSPEC, AF_INET or AF_INET6 */
+	union {
+		struct in_addr v4;
+		struct in6_addr v6;
+	} addr; /* may hold v4 or v6 addr */
+	struct {
+		unsigned int svc;
+		uint8_t map; /* is a mapped port? (boolean) */
+	} port;
+};
+
+/* struct to store information about server's addr / port updater in
+ * INET context
+ */
+enum server_inetaddr_updater_by {
+	SERVER_INETADDR_UPDATER_BY_NONE = 0,
+	SERVER_INETADDR_UPDATER_BY_CLI,
+	SERVER_INETADDR_UPDATER_BY_LUA,
+	SERVER_INETADDR_UPDATER_BY_DNS_AR,
+	SERVER_INETADDR_UPDATER_BY_DNS_CACHE,
+	SERVER_INETADDR_UPDATER_BY_DNS_RESOLVER,
+	/* changes here must be reflected in SERVER_INETADDR_UPDATER_*
+	 * helper macros and in server_inetaddr_updater_by_to_str() func
+	 */
+};
+struct server_inetaddr_updater {
+	enum server_inetaddr_updater_by by; // by identifier (unique)
+	uint8_t dns;                        // is dns involved?
+	union {
+		struct {
+			unsigned int ns_id; // nameserver id responsible for the update
+		} dns_resolver;             // SERVER_INETADDR_UPDATER_DNS_RESOLVER specific infos
+	} u;                                // per updater's additional ctx
+};
+#define SERVER_INETADDR_UPDATER_NONE                                           \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_NONE,      \
+                                   .dns = 0 }
+
+#define SERVER_INETADDR_UPDATER_CLI                                            \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_CLI,       \
+                                   .dns = 0 }
+
+#define SERVER_INETADDR_UPDATER_LUA                                            \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_LUA,       \
+                                   .dns = 0 }
+
+#define SERVER_INETADDR_UPDATER_DNS_AR                                         \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_DNS_AR,    \
+                                   .dns = 1 }
+
+#define SERVER_INETADDR_UPDATER_DNS_CACHE                                      \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_DNS_CACHE, \
+                                   .dns = 1 }
+
+#define SERVER_INETADDR_UPDATER_DNS_RESOLVER(_ns_id)                           \
+ (struct server_inetaddr_updater){                                             \
+    .by = SERVER_INETADDR_UPDATER_BY_DNS_RESOLVER,                             \
+    .dns = 1,                                                                  \
+    .u.dns_resolver.ns_id = _ns_id,                                            \
+ }
+
+/* data provided to EVENT_HDL_SUB_SERVER_INETADDR handlers through
+ * event_hdl facility
+ *
+ * Note that this may be casted to regular event_hdl_cb_data_server if
+ * you don't care about inetaddr related optional info
+ */
+struct event_hdl_cb_data_server_inetaddr {
+	/* provided by:
+	 *   EVENT_HDL_SUB_SERVER_INETADDR
+	 */
+	struct event_hdl_cb_data_server server;                 /* must be at the beginning */
+	struct {
+		struct server_inetaddr prev;
+		struct server_inetaddr next;
+		struct server_inetaddr_updater updater;
+	} safe;
+	/* no unsafe data */
 };
 
 /* Storage structure to load server-state lines from a flat file into

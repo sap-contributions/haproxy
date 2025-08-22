@@ -1,8 +1,6 @@
 varnishtest "A test to be sure payload is skipped for bodyless responses"
 feature ignore_unknown_macro
 
-#REQUIRE_VERSION=2.4
-
 server s1 {
         rxreq
         txresp \
@@ -32,6 +30,10 @@ server s1 {
 
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         # WT: limit false-positives causing "HTTP header incomplete" due to
         # idle server connections being randomly used and randomly expiring
         # under us.

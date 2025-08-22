@@ -26,17 +26,22 @@
 #include <import/ebpttree.h>
 #include <import/ebsttree.h>
 
+#include <haproxy/acme.h>
 #include <haproxy/applet.h>
 #include <haproxy/base64.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
 #include <haproxy/errors.h>
+#include <haproxy/proxy.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/ssl_ocsp.h>
 #include <haproxy/ssl_utils.h>
 #include <haproxy/stconn.h>
 #include <haproxy/tools.h>
+#include <haproxy/jwt.h>
 
 /* Uncommitted CKCH transaction */
 
@@ -84,6 +89,25 @@ struct show_cert_ctx {
 	int transaction;
 };
 
+#define SHOW_SNI_OPT_1FRONTEND  (1 << 0) /* show only the selected frontend */
+#define SHOW_SNI_OPT_NOTAFTER   (1 << 1) /* show certificates that are [A]fter the notAfter date */
+
+/* CLI context used by "show ssl sni" */
+struct show_sni_ctx {
+	struct proxy *px;
+	struct bind_conf *bind;
+	struct ebmb_node *n;
+	int nodetype;
+	int options;
+	unsigned int offset;
+};
+
+/* CLI context used by "dump ssl cert" */
+struct dump_cert_ctx {
+	struct ckch_store *ckchs;
+	int index;
+};
+
 /* CLI context used by "commit cert" */
 struct commit_cert_ctx {
 	struct ckch_store *old_ckchs;
@@ -110,6 +134,7 @@ struct commit_cacrlfile_ctx {
 	enum {
 		CACRL_ST_INIT = 0,
 		CACRL_ST_GEN,
+		CACRL_ST_CRLCB,
 		CACRL_ST_INSERT,
 		CACRL_ST_SUCCESS,
 		CACRL_ST_FIN,
@@ -117,6 +142,18 @@ struct commit_cacrlfile_ctx {
 	} state;
 };
 
+
+/*
+ * Callback function, which is called if defined after loading CRLs from disk
+ * when starting HAProxy (function __ssl_store_load_locations_file()), and after
+ * committing new CRLs via CLI (function cli_io_handler_commit_cafile_crlfile()).
+ *
+ * The input parameters of the function are the path for the CRL data and
+ * a structure containing information about X.509 certificates and CRLs.
+ * In case of error, returns -1 with an error message in err; or the number
+ * of revoked certificates (>= 0) otherwise.
+ */
+int (*ssl_commit_crlfile_cb)(const char *path, X509_STORE *ctx, char **err) = NULL;
 
 /********************  cert_key_and_chain functions *************************
  * These are the functions that fills a cert_key_and_chain structure. For the
@@ -221,7 +258,7 @@ end:
 	return ret;
 }
 
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
+#if defined(HAVE_SSL_OCSP)
 /*
  * This function load the OCSP Response in DER format contained in file at
  * path 'ocsp_path' or base64 in a buffer <buf>
@@ -317,7 +354,7 @@ end:
  *      0 on Success
  *      1 on SSL Failure
  */
-int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char **err)
+int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, struct ckch_conf *conf, char **err)
 {
 	struct buffer *fp = NULL;
 	int ret = 1;
@@ -327,6 +364,20 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char
 	if (ssl_sock_load_pem_into_ckch(path, NULL, data , err) != 0) {
 		goto end;
 	}
+
+	if (conf) {
+		conf->crt = strdup(path);
+		if (!conf->crt) {
+			memprintf(err, "%s out of memory.\n", err && *err ? *err : "");
+			goto end;
+		}
+		conf->key = strdup(path);
+		if (!conf->key) {
+			memprintf(err, "%s out of memory.\n", err && *err ? *err : "");
+			goto end;
+		}
+	}
+
 
 	fp = alloc_trash_chunk();
 	if (!fp) {
@@ -385,6 +436,14 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char
 			memprintf(err, "%sNo Private Key found in '%s'.\n", err && *err ? *err : "", fp->area);
 			goto end;
 		}
+		if (conf) {
+			free(conf->key);
+			conf->key = strdup(fp->area);
+			if (!conf->key) {
+				memprintf(err, "%s out of memory.\n", err && *err ? *err : "");
+				goto end;
+			}
+		}
 		/* remove the added extension */
 		*(fp->area + fp->data - strlen(".key")) = '\0';
 		b_sub(fp, strlen(".key"));
@@ -417,12 +476,21 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char
 				goto end;
 			}
 		}
+		if (conf) {
+			conf->sctl = strdup(fp->area);
+			if (!conf->sctl) {
+				memprintf(err, "%s out of memory.\n", err && *err ? *err : "");
+				goto end;
+			}
+		}
+
 		/* remove the added extension */
 		*(fp->area + fp->data - strlen(".sctl")) = '\0';
 		b_sub(fp, strlen(".sctl"));
 	}
 #endif
 
+#ifdef HAVE_SSL_OCSP
 	/* try to load an ocsp response file */
 	if (global_ssl.extra_files & SSL_GF_OCSP) {
 		struct stat st;
@@ -440,11 +508,18 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char
 				goto end;
 			}
 		}
+		if (conf) {
+			conf->ocsp = strdup(fp->area);
+			if (!conf->ocsp) {
+				memprintf(err, "%s out of memory.\n", err && *err ? *err : "");
+				goto end;
+			}
+		}
+
 		/* remove the added extension */
 		*(fp->area + fp->data - strlen(".ocsp")) = '\0';
 		b_sub(fp, strlen(".ocsp"));
 	}
-
 #ifndef OPENSSL_IS_BORINGSSL /* Useless for BoringSSL */
 	if (data->ocsp_response && (global_ssl.extra_files & SSL_GF_OCSP_ISSUER)) {
 		/* if no issuer was found, try to load an issuer from the .issuer */
@@ -471,11 +546,20 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char
 					goto end;
 				}
 			}
+			if (conf) {
+				conf->issuer = strdup(fp->area);
+				if (!conf->issuer) {
+					memprintf(err, "%s out of memory.\n", err && *err ? *err : "");
+					goto end;
+				}
+			}
+
 			/* remove the added extension */
 			*(fp->area + fp->data - strlen(".issuer")) = '\0';
 			b_sub(fp, strlen(".issuer"));
 		}
 	}
+#endif
 #endif
 
 	ret = 0;
@@ -565,6 +649,7 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 	EVP_PKEY *key = NULL;
 	HASSL_DH *dh = NULL;
 	STACK_OF(X509) *chain = NULL;
+	struct issuer_chain *issuer_chain = NULL;
 
 	if (buf) {
 		/* reading from a buffer */
@@ -632,6 +717,13 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 		}
 	}
 
+	/* If we couldn't find a chain, we should try to look for a corresponding chain in 'issuers-chain-path' */
+	if (chain == NULL) {
+		issuer_chain = ssl_get0_issuer_chain(cert);
+		if (issuer_chain)
+			chain = X509_chain_up_ref(issuer_chain->chain);
+	}
+
 	ret = ERR_get_error();
 	if (ret && !(ERR_GET_LIB(ret) == ERR_LIB_PEM && ERR_GET_REASON(ret) == PEM_R_NO_START_LINE)) {
 		memprintf(err, "%sunable to load certificate chain from file '%s': %s\n",
@@ -660,6 +752,7 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 	SWAP(data->dh, dh);
 	SWAP(data->cert, cert);
 	SWAP(data->chain, chain);
+	SWAP(data->extra_chain, issuer_chain);
 
 	ret = 0;
 
@@ -720,8 +813,27 @@ void ssl_sock_free_cert_key_and_chain_contents(struct ckch_data *data)
 		X509_free(data->ocsp_issuer);
 	data->ocsp_issuer = NULL;
 
-	OCSP_CERTID_free(data->ocsp_cid);
-	data->ocsp_cid = NULL;
+
+	/* We need to properly remove the reference to the corresponding
+	 * certificate_ocsp structure if it exists (which it should).
+	 */
+#if (defined(HAVE_SSL_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+	if (data->ocsp_cid) {
+		struct certificate_ocsp *ocsp = NULL;
+		unsigned char certid[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
+		unsigned int certid_length = 0;
+
+		if (ssl_ocsp_build_response_key(data->ocsp_cid, (unsigned char*)certid, &certid_length) >= 0) {
+			HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
+			ocsp = (struct certificate_ocsp *)ebmb_lookup(&cert_ocsp_tree, certid, OCSP_MAX_CERTID_ASN1_LENGTH);
+			HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
+			ssl_sock_free_ocsp(ocsp);
+		}
+
+		OCSP_CERTID_free(data->ocsp_cid);
+		data->ocsp_cid = NULL;
+	}
+#endif
 }
 
 /*
@@ -775,6 +887,7 @@ struct ckch_data *ssl_sock_copy_cert_key_and_chain(struct ckch_data *src,
 		dst->sctl = sctl;
 	}
 
+#ifdef HAVE_SSL_OCSP
 	if (src->ocsp_response) {
 		struct buffer *ocsp_response;
 
@@ -790,9 +903,8 @@ struct ckch_data *ssl_sock_copy_cert_key_and_chain(struct ckch_data *src,
 		X509_up_ref(src->ocsp_issuer);
 		dst->ocsp_issuer = src->ocsp_issuer;
 	}
-
 	dst->ocsp_cid = OCSP_CERTID_dup(src->ocsp_cid);
-
+#endif
 	return dst;
 
 error:
@@ -866,14 +978,17 @@ void ckch_store_free(struct ckch_store *store)
 	if (!store)
 		return;
 
-	ssl_sock_free_cert_key_and_chain_contents(store->data);
-
-	ha_free(&store->data);
-
 	list_for_each_entry_safe(inst, inst_s, &store->ckch_inst, by_ckchs) {
 		ckch_inst_free(inst);
 	}
 	ebmb_delete(&store->node);
+
+	ssl_sock_free_cert_key_and_chain_contents(store->data);
+	ha_free(&store->data);
+
+	/* free the ckch_conf content */
+	ckch_conf_clean(&store->conf);
+
 	free(store);
 }
 
@@ -914,6 +1029,8 @@ error:
 struct ckch_store *ckchs_dup(const struct ckch_store *src)
 {
 	struct ckch_store *dst;
+	int n = 0;
+	char **r = NULL;
 
 	if (!src)
 		return NULL;
@@ -925,9 +1042,53 @@ struct ckch_store *ckchs_dup(const struct ckch_store *src)
 	if (!ssl_sock_copy_cert_key_and_chain(src->data, dst->data))
 		goto error;
 
+
+	dst->conf.ocsp_update_mode = src->conf.ocsp_update_mode;
+
+        /* copy ckch_conf
+	 * XXX: could be automated for each field with the
+         * ckch_conf array used for parsing */
+
+        if (src->conf.crt)
+		dst->conf.crt = strdup(src->conf.crt);
+	if (src->conf.key)
+		dst->conf.key = strdup(src->conf.key);
+	if (src->conf.ocsp)
+		dst->conf.ocsp = strdup(src->conf.ocsp);
+	if (src->conf.issuer)
+		dst->conf.issuer = strdup(src->conf.issuer);
+	if (src->conf.sctl)
+		dst->conf.sctl = strdup(src->conf.sctl);
+	if (src->conf.acme.id)
+		dst->conf.acme.id = strdup(src->conf.acme.id);
+	if (src->conf.acme.domains) {
+
+		/* copy the array of domain strings */
+
+		while (src->conf.acme.domains[n]) {
+			r = realloc(r, sizeof(char *) * (n + 2));
+			if (!r)
+				goto error;
+
+			r[n] = strdup(src->conf.acme.domains[n]);
+			if (!r[n]) {
+				goto error;
+			}
+			n++;
+		}
+		r[n] = 0;
+		dst->conf.acme.domains = r;
+	}
+
 	return dst;
 
 error:
+	while (r && *r) {
+		char *prev = *r;
+		r++;
+		free(prev);
+	}
+	free(r);
 	ckch_store_free(dst);
 
 	return NULL;
@@ -950,7 +1111,7 @@ struct ckch_store *ckchs_lookup(char *path)
 /*
  * This function allocate a ckch_store and populate it with certificates from files.
  */
-struct ckch_store *ckchs_load_cert_file(char *path, char **err)
+struct ckch_store *ckch_store_new_load_files_path(char *path, char **err)
 {
 	struct ckch_store *ckchs;
 
@@ -960,8 +1121,10 @@ struct ckch_store *ckchs_load_cert_file(char *path, char **err)
 		goto end;
 	}
 
-	if (ssl_sock_load_files_into_ckch(path, ckchs->data, err) == 1)
+	if (ssl_sock_load_files_into_ckch(path, ckchs->data, &ckchs->conf, err) == 1)
 		goto end;
+
+	ckchs->conf.used = CKCH_CONF_SET_EMPTY;
 
 	/* insert into the ckchs tree */
 	memcpy(ckchs->path, path, strlen(path) + 1);
@@ -974,6 +1137,51 @@ end:
 	return NULL;
 }
 
+/*
+ * This function allocate a ckch_store and populate it with certificates using
+ * the ckch_conf structure.
+ */
+struct ckch_store *ckch_store_new_load_files_conf(char *name, struct ckch_conf *conf, const char *file, int linenum, char **err)
+{
+	struct ckch_store *ckchs;
+	int cfgerr = ERR_NONE;
+	char *tmpcrt = conf->crt;
+
+	ckchs = ckch_store_new(name);
+	if (!ckchs) {
+		memprintf(err, "%sunable to allocate memory.\n", err && *err ? *err : "");
+		goto end;
+	}
+
+	/* this is done for retro-compatibility. When no "filename" crt-store
+	 * options were configured in a crt-list, try to load the files by
+	 * auto-detecting them. */
+	if ((conf->used == CKCH_CONF_SET_EMPTY || conf->used == CKCH_CONF_SET_CRTLIST) &&
+		(!conf->key && !conf->ocsp && !conf->issuer && !conf->sctl)) {
+		cfgerr = ssl_sock_load_files_into_ckch(conf->crt, ckchs->data, &ckchs->conf, err);
+		if (cfgerr & ERR_FATAL)
+			goto end;
+		/* set conf->crt to NULL so it's not erased */
+		conf->crt = NULL;
+	}
+
+	/* load files using the ckch_conf */
+	cfgerr = ckch_store_load_files(conf, ckchs, 0, file, linenum, err);
+	if (cfgerr & ERR_FATAL)
+		goto end;
+
+	conf->crt = tmpcrt;
+
+	/* insert into the ckchs tree */
+	memcpy(ckchs->path, name, strlen(name) + 1);
+	ebst_insert(&ckchs_tree, &ckchs->node);
+	return ckchs;
+
+end:
+	ckch_store_free(ckchs);
+
+	return NULL;
+}
 
 /********************  ckch_inst functions ******************************/
 
@@ -1380,6 +1588,14 @@ scandir_err:
 			goto err;
 		}
 
+		if (ssl_commit_crlfile_cb != NULL) {
+			if (ssl_commit_crlfile_cb(path, store, NULL) == -1) {
+				if (!shuterror)
+					ha_alert("crl-file: couldn't load '%s'\n", path);
+				goto err;
+			}
+		}
+
 		objs = X509_STORE_get0_objects(store);
 		cert_count = sk_X509_OBJECT_num(objs);
 		if (cert_count == 0) {
@@ -1415,7 +1631,7 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 struct cert_exts cert_exts[] = {
 	{ "",        CERT_TYPE_PEM,      &ssl_sock_load_pem_into_ckch }, /* default mode, no extensions */
 	{ "key",     CERT_TYPE_KEY,      &ssl_sock_load_key_into_ckch },
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
+#if defined(HAVE_SSL_OCSP)
 	{ "ocsp",    CERT_TYPE_OCSP,     &ssl_sock_load_ocsp_response_from_file },
 #endif
 #ifdef HAVE_SSL_SCTL
@@ -1425,6 +1641,237 @@ struct cert_exts cert_exts[] = {
 	{ NULL,      CERT_TYPE_MAX,      NULL },
 };
 
+/* release function of the  `show ssl sni' command */
+static void cli_release_show_sni(struct appctx *appctx)
+{
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+}
+
+/* IO handler of "show ssl sni [<frontend>]".
+ * It makes use of a show_sni_ctx context
+ *
+ * The function does loop over the frontend, the bind_conf and the sni_ctx.
+ */
+static int cli_io_handler_show_sni(struct appctx *appctx)
+{
+	struct show_sni_ctx *ctx = appctx->svcctx;
+	struct buffer *trash = alloc_trash_chunk();
+	struct ebmb_node *n = NULL;
+	int type = 0;
+	struct bind_conf *bind = NULL;
+	struct proxy *px = NULL;
+
+	if (trash == NULL)
+		return 1;
+
+	/* ctx->bind is NULL only once we finished dumping a frontend or when starting
+	 * so let's dump the header in these cases*/
+	if (ctx->bind == NULL && (ctx->options & SHOW_SNI_OPT_1FRONTEND ||
+	    (!(ctx->options & SHOW_SNI_OPT_1FRONTEND) && ctx->px == proxies_list)))
+		chunk_appendf(trash, "# Frontend/Bind\tSNI\tNegative Filter\tType\tFilename\tNotAfter\tNotBefore\n");
+	if (applet_putchk(appctx, trash) == -1)
+		goto yield;
+
+	for (px = ctx->px; px; px = px->next) {
+
+		/* only check the frontends which are not internal proxies */
+		if (!(px->cap & PR_CAP_FE) || (px->cap & PR_CAP_INT))
+			continue;
+
+		bind = ctx->bind;
+		/* if we didn't get a bind from the previous yield */
+		if (!bind)
+			bind = LIST_ELEM(px->conf.bind.n, typeof(bind), by_fe);
+
+		list_for_each_entry_from(bind, &px->conf.bind, by_fe) {
+
+			HA_RWLOCK_RDLOCK(SNI_LOCK, &bind->sni_lock);
+
+			/* do this twice: once for the standard SNI and once for wildcards */
+			for (type = ctx->nodetype; type < 2; type++) {
+
+				n = ctx->n; /* get the node from previous yield */
+
+				if (!n) {
+					if (type == 0)
+						n = ebmb_first(&bind->sni_ctx);
+					else
+						n = ebmb_first(&bind->sni_w_ctx);
+				}
+				/* empty SNI tree, skip */
+				if (!n)
+					continue;
+
+				for (; n; n = ebmb_next(n)) {
+					struct sni_ctx *sni;
+					const char *name;
+					const char *certalg;
+					int isneg = 0; /* is there any negative filters associated to this node */
+
+					sni = ebmb_entry(n, struct sni_ctx, name);
+
+					if (sni->neg)
+						continue;
+#ifdef HAVE_ASN1_TIME_TO_TM
+					if (ctx->options & SHOW_SNI_OPT_NOTAFTER) {
+						time_t notAfter = x509_get_notafter_time_t(sni->ckch_inst->ckch_store->data->cert);
+						if (!(date.tv_sec+ctx->offset > notAfter))
+							continue;
+					}
+#endif
+
+					chunk_appendf(trash, "%s/%s:%d\t", bind->frontend->id, bind->file, bind->line);
+
+					name = (char *)sni->name.key;
+
+					chunk_appendf(trash, "%s%s%s\t", sni->neg ? "!" : "", type ? "*" : "",  name);
+
+					/* we are looking at wildcards, let's check the negative filters */
+					if (type == 1) {
+						struct sni_ctx *sni_tmp;
+						list_for_each_entry(sni_tmp, &sni->ckch_inst->sni_ctx, by_ckch_inst) {
+							if (sni_tmp->neg) {
+								chunk_appendf(trash, "%s%s ", sni_tmp->neg ? "!" : "",  (char *)sni_tmp->name.key);
+								isneg = 1;
+							}
+						}
+					}
+					chunk_appendf(trash, "%s\t", isneg ? "" : "-");
+
+					switch (sni->kinfo.sig) {
+						case TLSEXT_signature_ecdsa:
+							certalg = "ecdsa";
+							break;
+						case TLSEXT_signature_rsa:
+							certalg = "rsa";
+							break;
+						default: /* TLSEXT_signature_anonymous|dsa */
+							certalg = "dsa";
+							break;
+					}
+
+					chunk_appendf(trash, "%s\t", certalg);
+
+					/* we need to lock so the certificates in the ckch are not modified during the listing */
+					chunk_appendf(trash, "%s\t", sni->ckch_inst->ckch_store->path);
+					chunk_appendf(trash, "%s\t", x509_get_notafter(sni->ckch_inst->ckch_store->data->cert));
+					chunk_appendf(trash, "%s\n", x509_get_notbefore(sni->ckch_inst->ckch_store->data->cert));
+
+					if (applet_putchk(appctx, trash) == -1) {
+						HA_RWLOCK_RDUNLOCK(SNI_LOCK, &bind->sni_lock);
+						goto yield;
+					}
+
+				}
+				ctx->n = NULL;
+			}
+			ctx->nodetype = 0;
+			HA_RWLOCK_RDUNLOCK(SNI_LOCK, &bind->sni_lock);
+
+		}
+		ctx->bind = NULL;
+		/* only want to display the specified frontend */
+		if (ctx->options & SHOW_SNI_OPT_1FRONTEND)
+			break;
+	}
+	ctx->px = NULL;
+
+	free_trash_chunk(trash);
+	return 1;
+yield:
+
+	ctx->px = px;
+	ctx->bind = bind;
+	ctx->n = n;
+	ctx->nodetype = type;
+
+	free_trash_chunk(trash);
+	return 0; /* should come back */
+}
+
+
+/* parsing function for 'show ssl sni [-f <frontend>] [-A] [-t <offset>]' */
+static int cli_parse_show_sni(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct show_sni_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	int cur_arg = 3;
+
+	ctx->px = proxies_list;
+
+	/* look for the right <frontend> to display */
+
+	while (*args[cur_arg]) {
+		struct proxy *px;
+
+		if (strcmp(args[cur_arg], "-f") == 0) {
+
+			if (*args[cur_arg+1] == '\0')
+				return cli_err(appctx, "'-f' requires a frontend name!\n");
+
+			for (px = proxies_list; px; px = px->next) {
+
+				/* only check the frontends */
+				if (!(px->cap & PR_CAP_FE))
+					continue;
+
+				/* skip the internal proxies */
+				if (px->cap & PR_CAP_INT)
+					continue;
+
+				if (strcmp(px->id, args[cur_arg+1]) == 0) {
+					ctx->px = px;
+					ctx->options |= SHOW_SNI_OPT_1FRONTEND;
+				}
+			}
+			cur_arg++; /* skip the argument */
+			if (ctx->px == NULL)
+				return cli_err(appctx, "Couldn't find the specified frontend!\n");
+
+		} else if (strcmp(args[cur_arg], "-A") == 0) {
+			/* when current date > notAfter */
+			ctx->options |= SHOW_SNI_OPT_NOTAFTER;
+#ifndef HAVE_ASN1_TIME_TO_TM
+			return cli_err(appctx, "'-A' option is only supported with OpenSSL >= 1.1.1!\n");
+#endif
+
+		} else if (strcmp(args[cur_arg], "-t") == 0) {
+			unsigned int offset;
+			const char *res;
+			char *err = NULL;
+
+			if (*args[cur_arg+1] == '\0')
+				return cli_err(appctx, "'-t' requires an offset argument!\n");
+
+			res = parse_time_err(args[cur_arg+1], &offset, TIME_UNIT_S);
+
+			if (res == PARSE_TIME_OVER) {
+				return cli_dynerr(appctx, memprintf(&err, "offset overflow '%s' (maximum value is 2147483647s or ~24855 days)", args[cur_arg+1]));
+			}
+			else if (res == PARSE_TIME_UNDER) {
+				return cli_dynerr(appctx, memprintf(&err, "timer underflow '%s' (minimum non-null value is 1s)", args[cur_arg+1]));
+			}
+			else if (res) {
+				return cli_dynerr(appctx, memprintf(&err, "'%s %s' : unexpected character '%c'", args[cur_arg], args[cur_arg+1], *res));
+			}
+
+			if (!offset) {
+				return cli_dynerr(appctx, memprintf(&err, "'%s' expects a positive value", args[cur_arg]));
+			}
+
+			ctx->offset = offset;
+			cur_arg++; /* skip the argument */
+		} else {
+
+			return cli_err(appctx, "Invalid parameters, 'show ssl sni' only supports '-f', '-A' or '-t' options!\n");
+		}
+		cur_arg++;
+	}
+
+	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+		return cli_err(appctx, "Can't list SNIs\nOperations on certificates are currently locked!\n");
+
+	return 0;
+}
 
 /* release function of the  `show ssl cert' command */
 static void cli_release_show_cert(struct appctx *appctx)
@@ -1638,7 +2085,7 @@ void ckch_inst_add_cafile_link(struct ckch_inst *ckch_inst, struct bind_conf *bi
 
 
 
-static int show_cert_detail(X509 *cert, STACK_OF(X509) *chain, struct buffer *out)
+static int show_cert_detail(X509 *cert, STACK_OF(X509) *chain, struct issuer_chain *extra_chain, struct buffer *out)
 {
 	BIO *bio = NULL;
 	struct buffer *tmp = alloc_trash_chunk();
@@ -1653,15 +2100,11 @@ static int show_cert_detail(X509 *cert, STACK_OF(X509) *chain, struct buffer *ou
 	if (!cert)
 		goto end;
 
-	if (chain == NULL) {
-		struct issuer_chain *issuer;
-		issuer = ssl_get0_issuer_chain(cert);
-		if (issuer) {
-			chain = issuer->chain;
-			chunk_appendf(out, "Chain Filename: ");
-			chunk_appendf(out, "%s\n", issuer->path);
-		}
+	if (extra_chain) {
+		chunk_appendf(out, "Chain Filename: ");
+		chunk_appendf(out, "%s\n", extra_chain->path);
 	}
+
 	chunk_appendf(out, "Serial: ");
 	if (ssl_sock_get_serial(cert, tmp) == -1)
 		goto end;
@@ -1759,36 +2202,6 @@ end:
 	return 0;
 }
 
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-/*
- * Build the OCSP tree entry's key for a given ckch_store.
- * Returns a negative value in case of error.
- */
-static int ckch_store_build_certid(struct ckch_store *ckch_store, unsigned char certid[OCSP_MAX_CERTID_ASN1_LENGTH], unsigned int *key_length)
-{
-	unsigned char *p = NULL;
-	int i;
-
-	if (!key_length)
-		return -1;
-
-	*key_length = 0;
-
-	if (!ckch_store->data->ocsp_cid)
-		return 0;
-
-	i = i2d_OCSP_CERTID(ckch_store->data->ocsp_cid, NULL);
-	if (!i || (i > OCSP_MAX_CERTID_ASN1_LENGTH))
-		return 0;
-
-	p = certid;
-	*key_length = i2d_OCSP_CERTID(ckch_store->data->ocsp_cid, &p);
-
-end:
-	return *key_length > 0;
-}
-#endif
-
 /*
  * Dump the OCSP certificate key (if it exists) of certificate <ckch> into
  * buffer <out>.
@@ -1796,12 +2209,12 @@ end:
  */
 static int ckch_store_show_ocsp_certid(struct ckch_store *ckch_store, struct buffer *out)
 {
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+#if (defined(HAVE_SSL_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 	unsigned char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
 	unsigned int key_length = 0;
 	int i;
 
-	if (ckch_store_build_certid(ckch_store, (unsigned char*)key, &key_length) >= 0) {
+	if (ssl_ocsp_build_response_key(ckch_store->data->ocsp_cid, (unsigned char*)key, &key_length) >= 0) {
 		/* Dump the CERTID info */
 		chunk_appendf(out, "OCSP Response Key: ");
 		for (i = 0; i < key_length; ++i) {
@@ -1833,15 +2246,38 @@ static int cli_io_handler_show_cert_detail(struct appctx *appctx)
 		chunk_appendf(out, "*");
 	chunk_appendf(out, "%s\n", ckchs->path);
 
+	if (ckchs->conf.crt) {
+		chunk_appendf(out, "Crt filename: ");
+		chunk_appendf(out, "%s\n", ckchs->conf.crt);
+	}
+	if (ckchs->conf.key) {
+		chunk_appendf(out, "Key filename: ");
+		chunk_appendf(out, "%s\n", ckchs->conf.key);
+	}
+	if (ckchs->conf.ocsp) {
+		chunk_appendf(out, "OCSP filename: ");
+		chunk_appendf(out, "%s\n", ckchs->conf.ocsp);
+	}
+	if (ckchs->conf.issuer) {
+		chunk_appendf(out, "OCSP Issuer filename: ");
+		chunk_appendf(out, "%s\n", ckchs->conf.issuer);
+	}
+	if (ckchs->conf.sctl) {
+		chunk_appendf(out, "SCTL filename: ");
+		chunk_appendf(out, "%s\n", ckchs->conf.sctl);
+	}
+
 	chunk_appendf(out, "Status: ");
 	if (ckchs->data->cert == NULL)
 		chunk_appendf(out, "Empty\n");
+	else if (ckchs == ckchs_transaction.new_ckchs)
+		chunk_appendf(out, "Uncommitted\n");
 	else if (LIST_ISEMPTY(&ckchs->ckch_inst))
 		chunk_appendf(out, "Unused\n");
 	else
 		chunk_appendf(out, "Used\n");
 
-	retval = show_cert_detail(ckchs->data->cert, ckchs->data->chain, out);
+	retval = show_cert_detail(ckchs->data->cert, ckchs->data->chain, ckchs->data->extra_chain, out);
 	if (retval < 0)
 		goto end_no_putchk;
 	else if (retval)
@@ -1867,7 +2303,7 @@ yield:
  */
 static int cli_io_handler_show_cert_ocsp_detail(struct appctx *appctx)
 {
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+#if (defined(HAVE_SSL_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 	struct show_cert_ctx *ctx = appctx->svcctx;
 	struct ckch_store *ckchs = ctx->cur_ckchs;
 	struct buffer *out = alloc_trash_chunk();
@@ -1888,7 +2324,7 @@ static int cli_io_handler_show_cert_ocsp_detail(struct appctx *appctx)
 		unsigned char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
 		unsigned int key_length = 0;
 
-		if (ckch_store_build_certid(ckchs, (unsigned char*)key, &key_length) < 0)
+		if (ssl_ocsp_build_response_key(ckchs->data->ocsp_cid, (unsigned char*)key, &key_length) < 0)
 			goto end_no_putchk;
 
 		if (ssl_get_ocspresponse_detail(key, out))
@@ -1909,7 +2345,7 @@ yield:
 #endif
 }
 
-/* parsing function for 'show ssl cert [certfile]' */
+/* parsing function for 'show ssl cert [[*][\]<certfile>]' */
 static int cli_parse_show_cert(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_cert_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
@@ -1938,7 +2374,66 @@ static int cli_parse_show_cert(char **args, char *payload, struct appctx *appctx
 		}
 
 		if (*args[3] == '*') {
+			char *filename = args[3]+1;
+
 			from_transaction = 1;
+			if (!ckchs_transaction.new_ckchs)
+				goto error;
+
+			ckchs = ckchs_transaction.new_ckchs;
+
+			if (filename[0] == '\\')
+				filename++;
+
+			if (strcmp(filename, ckchs->path) != 0)
+				goto error;
+
+		} else {
+			char *filename = args[3];
+
+			if (filename[0] == '\\')
+				filename++;
+
+			if ((ckchs = ckchs_lookup(filename)) == NULL)
+				goto error;
+
+		}
+
+		ctx->cur_ckchs = ckchs;
+		/* use the IO handler that shows details */
+		if (show_ocsp_detail) {
+			ctx->transaction = from_transaction;
+			appctx->cli_ctx.io_handler = cli_io_handler_show_cert_ocsp_detail;
+		}
+		else
+			appctx->cli_ctx.io_handler = cli_io_handler_show_cert_detail;
+	}
+
+	return 0;
+
+error:
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+	return cli_err(appctx, "Can't display the certificate: Not found or the certificate is a bundle!\n");
+}
+
+/* parsing function for 'dump ssl cert <certfile>' */
+static int cli_parse_dump_cert(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct dump_cert_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	struct ckch_store *ckchs;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return cli_err(appctx, "Can't allocate memory!\n");
+
+	/* The operations on the CKCH architecture are locked so we can
+	 * manipulate ckch_store and ckch_inst */
+	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+		return cli_err(appctx, "Can't show!\nOperations on certificates are currently locked!\n");
+
+	/* check if there is a certificate to lookup */
+	if (*args[3]) {
+
+		if (*args[3] == '*') {
 			if (!ckchs_transaction.new_ckchs)
 				goto error;
 
@@ -1953,21 +2448,126 @@ static int cli_parse_show_cert(char **args, char *payload, struct appctx *appctx
 
 		}
 
-		ctx->cur_ckchs = ckchs;
-		/* use the IO handler that shows details */
-		if (show_ocsp_detail) {
-			ctx->transaction = from_transaction;
-			appctx->io_handler = cli_io_handler_show_cert_ocsp_detail;
-		}
-		else
-			appctx->io_handler = cli_io_handler_show_cert_detail;
+		ctx->ckchs = ckchs;
+		ctx->index = -2; /* -2 for pkey, -1 for cert, >= 0 for chain */
+
+		return 0;
+
 	}
-
-	return 0;
-
 error:
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 	return cli_err(appctx, "Can't display the certificate: Not found or the certificate is a bundle!\n");
+}
+
+
+/*
+ * Dump a CKCH in PEM format over the CLI
+ * - dump the PKEY
+ * - dump the cert
+ * - dump the chain element by element
+ *
+ *   Store an index to know what we need to dump at next yield
+ */
+static int cli_io_handler_dump_cert(struct appctx *appctx)
+{
+	struct dump_cert_ctx *ctx = appctx->svcctx;
+	struct ckch_store *ckchs = ctx->ckchs;
+	struct buffer *out = alloc_trash_chunk();
+	size_t write = 0;
+	BIO *bio = NULL;
+	int index = ctx->index;
+
+	if (!out)
+		goto end_no_putchk;
+
+
+	if ((bio = BIO_new(BIO_s_mem())) ==  NULL)
+		goto end_no_putchk;
+
+	if (index == -2) {
+
+		if (BIO_reset(bio) == -1)
+			goto end_no_putchk;
+
+		if (!PEM_write_bio_PrivateKey(bio, ckchs->data->key, NULL, NULL, 0, 0, NULL))
+			goto end_no_putchk;
+
+		write = BIO_read(bio, out->area, out->size-1);
+		if (write == 0)
+			goto end_no_putchk;
+		out->area[write] = '\0';
+		out->data = write;
+
+		if (applet_putchk(appctx, out) == -1)
+			goto end_no_putchk;
+
+		index++;
+
+	}
+
+	if (index == -1) {
+
+		if (BIO_reset(bio) == -1)
+			goto end_no_putchk;
+
+		if (!PEM_write_bio_X509(bio, ckchs->data->cert))
+			goto end_no_putchk;
+
+		write = BIO_read(bio, out->area, out->size-1);
+		if (write == 0)
+			goto end_no_putchk;
+		out->area[write] = '\0';
+		out->data = write;
+
+		if (applet_putchk(appctx, out) == -1)
+			goto yield;
+
+		index++;
+	}
+
+
+	for (; index < sk_X509_num(ckchs->data->chain); index++) {
+		X509 *cert = sk_X509_value(ckchs->data->chain, index);
+
+		if (BIO_reset(bio) == -1)
+			goto end_no_putchk;
+
+		if (!PEM_write_bio_X509(bio, cert))
+			goto end_no_putchk;
+
+		write = BIO_read(bio, out->area, out->size-1);
+		if (write == 0)
+			goto end_no_putchk;
+		out->area[write] = '\0';
+		out->data = write;
+
+		if (applet_putchk(appctx, out) == -1)
+			goto yield;
+	}
+
+end:
+	free_trash_chunk(out);
+	BIO_free(bio);
+	return 1; /* end, don't come back */
+
+end_no_putchk:
+	free_trash_chunk(out);
+	BIO_free(bio);
+	return 1;
+yield:
+	/* save the current state */
+	ctx->index = index;
+	free_trash_chunk(out);
+	BIO_free(bio);
+	return 0; /* should come back */
+
+}
+
+
+/* release function of the 'show ssl ca-file' command */
+static void cli_release_dump_cert(struct appctx *appctx)
+{
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 }
 
 /* release function of the  `set ssl cert' command, free things and unlock the spinlock */
@@ -2002,10 +2602,11 @@ int ckch_inst_rebuild(struct ckch_store *ckch_store, struct ckch_inst *ckchi,
 		fcount = ckchi->crtlist_entry->fcount;
 	}
 
-	if (ckchi->is_server_instance)
-		errcode |= ckch_inst_new_load_srv_store(ckch_store->path, ckch_store, new_inst, err);
+	if (ckchi->is_server_instance) {
+		errcode |= ckch_inst_new_load_srv_store(ckch_store->path, ckch_store, new_inst, err, srv_is_quic(ckchi->server));
+	}
 	else
-		errcode |= ckch_inst_new_load_store(ckch_store->path, ckch_store, ckchi->bind_conf, ckchi->ssl_conf, sni_filter, fcount, new_inst, err);
+		errcode |= ckch_inst_new_load_store(ckch_store->path, ckch_store, ckchi->bind_conf, ckchi->ssl_conf, sni_filter, fcount, ckchi->is_default, new_inst, err);
 
 	if (errcode & ERR_CODE)
 		return 1;
@@ -2129,6 +2730,8 @@ void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckc
 		__ckch_inst_free_locked(ckchi);
 	}
 
+	jwt_replace_ckch_store(old_ckchs, new_ckchs);
+
 	ckch_store_free(old_ckchs);
 	ebst_insert(&ckchs_tree, &new_ckchs->node);
 }
@@ -2142,15 +2745,11 @@ void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckc
 static int cli_io_handler_commit_cert(struct appctx *appctx)
 {
 	struct commit_cert_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
 	int y = 0;
 	struct ckch_store *old_ckchs, *new_ckchs = NULL;
 	struct ckch_inst *ckchi;
 
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
-		goto end;
-
+	usermsgs_clr("CLI");
 	while (1) {
 		switch (ctx->state) {
 			case CERT_ST_INIT:
@@ -2220,7 +2819,8 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 				ctx->state = CERT_ST_SUCCESS;
 				__fallthrough;
 			case CERT_ST_SUCCESS:
-				if (applet_putstr(appctx, "\nSuccess!\n") == -1)
+				chunk_printf(&trash, "\n%sSuccess!\n", usermsgs_str());
+				if (applet_putchk(appctx, &trash) == -1)
 					goto yield;
 				ctx->state = CERT_ST_FIN;
 				__fallthrough;
@@ -2233,7 +2833,7 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 
 			case CERT_ST_ERROR:
 			  error:
-				chunk_printf(&trash, "\n%sFailed!\n", ctx->err);
+				chunk_printf(&trash, "\n%s%sFailed!\n", usermsgs_str(), ctx->err);
 				if (applet_putchk(appctx, &trash) == -1)
 					goto yield;
 				ctx->state = CERT_ST_FIN;
@@ -2241,10 +2841,12 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 		}
 	}
 end:
+	usermsgs_clr(NULL);
 	/* success: call the release function and don't come back */
 	return 1;
 
 yield:
+	usermsgs_clr(NULL);
 	return 0; /* should come back */
 }
 
@@ -2277,13 +2879,8 @@ static int cli_parse_commit_cert(char **args, char *payload, struct appctx *appc
 		goto error;
 	}
 
-	/* if a certificate is here, a private key must be here too */
-	if (ckchs_transaction.new_ckchs->data->cert && !ckchs_transaction.new_ckchs->data->key) {
-		memprintf(&err, "The transaction must contain at least a certificate and a private key!\n");
-		goto error;
-	}
-
-	if (!X509_check_private_key(ckchs_transaction.new_ckchs->data->cert, ckchs_transaction.new_ckchs->data->key)) {
+	if (ckchs_transaction.new_ckchs->data->key &&
+	    !X509_check_private_key(ckchs_transaction.new_ckchs->data->cert, ckchs_transaction.new_ckchs->data->key)) {
 		memprintf(&err, "inconsistencies between private key and certificate loaded '%s'.\n", ckchs_transaction.path);
 		goto error;
 	}
@@ -2371,7 +2968,7 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 					errcode |= ERR_ALERT | ERR_FATAL;
 					goto end;
 				}
-
+				/* check again with the right extension */
 				if (strcmp(ckchs_transaction.path, buf->area) != 0) {
 					/* remove .crt of the error message */
 					*(b_orig(buf) + b_data(buf) + strlen(".crt")) = '\0';
@@ -2381,6 +2978,11 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 					errcode |= ERR_ALERT | ERR_FATAL;
 					goto end;
 				}
+			} else {
+				/* without del-ext the error is definitive */
+				memprintf(&err, "The ongoing transaction is about '%s' but you are trying to set '%s'\n", ckchs_transaction.path, buf->area);
+				errcode |= ERR_ALERT | ERR_FATAL;
+				goto end;
 			}
 		}
 
@@ -2420,9 +3022,17 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 		goto end;
 	}
 
+#if defined(HAVE_SSL_OCSP)
+	/* Reset the OCSP CID */
+	if (cert_ext->type == CERT_TYPE_PEM || cert_ext->type == CERT_TYPE_KEY ||
+	    cert_ext->type == CERT_TYPE_ISSUER) {
+		OCSP_CERTID_free(new_ckchs->data->ocsp_cid);
+		new_ckchs->data->ocsp_cid = NULL;
+	}
+#endif
 	data = new_ckchs->data;
 
-	/* appply the change on the duplicate */
+	/* apply the change on the duplicate */
 	if (cert_ext->load(buf->area, payload, data, &err) != 0) {
 		memprintf(&err, "%sCan't load the payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
@@ -2581,6 +3191,9 @@ static int cli_parse_del_cert(char **args, char *payload, struct appctx *appctx,
 	}
 	if (!LIST_ISEMPTY(&store->ckch_inst)) {
 		memprintf(&err, "certificate '%s' in use, can't be deleted!\n", filename);
+		goto error;
+	} else if (store->jwt_entry) {
+		memprintf(&err, "certificate '%s' in use for JWT validation, can't be deleted!\n", filename);
 		goto error;
 	}
 
@@ -2817,16 +3430,11 @@ error:
 static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 {
 	struct commit_cacrlfile_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
 	int y = 0;
 	struct cafile_entry *old_cafile_entry = ctx->old_entry;
 	struct cafile_entry *new_cafile_entry = ctx->new_entry;
 	struct ckch_inst_link *ckchi_link;
 	char *path;
-
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
-		goto end;
 
 	/* The ctx was already validated by the ca-file/crl-file parsing
 	 * function. Entries can only be NULL in CACRL_ST_SUCCESS or
@@ -2904,6 +3512,15 @@ static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 					y++;
 				}
 
+				ctx->state = CACRL_ST_CRLCB;
+				__fallthrough;
+			case CACRL_ST_CRLCB:
+				if ((ctx->cafile_type == CAFILE_CRL) && (ssl_commit_crlfile_cb != NULL)) {
+					if (ssl_commit_crlfile_cb(crlfile_transaction.path, crlfile_transaction.new_crlfile_entry->ca_store, &ctx->err) == -1) {
+						ctx->state = CACRL_ST_ERROR;
+						goto error;
+					}
+				}
 				ctx->state = CACRL_ST_INSERT;
 				__fallthrough;
 			case CACRL_ST_INSERT:
@@ -3066,6 +3683,8 @@ static int cli_io_handler_show_cafile_detail(struct appctx *appctx)
 	chunk_appendf(out, "Status: ");
 	if (!cafile_entry->ca_store)
 		chunk_appendf(out, "Empty\n");
+	else if (cafile_entry == cafile_transaction.new_cafile_entry)
+		chunk_appendf(out, "Uncommitted\n");
 	else if (LIST_ISEMPTY(&cafile_entry->ckch_inst_link))
 		chunk_appendf(out, "Unused\n");
 	else
@@ -3083,7 +3702,7 @@ static int cli_io_handler_show_cafile_detail(struct appctx *appctx)
 
 		/* file starts at line 1 */
 		chunk_appendf(out, " \nCertificate #%d:\n", i+1);
-		retval = show_cert_detail(cert, NULL, out);
+		retval = show_cert_detail(cert, NULL, NULL, out);
 		if (retval < 0)
 			goto end_no_putchk;
 		else if (retval)
@@ -3111,7 +3730,7 @@ yield:
 }
 
 
-/* parsing function for 'show ssl ca-file [cafile[:index]]'.
+/* parsing function for 'show ssl ca-file [[*][\]<cafile>[:index]]'.
  * It prepares a show_cafile_ctx context, and checks the global
  * cafile_transaction under the ckch_lock (read only).
  */
@@ -3153,24 +3772,33 @@ static int cli_parse_show_cafile(char **args, char *payload, struct appctx *appc
 		}
 
 		if (*args[3] == '*') {
+			char *filename = args[3]+1;
+
+			if (filename[0] == '\\')
+				filename++;
+
 			if (!cafile_transaction.new_cafile_entry)
 				goto error;
 
 			cafile_entry = cafile_transaction.new_cafile_entry;
 
-			if (strcmp(args[3] + 1, cafile_entry->path) != 0)
+			if (strcmp(filename, cafile_entry->path) != 0)
 				goto error;
 
 		} else {
+			char *filename = args[3];
+
+			if (filename[0] == '\\')
+				filename++;
 			/* Get the "original" cafile_entry and not the
 			 * uncommitted one if it exists. */
-			if ((cafile_entry = ssl_store_get_cafile_entry(args[3], 1)) == NULL || cafile_entry->type != CAFILE_CERT)
+			if ((cafile_entry = ssl_store_get_cafile_entry(filename, 1)) == NULL || cafile_entry->type != CAFILE_CERT)
 				goto error;
 		}
 
 		ctx->cur_cafile_entry = cafile_entry;
 		/* use the IO handler that shows details */
-		appctx->io_handler = cli_io_handler_show_cafile_detail;
+		appctx->cli_ctx.io_handler = cli_io_handler_show_cafile_detail;
 	}
 
 	return 0;
@@ -3718,7 +4346,7 @@ end:
 	return 0;
 }
 
-/* IO handler of details "show ssl crl-file <filename[:index]>".
+/* IO handler of details "show ssl crl-file [*][\]<filename[:index]>".
  * It uses show_crlfile_ctx and the global
  * crlfile_transaction.new_cafile_entry in read-only.
  */
@@ -3744,6 +4372,8 @@ static int cli_io_handler_show_crlfile_detail(struct appctx *appctx)
 	chunk_appendf(out, "Status: ");
 	if (!cafile_entry->ca_store)
 		chunk_appendf(out, "Empty\n");
+	else if (cafile_entry == crlfile_transaction.new_crlfile_entry)
+		chunk_appendf(out, "Uncommitted\n");
 	else if (LIST_ISEMPTY(&cafile_entry->ckch_inst_link))
 		chunk_appendf(out, "Unused\n");
 	else
@@ -3820,25 +4450,33 @@ static int cli_parse_show_crlfile(char **args, char *payload, struct appctx *app
 		}
 
 		if (*args[3] == '*') {
+			char *filename = args[3]+1;
+
+			if (filename[0] == '\\')
+				 filename++;
 			if (!crlfile_transaction.new_crlfile_entry)
 				goto error;
 
 			cafile_entry = crlfile_transaction.new_crlfile_entry;
 
-			if (strcmp(args[3] + 1, cafile_entry->path) != 0)
+			if (strcmp(filename, cafile_entry->path) != 0)
 				goto error;
 
 		} else {
+			char *filename = args[3];
+
+			if (filename[0] == '\\')
+				filename++;
 			/* Get the "original" cafile_entry and not the
 			 * uncommitted one if it exists. */
-			if ((cafile_entry = ssl_store_get_cafile_entry(args[3], 1)) == NULL || cafile_entry->type != CAFILE_CRL)
+			if ((cafile_entry = ssl_store_get_cafile_entry(filename, 1)) == NULL || cafile_entry->type != CAFILE_CRL)
 				goto error;
 		}
 
 		ctx->cafile_entry = cafile_entry;
 		ctx->index = index;
 		/* use the IO handler that shows details */
-		appctx->io_handler = cli_io_handler_show_crlfile_detail;
+		appctx->cli_ctx.io_handler = cli_io_handler_show_crlfile_detail;
 	}
 
 	return 0;
@@ -3937,12 +4575,16 @@ void ckch_deinit()
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
+	{ { "show", "ssl", "sni", NULL },       "show ssl sni [-f <frontend>] [-A]       : display the list of SNI and their corresponding filename",              cli_parse_show_sni, cli_io_handler_show_sni, cli_release_show_sni },
+
 	{ { "new", "ssl", "cert", NULL },       "new ssl cert <certfile>                 : create a new certificate file to be used in a crt-list or a directory", cli_parse_new_cert, NULL, NULL },
 	{ { "set", "ssl", "cert", NULL },       "set ssl cert <certfile> <payload>       : replace a certificate file",                                            cli_parse_set_cert, NULL, NULL },
 	{ { "commit", "ssl", "cert", NULL },    "commit ssl cert <certfile>              : commit a certificate file",                                             cli_parse_commit_cert, cli_io_handler_commit_cert, cli_release_commit_cert },
 	{ { "abort", "ssl", "cert", NULL },     "abort ssl cert <certfile>               : abort a transaction for a certificate file",                            cli_parse_abort_cert, NULL, NULL },
 	{ { "del", "ssl", "cert", NULL },       "del ssl cert <certfile>                 : delete an unused certificate file",                                     cli_parse_del_cert, NULL, NULL },
 	{ { "show", "ssl", "cert", NULL },      "show ssl cert [<certfile>]              : display the SSL certificates used in memory, or the details of a file", cli_parse_show_cert, cli_io_handler_show_cert, cli_release_show_cert },
+	{ { "dump", "ssl", "cert", NULL },      "dump ssl cert <certfile>                : dump the SSL certificates in PEM format",                               cli_parse_dump_cert, cli_io_handler_dump_cert, cli_release_dump_cert },
+
 
 	{ { "new", "ssl", "ca-file", NULL },    "new ssl ca-file <cafile>                : create a new CA file to be used in a crt-list",                         cli_parse_new_cafile, NULL, NULL },
 	{ { "add", "ssl", "ca-file", NULL },    "add ssl ca-file <cafile> <payload>      : add a certificate into the CA file",                                    cli_parse_set_cafile, NULL, NULL },
@@ -3952,7 +4594,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "del", "ssl", "ca-file", NULL },    "del ssl ca-file <cafile>                : delete an unused CA file",                                              cli_parse_del_cafile, NULL, NULL },
 	{ { "show", "ssl", "ca-file", NULL },   "show ssl ca-file [<cafile>[:<index>]]   : display the SSL CA files used in memory, or the details of a <cafile>, or a single certificate of index <index> of a CA file <cafile>", cli_parse_show_cafile, cli_io_handler_show_cafile, cli_release_show_cafile },
 
-	{ { "new", "ssl", "crl-file", NULL },   "new ssl crlfile <crlfile>               : create a new CRL file to be used in a crt-list",                        cli_parse_new_crlfile, NULL, NULL },
+	{ { "new", "ssl", "crl-file", NULL },   "new ssl crl-file <crlfile>               : create a new CRL file to be used in a crt-list",                        cli_parse_new_crlfile, NULL, NULL },
 	{ { "set", "ssl", "crl-file", NULL },   "set ssl crl-file <crlfile> <payload>    : replace a CRL file",                                                    cli_parse_set_crlfile, NULL, NULL },
 	{ { "commit", "ssl", "crl-file", NULL },"commit ssl crl-file <crlfile>           : commit a CRL file",                                                     cli_parse_commit_crlfile, cli_io_handler_commit_cafile_crlfile, cli_release_commit_crlfile },
 	{ { "abort", "ssl", "crl-file", NULL }, "abort ssl crl-file <crlfile>            : abort a transaction for a CRL file",                                    cli_parse_abort_crlfile, NULL, NULL },
@@ -3963,3 +4605,631 @@ static struct cli_kw_list cli_kws = {{ },{
 
 INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
 
+static char *current_crtbase = NULL;
+static char *current_keybase = NULL;
+static int crtstore_load = 0; /* did we already load in this crt-store */
+
+/* declare the ckch_conf_load_* wrapper functions */
+DECLARE_CKCH_CONF_LOAD(pem,           current_crtbase, ssl_sock_load_pem_into_ckch);
+DECLARE_CKCH_CONF_LOAD(key,           current_keybase, ssl_sock_load_key_into_ckch);
+DECLARE_CKCH_CONF_LOAD(ocsp_response, current_crtbase, ssl_sock_load_ocsp_response_from_file);
+DECLARE_CKCH_CONF_LOAD(ocsp_issuer,   current_crtbase, ssl_sock_load_issuer_file_into_ckch);
+DECLARE_CKCH_CONF_LOAD(sctl,          current_crtbase, ssl_sock_load_sctl_from_file);
+
+struct ckch_conf_kws ckch_conf_kws[] = {
+	{ "alias",        -1,                                           PARSE_TYPE_NONE,  NULL,                           },
+	{ "crt",          offsetof(struct ckch_conf, crt),              PARSE_TYPE_STR,   ckch_conf_load_pem,             },
+	{ "key",          offsetof(struct ckch_conf, key),              PARSE_TYPE_STR,   ckch_conf_load_key,             },
+#ifdef HAVE_SSL_OCSP
+	{ "ocsp",         offsetof(struct ckch_conf, ocsp),             PARSE_TYPE_STR,   ckch_conf_load_ocsp_response,   },
+#endif
+	{ "issuer",       offsetof(struct ckch_conf, issuer),           PARSE_TYPE_STR,   ckch_conf_load_ocsp_issuer,     },
+	{ "sctl",         offsetof(struct ckch_conf, sctl),             PARSE_TYPE_STR,   ckch_conf_load_sctl,            },
+#if defined(HAVE_SSL_OCSP)
+	{ "ocsp-update",  offsetof(struct ckch_conf, ocsp_update_mode), PARSE_TYPE_ONOFF, ocsp_update_init,               },
+#endif
+#if defined(HAVE_ACME)
+	{ "acme",         offsetof(struct ckch_conf, acme.id),          PARSE_TYPE_STR,   ckch_conf_acme_init,            },
+#endif
+	{ "domains",      offsetof(struct ckch_conf, acme.domains),     PARSE_TYPE_ARRAY_SUBSTR,   NULL,            },
+	{ NULL,          -1,                                            PARSE_TYPE_STR,   NULL,                           }
+};
+
+
+/* crt-store does not try to find files, but use the stored filename */
+int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, const char *file, int linenum, char **err)
+{
+	int i;
+	int err_code = 0;
+	int rc = 1;
+	struct ckch_data *d = c->data;
+
+	for (i = 0; ckch_conf_kws[i].name; i++) {
+		void *src = NULL;
+
+		if (ckch_conf_kws[i].offset < 0)
+			continue;
+
+		if (!ckch_conf_kws[i].func)
+			continue;
+
+		src = (void *)((intptr_t)f + (ptrdiff_t)ckch_conf_kws[i].offset);
+
+		switch (ckch_conf_kws[i].type) {
+			case PARSE_TYPE_STR:
+			{
+				char *v;
+
+				v = *(char **)src;
+				if (!v)
+					goto next;
+
+				rc = ckch_conf_kws[i].func(v, NULL, d, cli, file, linenum, err);
+				if (rc) {
+					err_code |= ERR_ALERT | ERR_FATAL;
+					memprintf(err, "%s '%s' cannot be read or parsed.", err && *err ? *err : "", v);
+					goto out;
+				}
+				break;
+			}
+
+			case PARSE_TYPE_INT:
+			case PARSE_TYPE_ONOFF:
+			{
+				int v = *(int *)src;
+				rc = ckch_conf_kws[i].func(&v, NULL, d, cli, file, linenum, err);
+				if (rc) {
+					err_code |= ERR_ALERT | ERR_FATAL;
+					memprintf(err, "%s '%d' cannot be read or parsed.", err && *err ? *err : "", v);
+					goto out;
+				}
+
+				break;
+			}
+
+			default:
+				break;
+		}
+next:
+		;
+	}
+
+out:
+	if (err_code & ERR_FATAL)
+		ssl_sock_free_cert_key_and_chain_contents(d);
+	ERR_clear_error();
+
+	return err_code;
+}
+
+/* Parse a local crt-base or key-base for a crt-store */
+static int crtstore_parse_path_base(char **args, int section_type, struct proxy *curpx, const struct proxy *defpx,
+                        const char *file, int linenum, char **err)
+{
+	int err_code = ERR_NONE;
+
+	if (!*args[1]) {
+		memprintf(err, "parsing [%s:%d] : '%s' requires a <path> argument.",
+		          file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	if (crtstore_load) {
+		memprintf(err, "parsing [%s:%d] : '%s' can't be used after a load line, use it at the beginning of the section.",
+		          file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	if (args[0][1] == 'r') {
+		/* crt-base */
+		free(current_crtbase);
+		current_crtbase = strdup(args[1]);
+	} else if (args[0][1] == 'e') {
+		/* key-base */
+		free(current_keybase);
+		current_keybase = strdup(args[1]);
+	}
+out:
+	return err_code;
+}
+
+/*
+ * Check if ckch_conf <prev> and <new> are compatible:
+ *
+ * new \ prev | EMPTY | CRTLIST  | CRTSTORE
+ * ----------------------------------------
+ *  EMPTY     |  OK   |  X       |   OK
+ * ----------------------------------------
+ *  CRTLIST   |  X    | CMP      |  CMP
+ * ----------------------------------------
+ *
+ * Return:
+ *  1 when the 2 structures have different variables or are incompatible
+ *  0 when the 2 structures have equal variables or are compatibles
+ */
+int ckch_conf_cmp(struct ckch_conf *prev, struct ckch_conf *new, char **err)
+{
+	int ret = 0;
+	int i;
+
+	if (!prev || !new)
+	    return 1;
+
+	/* compatibility check */
+
+	if (prev->used == CKCH_CONF_SET_EMPTY) {
+		if (new->used == CKCH_CONF_SET_CRTLIST) {
+			memprintf(err, "%sCan't use the certificate previously defined without any keyword with these keywords:\n", *err ? *err : "");
+			ret = 1;
+		}
+		if (new->used == CKCH_CONF_SET_EMPTY)
+			return 0;
+
+	} else if (prev->used == CKCH_CONF_SET_CRTLIST) {
+		if (new->used == CKCH_CONF_SET_EMPTY) {
+			memprintf(err, "%sCan't use the certificate previously defined with keywords without these keywords:\n", *err ? *err : "");
+			ret = 1;
+		}
+	} else if (prev->used == CKCH_CONF_SET_CRTSTORE) {
+		if (new->used == CKCH_CONF_SET_EMPTY)
+			return 0;
+	}
+
+
+	for (i = 0; ckch_conf_kws[i].name != NULL; i++) {
+
+		if (strcmp(ckch_conf_kws[i].name, "crt") == 0)
+			continue;
+
+		switch (ckch_conf_kws[i].type) {
+			case PARSE_TYPE_STR: {
+				char *avail1, *avail2;
+				avail1 = *(char **)((intptr_t)prev + (ptrdiff_t)ckch_conf_kws[i].offset);
+				avail2 = *(char **)((intptr_t)new + (ptrdiff_t)ckch_conf_kws[i].offset);
+
+				/* must alert when strcmp is wrong, or when one of the field is NULL */
+				if (((avail1 && avail2) && strcmp(avail1, avail2) != 0) || (!!avail1 ^ !!avail2)) {
+					memprintf(err, "%s- different parameter '%s' : previously '%s' vs '%s'\n", *err ? *err : "", ckch_conf_kws[i].name, avail1, avail2);
+					ret = 1;
+				}
+			}
+			break;
+
+			default:
+				break;
+		}
+#if defined(HAVE_SSL_OCSP)
+		/* special case for ocsp-update and default */
+		if (strcmp(ckch_conf_kws[i].name, "ocsp-update") == 0) {
+			int o1, o2; /* ocsp-update from the configuration */
+			int q1, q2; /* final ocsp-update value (from default) */
+
+
+			o1 = *(int *)((intptr_t)prev + (ptrdiff_t)ckch_conf_kws[i].offset);
+			o2 = *(int *)((intptr_t)new + (ptrdiff_t)ckch_conf_kws[i].offset);
+
+			q1 = (o1 == SSL_SOCK_OCSP_UPDATE_DFLT) ? global_ssl.ocsp_update.mode : o1;
+			q2 = (o2 == SSL_SOCK_OCSP_UPDATE_DFLT) ? global_ssl.ocsp_update.mode : o2;
+
+			if (q1 != q2) {
+				int j = 1;
+				int o = o1;
+				int q = q1;
+				memprintf(err, "%s- different parameter '%s' : previously ", *err ? *err : "", ckch_conf_kws[i].name);
+
+				do {
+					switch (o) {
+						case SSL_SOCK_OCSP_UPDATE_DFLT:
+							memprintf(err, "%s'default' (ocsp-update.mode %s)", *err ? *err : "", (q > 0) ? "on" : "off");
+						break;
+						case SSL_SOCK_OCSP_UPDATE_ON:
+							memprintf(err, "%s'%s'", *err ? *err : "", "on");
+						break;
+						case SSL_SOCK_OCSP_UPDATE_OFF:
+							memprintf(err, "%s'%s'", *err ? *err : "", "off");
+						break;
+					}
+					o = o2;
+					q = q2;
+					if (j)
+						memprintf(err, "%s vs ", *err ? *err : "");
+				} while (j--);
+				memprintf(err, "%s\n", *err ? *err : "");
+				ret = 1;
+			}
+		}
+#endif
+	}
+
+out:
+	return ret;
+}
+
+/*
+ *  Compare a previously generated ckch_conf with an empty one, using ckch_conf_cmp().
+ */
+int ckch_conf_cmp_empty(struct ckch_conf *prev, char **err)
+{
+	struct ckch_conf new = {};
+
+	return ckch_conf_cmp(prev, &new, err);
+}
+
+/* parse ckch_conf keywords for crt-list */
+int ckch_conf_parse(char **args, int cur_arg, struct ckch_conf *f, int *found, const char *file, int linenum, char **err)
+{
+	int i;
+	int err_code = 0;
+
+	for (i = 0; ckch_conf_kws[i].name != NULL; i++) {
+		if (strcmp(ckch_conf_kws[i].name, args[cur_arg]) == 0) {
+			void *target;
+			*found = 1;
+			target = (char **)((intptr_t)f + (ptrdiff_t)ckch_conf_kws[i].offset);
+
+			if (ckch_conf_kws[i].type == PARSE_TYPE_STR) {
+				char **t = target;
+
+				if (*t) {
+					ha_free(t);
+					memprintf(err, "'%s' already specified, overwriting.", ckch_conf_kws[i].name);
+					err_code |= ERR_WARN;
+				}
+
+				*t = strdup(args[cur_arg + 1]);
+				if (!*t) {
+					ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+					err_code |= ERR_ALERT | ERR_ABORT;
+					goto out;
+				}
+			} else if (ckch_conf_kws[i].type == PARSE_TYPE_ARRAY_SUBSTR) {
+				char ***t = target;
+				char **r = NULL;
+				int n = 0;
+				char *b, *e;
+
+				/* split a string into substring split by colons */
+				if (*t) {
+					ha_freearray(t);
+					memprintf(err, "'%s' already specified, overwriting.", ckch_conf_kws[i].name);
+					err_code |= ERR_WARN;
+				}
+				e = b = args[cur_arg + 1];
+				do {
+					while (*e != ',' && *e != '\0')
+						e++;
+					r = realloc(r, sizeof(char *) * (n + 2));
+					if (!r) {
+						ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+						err_code |= ERR_ALERT | ERR_ABORT;
+						goto array_err;
+					}
+					r[n] = my_strndup(b, e - b);
+					if (!r[n]) {
+						ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+						err_code |= ERR_ALERT | ERR_ABORT;
+						goto array_err;
+					}
+
+					n++;
+
+					if (*e == '\0')
+						break;
+
+					e++; /* skip the separator */
+
+					/* skip trailing spaces */
+					while (*e == ' ')
+						e++;
+
+					b = e;
+
+				} while (*b);
+
+				r[n] = NULL; /* last element is NULL */
+				*t = r;
+// debug
+//				while (*r)
+//					fprintf(stderr, "sub: \"%s\"\n", *r++);
+
+				goto out;
+array_err:
+				while (r && *r) {
+					char *prev = *r;
+					r++;
+					free(prev);
+				}
+				free(r);
+
+
+			} else if (ckch_conf_kws[i].type == PARSE_TYPE_INT) {
+				int *t = target;
+				char *stop;
+
+				*t = strtol(args[cur_arg + 1], &stop, 10);
+				if (*stop != '\0') {
+					memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', an integer is expected.\n",
+					          file, linenum, args[cur_arg], args[cur_arg + 1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			} else if (ckch_conf_kws[i].type == PARSE_TYPE_ONOFF) {
+				int *t = target;
+
+				if (strcmp(args[cur_arg + 1], "on") == 0) {
+					*t = 1;
+				} else if (strcmp(args[cur_arg + 1], "off") == 0) {
+					*t = -1;
+				} else {
+					memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', 'on' or 'off' is expected.\n",
+					          file, linenum, args[cur_arg], args[cur_arg + 1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			}
+			break;
+		}
+	}
+out:
+	return err_code;
+}
+
+/* freeing the content of a ckch_conf structure */
+void ckch_conf_clean(struct ckch_conf *conf)
+{
+	char **r;
+
+	if (!conf)
+		return;
+
+	ha_free(&conf->crt);
+	ha_free(&conf->key);
+	ha_free(&conf->ocsp);
+	ha_free(&conf->issuer);
+	ha_free(&conf->sctl);
+
+	ha_free(&conf->acme.id);
+
+	r = conf->acme.domains;
+	while (r && *r) {
+		char *prev = *r;
+		r++;
+		free(prev);
+	}
+	ha_free(&conf->acme.domains);
+
+}
+
+static char current_crtstore_name[PATH_MAX] = {};
+
+static int crtstore_parse_load(char **args, int section_type, struct proxy *curpx, const struct proxy *defpx,
+                        const char *file, int linenum, char **err)
+{
+	int err_code = 0;
+	int cur_arg = 0;
+	struct ckch_conf f = {};
+	struct ckch_store *c = NULL;
+	char store_path[PATH_MAX]; /* complete path with crt_base */
+	char alias_name[PATH_MAX]; /* complete alias name with the store prefix '@/' */
+	char *final_name = NULL; /* name used as a key in the ckch_store */
+
+	cur_arg++; /* skip "load" */
+
+	while (*(args[cur_arg])) {
+		int found = 0;
+
+		if (strcmp("alias", args[cur_arg]) == 0) {
+			int rv;
+
+			if (*args[cur_arg + 1] == '/') {
+				memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', '/' is forbidden as the first character.\n",
+					  file, linenum, args[cur_arg], args[cur_arg + 1]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			rv = snprintf(alias_name, sizeof(alias_name), "@%s/%s", current_crtstore_name, args[cur_arg + 1]);
+			if (rv >= sizeof(alias_name)) {
+				memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', too long, max len is %zd.\n",
+					  file, linenum, args[cur_arg], args[cur_arg + 1], sizeof(alias_name));
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			final_name = alias_name;
+			found = 1;
+		} else {
+			err_code |= ckch_conf_parse(args, cur_arg, &f, &found, file, linenum, err);
+			if (err_code & ERR_FATAL)
+			goto out;
+		}
+
+		if (!found) {
+			memprintf(err,"parsing [%s:%d] : '%s %s' in section 'crt-store': unknown keyword '%s'.",
+			         file, linenum, args[0], args[cur_arg],args[cur_arg]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		cur_arg += 2;
+	}
+
+	if (!f.crt) {
+		memprintf(err,"parsing [%s:%d] : '%s' in section 'crt-store': mandatory 'crt' parameter not found.",
+		         file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	crtstore_load = 1;
+
+	if (!final_name) {
+		final_name = f.crt;
+
+		/* if no alias was used:
+		 * - when a crt-store exists, use @store/crt
+		 * - or use the absolute file (crt_base + crt)
+		 * - or the relative file when no crt_base exists
+		 */
+		if (current_crtstore_name[0] != '\0') {
+			int rv;
+
+			/* add the crt-store name, avoid a double / if the crt starts by it */
+			rv = snprintf(alias_name, sizeof(alias_name), "@%s%s%s", current_crtstore_name, f.crt[0] != '/' ? "/" : "", f.crt);
+			if (rv >= sizeof(alias_name)) {
+				memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', too long, max len is %zd.\n",
+				          file, linenum, args[cur_arg], args[cur_arg + 1], sizeof(alias_name));
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			final_name = alias_name;
+		} else if (global_ssl.crt_base && *f.crt != '/') {
+			int rv;
+			/* When no crt_store name, complete the name in the ckch_tree with 'crt-base' */
+
+			rv = snprintf(store_path, sizeof(store_path), "%s/%s", global_ssl.crt_base, f.crt);
+			if (rv >= sizeof(store_path)) {
+				memprintf(err, "'%s/%s' : path too long", global_ssl.crt_base, f.crt);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			final_name = store_path;
+		}
+	}
+	/* process and insert the ckch_store */
+	c = ckch_store_new(final_name);
+	if (!c)
+		goto alloc_error;
+
+	err_code |= ckch_store_load_files(&f, c,  0, file, linenum, err);
+	if (err_code & ERR_FATAL)
+		goto out;
+
+	c->conf = f;
+	c->conf.used = CKCH_CONF_SET_CRTSTORE;
+
+	if (ebst_insert(&ckchs_tree, &c->node) != &c->node) {
+		memprintf(err,"parsing [%s:%d] : '%s' in section 'crt-store': store '%s' was already defined.",
+		         file, linenum, args[0], c->path);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+out:
+	/* free ckch_conf content */
+	if (err_code & ERR_FATAL)
+		ckch_store_free(c);
+	return err_code;
+
+alloc_error:
+	ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+	err_code |= ERR_ALERT | ERR_ABORT;
+	goto out;
+}
+
+/*
+ * Parse "crt-store" section and create corresponding ckch_stores.
+ *
+ * The function returns 0 in success case, otherwise, it returns error
+ * flags.
+ */
+static int cfg_parse_crtstore(const char *file, int linenum, char **args, int kwm)
+{
+	struct cfg_kw_list *kwl;
+	const char *best;
+	int index;
+	int rc = 0;
+	int err_code = 0;
+	char *errmsg = NULL;
+
+	if (strcmp(args[0], "crt-store") == 0) { /* new crt-store section */
+		if (!*args[1]) {
+			current_crtstore_name[0] = '\0';
+		} else {
+			rc = snprintf(current_crtstore_name, sizeof(current_crtstore_name), "%s", args[1]);
+			if (rc >= sizeof(current_crtstore_name)) {
+				ha_alert("parsing [%s:%d] : 'crt-store' <name> argument is too long.\n", file, linenum);
+				current_crtstore_name[0] = '\0';
+				err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
+				goto out;
+			}
+		}
+
+		if (*args[2]) {
+			ha_alert("parsing [%s:%d] : 'crt-store' section only supports a <name> argument.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
+			goto out;
+		}
+		/* copy the crt_base and key_base */
+		ha_free(&current_crtbase);
+		if (global_ssl.crt_base)
+			current_crtbase = strdup(global_ssl.crt_base);
+		ha_free(&current_keybase);
+		if (global_ssl.key_base)
+			current_keybase = strdup(global_ssl.key_base);
+		crtstore_load = 0;
+
+		goto out;
+	}
+
+	list_for_each_entry(kwl, &cfg_keywords.list, list) {
+		for (index = 0; kwl->kw[index].kw != NULL; index++) {
+			if (kwl->kw[index].section != CFG_CRTSTORE)
+				continue;
+			if (strcmp(kwl->kw[index].kw, args[0]) == 0) {
+				if (check_kw_experimental(&kwl->kw[index], file, linenum, &errmsg)) {
+					ha_alert("%s\n", errmsg);
+					err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
+					goto out;
+				}
+
+				/* prepare error message just in case */
+				rc = kwl->kw[index].parse(args, CFG_CRTSTORE, NULL, NULL, file, linenum, &errmsg);
+				if (rc & ERR_ALERT) {
+					ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+					err_code |= rc;
+					goto out;
+				}
+				else if (rc & ERR_WARN) {
+					ha_warning("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+					err_code |= rc;
+					goto out;
+				}
+				goto out;
+			}
+		}
+	}
+
+	best = cfg_find_best_match(args[0], &cfg_keywords.list, CFG_CRTSTORE, NULL);
+	if (best)
+		ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section; did you mean '%s' maybe ?\n", file, linenum, args[0], cursection, best);
+	else
+		ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section\n", file, linenum, args[0], cursection);
+	err_code |= ERR_ALERT | ERR_FATAL;
+	goto out;
+
+out:
+	if (err_code & ERR_FATAL)
+		err_code |= ERR_ABORT;
+	free(errmsg);
+	return err_code;
+}
+
+static int cfg_post_parse_crtstore()
+{
+	current_crtstore_name[0] = '\0';
+	ha_free(&current_crtbase);
+	ha_free(&current_keybase);
+
+	return ERR_NONE;
+}
+
+REGISTER_CONFIG_SECTION("crt-store", cfg_parse_crtstore, cfg_post_parse_crtstore);
+
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_CRTSTORE, "crt-base", crtstore_parse_path_base },
+	{ CFG_CRTSTORE, "key-base", crtstore_parse_path_base },
+	{ CFG_CRTSTORE, "load", crtstore_parse_load },
+	{ 0, NULL, NULL },
+}};
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);

@@ -64,7 +64,16 @@ syslog S1 -level notice {
 
 haproxy h1 -conf {
 	global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
 		stats socket "${tmpdir}/h1/stats" level admin
+
+	defaults
+		timeout client 30s
+		timeout server 30s
+		timeout connect 30s
 
 	backend be1
 		option log-health-checks

@@ -1,5 +1,4 @@
 varnishtest "normalize-uri tests"
-#REQUIRE_VERSION=2.4
 
 # This reg-test tests the http-request normalize-uri action.
 
@@ -12,6 +11,10 @@ server s1 {
 
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         # WT: limit false-positives causing "HTTP header incomplete" due to
         # idle server connections being randomly used and randomly expiring
         # under us.
@@ -127,7 +130,7 @@ haproxy h1 -conf {
 
     frontend fe_fragment_strip
         bind "fd@${fe_fragment_strip}"
-        option accept-invalid-http-request
+        option accept-unsafe-violations-in-http-request
 
         http-request set-var(txn.before) url
         http-request normalize-uri fragment-strip
@@ -140,7 +143,7 @@ haproxy h1 -conf {
 
     frontend fe_fragment_encode
         bind "fd@${fe_fragment_encode}"
-        option accept-invalid-http-request
+        option accept-unsafe-violations-in-http-request
 
         http-request set-var(txn.before) url
         http-request normalize-uri fragment-encode

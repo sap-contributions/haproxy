@@ -28,6 +28,7 @@
 #include <haproxy/acl-t.h>
 #include <haproxy/api-t.h>
 #include <haproxy/arg-t.h>
+#include <haproxy/log-t.h>
 #include <haproxy/fcgi.h>
 #include <haproxy/filters-t.h>
 #include <haproxy/regex-t.h>
@@ -55,23 +56,23 @@ struct fcgi_rule_conf {
 	struct list list;
 };
 
-/* parameter rule evaluated during request analyzis */
+/* parameter rule evaluated during request analysis */
 struct fcgi_rule {
 	enum fcgi_rule_type type;
 	struct ist name;       /* name of the parameter/header */
-	struct list value;     /* log-format compatible expression, may be empty */
+	struct lf_expr value;  /* log-format compatible expression, may be empty */
 	struct acl_cond *cond; /* acl condition to set the param */
 	struct list list;
 };
 
-/* parameter rule to set/unset a param at the end of the analyzis */
+/* parameter rule to set/unset a param at the end of the analysis */
 struct fcgi_param_rule {
 	struct ist name;
-	struct list *value; /* if empty , unset the parameter */
+	struct lf_expr *value; /* if empty , unset the parameter */
 	struct ebpt_node node;
 };
 
-/* header rule to pass/hide a header at the end of the analyzis */
+/* header rule to pass/hide a header at the end of the analysis */
 struct fcgi_hdr_rule {
 	struct ist name;
 	int pass; /* 1 to pass the header, 0 Otherwise */
@@ -84,7 +85,7 @@ struct fcgi_app {
 	struct ist         index;         /* filename to append to URI ending by a '/' */
 	struct my_regex   *pathinfo_re;   /* Regex to use to split scriptname and path-info */
 	unsigned int       flags;         /* FCGI_APP_FL_* */
-	struct list        logsrvs;       /* log servers */
+	struct list        loggers;       /* one per 'log' directive */
 	unsigned int       maxreqs;       /* maximum number of concurrent requests */
 
 	struct list acls;                 /* list of acls declared for this application */

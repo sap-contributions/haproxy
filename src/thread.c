@@ -27,10 +27,6 @@
 #ifdef USE_CPU_AFFINITY
 #  include <sched.h>
 #  if defined(__FreeBSD__) || defined(__DragonFly__)
-#    include <sys/param.h>
-#    ifdef __FreeBSD__
-#      include <sys/cpuset.h>
-#    endif
 #    include <pthread_np.h>
 #  endif
 #  ifdef __APPLE__
@@ -39,6 +35,7 @@
 #    include <mach/thread_policy.h>
 #  endif
 #  include <haproxy/cpuset.h>
+#  include <haproxy/cpu_topo.h>
 #endif
 
 #include <haproxy/cfgparse.h>
@@ -263,7 +260,7 @@ void wait_for_threads_completion()
 	for (i = 1; i < global.nbthread; i++)
 		pthread_join(ha_pthread[i], NULL);
 
-#if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+#if (DEBUG_THREAD > 1) || defined(DEBUG_FULL)
 	show_lock_stats();
 #endif
 }
@@ -287,14 +284,14 @@ void set_thread_cpu_affinity()
 			thread_affinity_policy_data_t cpu_set = { j - 1 };
 			thread_port_t mthread;
 
-			mthread = pthread_mach_thread_np(ha_pthread[tid]);
+			mthread = pthread_mach_thread_np(pthread_self());
 			thread_policy_set(mthread, THREAD_AFFINITY_POLICY, (thread_policy_t)&cpu_set, 1);
 			set &= ~(1UL << (j - 1));
 		}
 #  else
 		struct hap_cpuset *set = &cpu_map[tgid - 1].thread[ti->ltid];
 
-		pthread_setaffinity_np(ha_pthread[tid], sizeof(set->cpuset), &set->cpuset);
+		pthread_setaffinity_np(pthread_self(), sizeof(set->cpuset), &set->cpuset);
 #  endif
 	}
 #endif /* USE_CPU_AFFINITY */
@@ -380,47 +377,24 @@ void ha_rwlock_init(HA_RWLOCK_T *l)
 static int thread_cpus_enabled()
 {
 	int ret = 1;
-
 #ifdef USE_CPU_AFFINITY
-#if defined(__linux__) && defined(CPU_COUNT)
-	cpu_set_t mask;
+	struct hap_cpuset set = { };
 
-	if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
-		ret = CPU_COUNT(&mask);
-#elif defined(__FreeBSD__) && defined(USE_CPU_AFFINITY)
-	cpuset_t cpuset;
-	if (cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1,
-	    sizeof(cpuset), &cpuset) == 0)
-		ret = CPU_COUNT(&cpuset);
-#elif defined(__APPLE__)
-	ret = (int)sysconf(_SC_NPROCESSORS_ONLN);
+	ret = ha_cpuset_detect_bound(&set);
+#if defined(__APPLE__)
+	if (!ret)
+		ret = (int)sysconf(_SC_NPROCESSORS_ONLN);
 #endif
 #endif
 	ret = MAX(ret, 1);
 	return ret;
 }
 
-/* Returns 1 if the cpu set is currently restricted for the process else 0.
- * Currently only implemented for the Linux platform.
- */
-int thread_cpu_mask_forced()
-{
-#if defined(__linux__)
-	const int cpus_avail = sysconf(_SC_NPROCESSORS_ONLN);
-	return cpus_avail != thread_cpus_enabled();
-#else
-	return 0;
-#endif
-}
-
 /* Below come the lock-debugging functions */
 
-#if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+#if (DEBUG_THREAD > 0) || defined(DEBUG_FULL)
 
-struct lock_stat lock_stats[LOCK_LABELS];
-
-/* this is only used below */
-static const char *lock_label(enum lock_label label)
+const char *lock_label(enum lock_label label)
 {
 	switch (label) {
 	case TASK_RQ_LOCK:         return "TASK_RQ";
@@ -431,6 +405,7 @@ static const char *lock_label(enum lock_label label)
 	case LBPRM_LOCK:           return "LBPRM";
 	case SIGNALS_LOCK:         return "SIGNALS";
 	case STK_TABLE_LOCK:       return "STK_TABLE";
+	case STK_TABLE_UPDT_LOCK:       return "STK_TABLE_UPDT";
 	case STK_SESS_LOCK:        return "STK_SESS";
 	case APPLETS_LOCK:         return "APPLETS";
 	case PEER_LOCK:            return "PEER";
@@ -446,7 +421,6 @@ static const char *lock_label(enum lock_label label)
 	case SPOE_APPLET_LOCK:     return "SPOE_APPLET";
 	case DNS_LOCK:             return "DNS";
 	case PID_LIST_LOCK:        return "PID_LIST";
-	case EMAIL_ALERTS_LOCK:    return "EMAIL_ALERTS";
 	case PIPES_LOCK:           return "PIPES";
 	case TLSKEYS_REF_LOCK:     return "TLSKEYS_REF";
 	case AUTH_LOCK:            return "AUTH";
@@ -461,6 +435,9 @@ static const char *lock_label(enum lock_label label)
 	case IDLE_CONNS_LOCK:      return "IDLE_CONNS";
 	case OCSP_LOCK:            return "OCSP";
 	case QC_CID_LOCK:          return "QC_CID";
+	case CACHE_LOCK:           return "CACHE";
+	case GUID_LOCK:            return "GUID";
+	case JWT_LOCK:             return "JWT";
 	case OTHER_LOCK:           return "OTHER";
 	case DEBUG1_LOCK:          return "DEBUG1";
 	case DEBUG2_LOCK:          return "DEBUG2";
@@ -472,15 +449,56 @@ static const char *lock_label(enum lock_label label)
 	/* only way to come here is consecutive to an internal bug */
 	abort();
 }
+#endif
+
+#if (DEBUG_THREAD > 1) || defined(DEBUG_FULL)
+
+struct lock_stat lock_stats_rd[LOCK_LABELS] = { };
+struct lock_stat lock_stats_sk[LOCK_LABELS] = { };
+struct lock_stat lock_stats_wr[LOCK_LABELS] = { };
+
+/* returns the num read/seek/write for a given label by summing buckets */
+static uint64_t get_lock_stat_num_read(int lbl)
+{
+	uint64_t ret = 0;
+	uint bucket;
+
+	for (bucket = 0; bucket < 30; bucket++)
+		ret += _HA_ATOMIC_LOAD(&lock_stats_rd[lbl].buckets[bucket]);
+	return ret;
+}
+
+static uint64_t get_lock_stat_num_seek(int lbl)
+{
+	uint64_t ret = 0;
+	uint bucket;
+
+	for (bucket = 0; bucket < 30; bucket++)
+		ret += _HA_ATOMIC_LOAD(&lock_stats_sk[lbl].buckets[bucket]);
+	return ret;
+}
+
+static uint64_t get_lock_stat_num_write(int lbl)
+{
+	uint64_t ret = 0;
+	uint bucket;
+
+	for (bucket = 0; bucket < 30; bucket++)
+		ret += _HA_ATOMIC_LOAD(&lock_stats_wr[lbl].buckets[bucket]);
+	return ret;
+}
 
 void show_lock_stats()
 {
 	int lbl;
+	uint bucket;
 
 	for (lbl = 0; lbl < LOCK_LABELS; lbl++) {
-		if (!lock_stats[lbl].num_write_locked &&
-		    !lock_stats[lbl].num_seek_locked &&
-		    !lock_stats[lbl].num_read_locked) {
+		uint64_t num_write_locked = get_lock_stat_num_write(lbl);
+		uint64_t num_seek_locked = get_lock_stat_num_seek(lbl);
+		uint64_t num_read_locked = get_lock_stat_num_read(lbl);
+
+		if (!num_write_locked && !num_seek_locked && !num_read_locked) {
 			fprintf(stderr,
 			        "Stats about Lock %s: not used\n",
 			        lock_label(lbl));
@@ -491,41 +509,62 @@ void show_lock_stats()
 			"Stats about Lock %s: \n",
 			lock_label(lbl));
 
-		if (lock_stats[lbl].num_write_locked)
+		if (num_write_locked) {
 			fprintf(stderr,
 			        "\t # write lock  : %llu\n"
 			        "\t # write unlock: %llu (%lld)\n"
 			        "\t # wait time for write     : %.3f msec\n"
-			        "\t # wait time for write/lock: %.3f nsec\n",
-			        (ullong)lock_stats[lbl].num_write_locked,
-			        (ullong)lock_stats[lbl].num_write_unlocked,
-			        (llong)(lock_stats[lbl].num_write_unlocked - lock_stats[lbl].num_write_locked),
-			        (double)lock_stats[lbl].nsec_wait_for_write / 1000000.0,
-			        lock_stats[lbl].num_write_locked ? ((double)lock_stats[lbl].nsec_wait_for_write / (double)lock_stats[lbl].num_write_locked) : 0);
+			        "\t # wait time for write/lock: %.3f nsec\n"
+			        "\t # WR wait time(ns) buckets:",
+			        (ullong)num_write_locked,
+			        (ullong)lock_stats_wr[lbl].num_unlocked,
+			        (llong)(lock_stats_wr[lbl].num_unlocked - num_write_locked),
+			        (double)lock_stats_wr[lbl].nsec_wait / 1000000.0,
+			        num_write_locked ? ((double)lock_stats_wr[lbl].nsec_wait / (double)num_write_locked) : 0);
 
-		if (lock_stats[lbl].num_seek_locked)
+			for (bucket = 0; bucket < 30; bucket++)
+				if (lock_stats_wr[lbl].buckets[bucket])
+					fprintf(stderr, " %u:%llu", bucket, (ullong)lock_stats_wr[lbl].buckets[bucket]);
+			fprintf(stderr, "\n");
+		}
+
+		if (num_seek_locked) {
 			fprintf(stderr,
 			        "\t # seek lock   : %llu\n"
 			        "\t # seek unlock : %llu (%lld)\n"
 			        "\t # wait time for seek      : %.3f msec\n"
-			        "\t # wait time for seek/lock : %.3f nsec\n",
-			        (ullong)lock_stats[lbl].num_seek_locked,
-			        (ullong)lock_stats[lbl].num_seek_unlocked,
-			        (llong)(lock_stats[lbl].num_seek_unlocked - lock_stats[lbl].num_seek_locked),
-			        (double)lock_stats[lbl].nsec_wait_for_seek / 1000000.0,
-			        lock_stats[lbl].num_seek_locked ? ((double)lock_stats[lbl].nsec_wait_for_seek / (double)lock_stats[lbl].num_seek_locked) : 0);
+			        "\t # wait time for seek/lock : %.3f nsec\n"
+			        "\t # SK wait time(ns) buckets:",
+			        (ullong)num_seek_locked,
+			        (ullong)lock_stats_sk[lbl].num_unlocked,
+			        (llong)(lock_stats_sk[lbl].num_unlocked - num_seek_locked),
+			        (double)lock_stats_sk[lbl].nsec_wait / 1000000.0,
+			        num_seek_locked ? ((double)lock_stats_sk[lbl].nsec_wait / (double)num_seek_locked) : 0);
 
-		if (lock_stats[lbl].num_read_locked)
+			for (bucket = 0; bucket < 30; bucket++)
+				if (lock_stats_sk[lbl].buckets[bucket])
+					fprintf(stderr, " %u:%llu", bucket, (ullong)lock_stats_sk[lbl].buckets[bucket]);
+			fprintf(stderr, "\n");
+		}
+
+		if (num_read_locked) {
 			fprintf(stderr,
 			        "\t # read lock   : %llu\n"
 			        "\t # read unlock : %llu (%lld)\n"
 			        "\t # wait time for read      : %.3f msec\n"
-			        "\t # wait time for read/lock : %.3f nsec\n",
-			        (ullong)lock_stats[lbl].num_read_locked,
-			        (ullong)lock_stats[lbl].num_read_unlocked,
-			        (llong)(lock_stats[lbl].num_read_unlocked - lock_stats[lbl].num_read_locked),
-			        (double)lock_stats[lbl].nsec_wait_for_read / 1000000.0,
-			        lock_stats[lbl].num_read_locked ? ((double)lock_stats[lbl].nsec_wait_for_read / (double)lock_stats[lbl].num_read_locked) : 0);
+			        "\t # wait time for read/lock : %.3f nsec\n"
+			        "\t # RD wait time(ns) buckets:",
+			        (ullong)num_read_locked,
+			        (ullong)lock_stats_rd[lbl].num_unlocked,
+			        (llong)(lock_stats_rd[lbl].num_unlocked - num_read_locked),
+			        (double)lock_stats_rd[lbl].nsec_wait / 1000000.0,
+			        num_read_locked ? ((double)lock_stats_rd[lbl].nsec_wait / (double)num_read_locked) : 0);
+
+			for (bucket = 0; bucket < 30; bucket++)
+				if (lock_stats_rd[lbl].buckets[bucket])
+					fprintf(stderr, " %u:%llu", bucket, (ullong)lock_stats_rd[lbl].buckets[bucket]);
+			fprintf(stderr, "\n");
+		}
 	}
 }
 
@@ -548,17 +587,21 @@ void __ha_rwlock_wrlock(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__RWLOCK_WRLOCK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_write, (now_mono_time() - start_time));
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_wr[lbl].nsec_wait, start_time);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time + 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_wr[lbl].buckets[bucket]);
 
 	st->cur_writer                 = tbit;
 	l->info.last_location.function = func;
@@ -574,6 +617,7 @@ int __ha_rwlock_trywrlock(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 	int r;
 
 	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
@@ -582,14 +626,18 @@ int __ha_rwlock_trywrlock(enum lock_label lbl, struct ha_rwlock *l,
 	/* We set waiting writer because trywrlock could wait for readers to quit */
 	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	r = __RWLOCK_TRYWRLOCK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_write, (now_mono_time() - start_time));
+	start_time += now_mono_time();
 	if (unlikely(r)) {
 		HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 		return r;
 	}
-	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
+	HA_ATOMIC_ADD(&lock_stats_wr[lbl].nsec_wait, start_time);
+
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_wr[lbl].buckets[bucket]);
 
 	st->cur_writer                 = tbit;
 	l->info.last_location.function = func;
@@ -619,7 +667,7 @@ void __ha_rwlock_wrunlock(enum lock_label lbl,struct ha_rwlock *l,
 
 	__RWLOCK_WRUNLOCK(&l->lock);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_write_unlocked);
+	HA_ATOMIC_INC(&lock_stats_wr[lbl].num_unlocked);
 }
 
 void __ha_rwlock_rdlock(enum lock_label lbl,struct ha_rwlock *l)
@@ -627,16 +675,21 @@ void __ha_rwlock_rdlock(enum lock_label lbl,struct ha_rwlock *l)
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__RWLOCK_RDLOCK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_read, (now_mono_time() - start_time));
-	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_rd[lbl].nsec_wait, start_time);
+
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_rd[lbl].buckets[bucket]);
 
 	HA_ATOMIC_OR(&st->cur_readers, tbit);
 
@@ -647,16 +700,26 @@ int __ha_rwlock_tryrdlock(enum lock_label lbl,struct ha_rwlock *l)
 {
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+	uint64_t start_time;
+	uint bucket;
 	int r;
 
 	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	/* try read should never wait */
+	start_time = -now_mono_time();
 	r = __RWLOCK_TRYRDLOCK(&l->lock);
+	start_time += now_mono_time();
+
 	if (unlikely(r))
 		return r;
-	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
+
+	HA_ATOMIC_ADD(&lock_stats_rd[lbl].nsec_wait, start_time);
+
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_rd[lbl].buckets[bucket]);
 
 	HA_ATOMIC_OR(&st->cur_readers, tbit);
 
@@ -677,7 +740,7 @@ void __ha_rwlock_rdunlock(enum lock_label lbl,struct ha_rwlock *l)
 
 	__RWLOCK_RDUNLOCK(&l->lock);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_read_unlocked);
+	HA_ATOMIC_INC(&lock_stats_rd[lbl].num_unlocked);
 }
 
 void __ha_rwlock_wrtord(enum lock_label lbl, struct ha_rwlock *l,
@@ -686,6 +749,7 @@ void __ha_rwlock_wrtord(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if ((st->cur_readers | st->cur_seeker) & tbit)
 		abort();
@@ -695,11 +759,14 @@ void __ha_rwlock_wrtord(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__RWLOCK_WRTORD(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_read, (now_mono_time() - start_time));
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_rd[lbl].nsec_wait, start_time);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_rd[lbl].buckets[bucket]);
 
 	HA_ATOMIC_OR(&st->cur_readers, tbit);
 	HA_ATOMIC_AND(&st->cur_writer, ~tbit);
@@ -716,6 +783,7 @@ void __ha_rwlock_wrtosk(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if ((st->cur_readers | st->cur_seeker) & tbit)
 		abort();
@@ -725,11 +793,14 @@ void __ha_rwlock_wrtosk(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__RWLOCK_WRTOSK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_seek, (now_mono_time() - start_time));
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_sk[lbl].nsec_wait, start_time);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_sk[lbl].buckets[bucket]);
 
 	HA_ATOMIC_OR(&st->cur_seeker, tbit);
 	HA_ATOMIC_AND(&st->cur_writer, ~tbit);
@@ -746,17 +817,21 @@ void __ha_rwlock_sklock(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__RWLOCK_SKLOCK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_seek, (now_mono_time() - start_time));
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_sk[lbl].nsec_wait, start_time);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_sk[lbl].buckets[bucket]);
 
 	HA_ATOMIC_OR(&st->cur_seeker, tbit);
 	l->info.last_location.function = func;
@@ -772,6 +847,7 @@ void __ha_rwlock_sktowr(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if ((st->cur_readers | st->cur_writer) & tbit)
 		abort();
@@ -781,11 +857,14 @@ void __ha_rwlock_sktowr(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__RWLOCK_SKTOWR(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_write, (now_mono_time() - start_time));
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_wr[lbl].nsec_wait, start_time);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_wr[lbl].buckets[bucket]);
 
 	HA_ATOMIC_OR(&st->cur_writer, tbit);
 	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
@@ -802,6 +881,7 @@ void __ha_rwlock_sktord(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if ((st->cur_readers | st->cur_writer) & tbit)
 		abort();
@@ -811,11 +891,14 @@ void __ha_rwlock_sktord(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__RWLOCK_SKTORD(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_read, (now_mono_time() - start_time));
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_rd[lbl].nsec_wait, start_time);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_rd[lbl].buckets[bucket]);
 
 	HA_ATOMIC_OR(&st->cur_readers, tbit);
 	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
@@ -841,7 +924,7 @@ void __ha_rwlock_skunlock(enum lock_label lbl,struct ha_rwlock *l,
 
 	__RWLOCK_SKUNLOCK(&l->lock);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_seek_unlocked);
+	HA_ATOMIC_INC(&lock_stats_sk[lbl].num_unlocked);
 }
 
 int __ha_rwlock_trysklock(enum lock_label lbl, struct ha_rwlock *l,
@@ -850,6 +933,7 @@ int __ha_rwlock_trysklock(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 	int r;
 
 	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
@@ -857,13 +941,17 @@ int __ha_rwlock_trysklock(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	r = __RWLOCK_TRYSKLOCK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_seek, (now_mono_time() - start_time));
+	start_time += now_mono_time();
 
 	if (likely(!r)) {
 		/* got the lock ! */
-		HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
+		HA_ATOMIC_ADD(&lock_stats_sk[lbl].nsec_wait, start_time);
+
+		start_time &= 0x3fffffff; // keep values below 1 billion only
+		bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+		HA_ATOMIC_INC(&lock_stats_sk[lbl].buckets[bucket]);
 		HA_ATOMIC_OR(&st->cur_seeker, tbit);
 		l->info.last_location.function = func;
 		l->info.last_location.file     = file;
@@ -880,6 +968,7 @@ int __ha_rwlock_tryrdtosk(enum lock_label lbl, struct ha_rwlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 	int r;
 
 	if ((st->cur_writer | st->cur_seeker) & tbit)
@@ -890,13 +979,17 @@ int __ha_rwlock_tryrdtosk(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	r = __RWLOCK_TRYRDTOSK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_seek, (now_mono_time() - start_time));
+	start_time += now_mono_time();
 
 	if (likely(!r)) {
 		/* got the lock ! */
-		HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
+		HA_ATOMIC_ADD(&lock_stats_sk[lbl].nsec_wait, start_time);
+
+		start_time &= 0x3fffffff; // keep values below 1 billion only
+		bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+		HA_ATOMIC_INC(&lock_stats_sk[lbl].buckets[bucket]);
 		HA_ATOMIC_OR(&st->cur_seeker, tbit);
 		HA_ATOMIC_AND(&st->cur_readers, ~tbit);
 		l->info.last_location.function = func;
@@ -907,6 +1000,46 @@ int __ha_rwlock_tryrdtosk(enum lock_label lbl, struct ha_rwlock *l,
 	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 	return r;
 }
+
+int __ha_rwlock_tryrdtowr(enum lock_label lbl, struct ha_rwlock *l,
+                          const char *func, const char *file, int line)
+{
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+	uint64_t start_time;
+	uint bucket;
+	int r;
+
+	if ((st->cur_writer | st->cur_seeker) & tbit)
+		abort();
+
+	if (!(st->cur_readers & tbit))
+		abort();
+
+	HA_ATOMIC_OR(&st->wait_writers, tbit);
+
+	start_time = -now_mono_time();
+	r = __RWLOCK_TRYRDTOWR(&l->lock);
+	start_time += now_mono_time();
+
+	if (likely(!r)) {
+		/* got the lock ! */
+		HA_ATOMIC_ADD(&lock_stats_sk[lbl].nsec_wait, start_time);
+
+		start_time &= 0x3fffffff; // keep values below 1 billion only
+		bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+		HA_ATOMIC_INC(&lock_stats_sk[lbl].buckets[bucket]);
+		HA_ATOMIC_OR(&st->cur_writer, tbit);
+		HA_ATOMIC_AND(&st->cur_readers, ~tbit);
+		l->info.last_location.function = func;
+		l->info.last_location.file     = file;
+		l->info.last_location.line     = line;
+	}
+
+	HA_ATOMIC_AND(&st->wait_writers, ~tbit);
+	return r;
+}
+
 
 void __spin_init(struct ha_spinlock *l)
 {
@@ -926,6 +1059,7 @@ void __spin_lock(enum lock_label lbl, struct ha_spinlock *l,
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_spinlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
+	uint bucket;
 
 	if (unlikely(st->owner & tbit)) {
 		/* the thread is already owning the lock */
@@ -934,11 +1068,14 @@ void __spin_lock(enum lock_label lbl, struct ha_spinlock *l,
 
 	HA_ATOMIC_OR(&st->waiters, tbit);
 
-	start_time = now_mono_time();
+	start_time = -now_mono_time();
 	__SPIN_LOCK(&l->lock);
-	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_write, (now_mono_time() - start_time));
+	start_time += now_mono_time();
+	HA_ATOMIC_ADD(&lock_stats_sk[lbl].nsec_wait, start_time);
 
-	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_sk[lbl].buckets[bucket]);
 
 
 	st->owner                  = tbit;
@@ -954,6 +1091,8 @@ int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
 {
 	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
 	struct ha_spinlock_state *st = &l->info.st[tgid-1];
+	uint64_t start_time;
+	uint bucket;
 	int r;
 
 	if (unlikely(st->owner & tbit)) {
@@ -962,10 +1101,18 @@ int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
 	}
 
 	/* try read should never wait */
+	start_time = -now_mono_time();
 	r = __SPIN_TRYLOCK(&l->lock);
+	start_time += now_mono_time();
+
 	if (unlikely(r))
 		return r;
-	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
+
+	HA_ATOMIC_ADD(&lock_stats_sk[lbl].nsec_wait, start_time);
+
+	start_time &= 0x3fffffff; // keep values below 1 billion only
+	bucket = flsnz((uint32_t)start_time ? (uint32_t)start_time : 1) - 1;
+	HA_ATOMIC_INC(&lock_stats_sk[lbl].buckets[bucket]);
 
 	st->owner                      = tbit;
 	l->info.last_location.function = func;
@@ -992,10 +1139,10 @@ void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
 	l->info.last_location.line     = line;
 
 	__SPIN_UNLOCK(&l->lock);
-	HA_ATOMIC_INC(&lock_stats[lbl].num_write_unlocked);
+	HA_ATOMIC_INC(&lock_stats_sk[lbl].num_unlocked);
 }
 
-#endif // defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+#endif // (DEBUG_THREAD > 1) || defined(DEBUG_FULL)
 
 
 #if defined(USE_PTHREAD_EMULATION)
@@ -1066,6 +1213,7 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
 }
 #endif // defined(USE_PTHREAD_EMULATION)
 
+#ifndef __APPLE__
 /* Depending on the platform and how libpthread was built, pthread_exit() may
  * involve some code in libgcc_s that would be loaded on exit for the first
  * time, causing aborts if the process is chrooted. It's harmless bit very
@@ -1086,12 +1234,15 @@ static inline void preload_libgcc_s(void)
 	if (pthread_create(&dummy_thread, NULL, dummy_thread_function, NULL) == 0)
 		pthread_join(dummy_thread, NULL);
 }
+#endif
 
 static void __thread_init(void)
 {
 	char *ptr = NULL;
 
+#ifndef __APPLE__
 	preload_libgcc_s();
+#endif
 
 	thread_cpus_enabled_at_boot = thread_cpus_enabled();
 	thread_cpus_enabled_at_boot = MIN(thread_cpus_enabled_at_boot, MAX_THREADS);
@@ -1099,10 +1250,6 @@ static void __thread_init(void)
 	memprintf(&ptr, "Built with multi-threading support (MAX_TGROUPS=%d, MAX_THREADS=%d, default=%d).",
 		  MAX_TGROUPS, MAX_THREADS, thread_cpus_enabled_at_boot);
 	hap_register_build_opts(ptr, 1);
-
-#if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
-	memset(lock_stats, 0, sizeof(lock_stats));
-#endif
 }
 INITCALL0(STG_PREPARE, __thread_init);
 
@@ -1332,6 +1479,16 @@ int thread_map_to_groups()
 #ifdef USE_THREAD
 	all_tgroups_mask = m;
 #endif
+
+#if defined(USE_THREAD) && defined(USE_CPU_AFFINITY)
+	if (global.tune.debug & GDBG_CPU_AFFINITY) {
+		cpu_reorder_by_index(ha_cpu_topo, cpu_topo_maxcpus);
+		cpu_topo_debug(ha_cpu_topo);
+		chunk_reset(&trash);
+		cpu_topo_dump_summary(ha_cpu_topo, &trash);
+		printf("%s\n", trash.area);
+	}
+#endif
 	return 0;
 }
 
@@ -1437,6 +1594,139 @@ int thread_resolve_group_mask(struct thread_set *ts, int defgrp, char **err)
 	*ts = new_ts;
 	return 0;
 }
+
+/* Tries to guess the best thread group count and thread count depending on
+ * (possibly) existing values, presence or not of cpu-map, of a forced
+ * taskset, etc.
+ */
+void thread_detect_count(void)
+{
+	int thr_max;
+	int thr_min __maybe_unused;
+	int grp_min __maybe_unused;
+	int grp_max __maybe_unused;
+	int cpus_avail __maybe_unused;
+	int cpu __maybe_unused;
+	char *err __maybe_unused;
+
+	thr_min = 1; thr_max = MAX_THREADS;
+	grp_min = 1; grp_max = MAX_TGROUPS;
+
+	if (global.thread_limit && global.nbthread > global.thread_limit) {
+		ha_warning("nbthread forced to a higher value (%d) than the configured thread-hard-limit (%d), enforcing the limit. "
+			   "Please fix either value to remove this warning.\n",
+			   global.nbthread, global.thread_limit);
+		global.nbthread = global.thread_limit;
+	}
+
+	/* config forces both values */
+	if (global.nbthread)
+		thr_min = thr_max = global.nbthread;
+
+	if (global.nbtgroups)
+		grp_min = grp_max = global.nbtgroups;
+
+#if defined(USE_THREAD)
+	/* Adjust to boot settings if not forced */
+	if (thr_min <= thread_cpus_enabled_at_boot && thread_cpus_enabled_at_boot < thr_max)
+		thr_max = thread_cpus_enabled_at_boot;
+#endif
+
+	if (global.thread_limit && thr_max > global.thread_limit)
+		thr_max = global.thread_limit;
+
+#if defined(USE_THREAD) && defined(USE_CPU_AFFINITY)
+	/* consider the number of online CPUs as an upper limit if set */
+	cpus_avail = 0;
+	for (cpu = 0; cpu <= cpu_topo_lastcpu; cpu++)
+		if (!(ha_cpu_topo[cpu].st & HA_CPU_F_OFFLINE))
+			cpus_avail++;
+
+	if (thr_min <= cpus_avail && cpus_avail < thr_max)
+		thr_max = cpus_avail;
+
+	/* make sure values are consistent */
+	if (thr_min < grp_min && thr_max >= grp_min)
+		thr_min = grp_min;
+
+	if (thr_min <= MAX_THREADS_PER_GROUP * grp_max &&
+	    thr_max > MAX_THREADS_PER_GROUP * grp_max)
+		thr_max = MAX_THREADS_PER_GROUP * grp_max;
+
+	if (grp_min < (thr_min +  MAX_THREADS_PER_GROUP - 1) / MAX_THREADS_PER_GROUP &&
+	    grp_max >= (thr_min +  MAX_THREADS_PER_GROUP - 1) / MAX_THREADS_PER_GROUP)
+		grp_min = (thr_min +  MAX_THREADS_PER_GROUP - 1) / MAX_THREADS_PER_GROUP;
+
+	if (grp_max > thr_max && grp_min <= thr_max)
+		grp_max = thr_max;
+
+	if (grp_min < grp_max && cpu_map_configured()) {
+		/* if a cpu-map directive is set, we cannot reliably infer what
+		 * CPUs will be used anymore, so we'll use the smallest permitted
+		 * number of groups.
+		 */
+		grp_max = grp_min;
+	}
+
+	/* now, if the thr_min < thr_max this means that we're supposed to
+	 * figure the best set of CPUs to use. E.g. use a single cluster on
+	 * a complex set. Thus we can try to select the best clusters in
+	 * capacity order until we reach at least thr_min, then continue
+	 * on the same cluster _capacity_ up to thr_max.
+	 */
+
+	if (cpu_apply_policy(thr_min, thr_max, grp_min, grp_max, &err) < 0) {
+		if (err)
+			ha_warning("cpu-policy: %s\n", err);
+		ha_free(&err);
+		return;
+	}
+
+	if (!ha_cpuset_count(&cpu_map[0].thread[0])) {
+		/* thread 1 is not mapped, no policy was applied, so we have to
+		 * count the threads ourselves.
+		 */
+		struct hap_cpuset node_cpu_set;
+		int thr, cpu, grp, cpu_count;
+
+		ha_cpuset_zero(&node_cpu_set);
+
+		for (cpu = cpu_count = 0; cpu <= cpu_topo_lastcpu; cpu++) {
+			if (ha_cpu_topo[cpu].st & HA_CPU_F_EXCL_MASK)
+				continue;
+
+			ha_cpuset_set(&node_cpu_set, ha_cpu_topo[cpu].idx);
+			cpu_count++;
+		}
+
+		/* assign all threads of all thread groups to this node */
+		for (grp = 0; grp < MAX_TGROUPS; grp++)
+			for (thr = 0; thr < MAX_THREADS_PER_GROUP; thr++)
+				ha_cpuset_assign(&cpu_map[grp].thread[thr], &node_cpu_set);
+
+		/* if the number of CPUs is within the allowed thread range,
+		 * automatically set the max thread count to the number of CPUs
+		 * as this will be used as the final number of threads.
+		 */
+		if (thr_min <= cpu_count && cpu_count <= thr_max)
+			thr_max = cpu_count;
+	}
+#endif // USE_THREAD && USE_CPU_AFFINITY
+
+	if (!global.nbthread)
+		global.nbthread = thr_max;
+
+	if (!global.nbtgroups)
+		global.nbtgroups = 1;
+
+	if (global.nbthread > MAX_THREADS_PER_GROUP * global.nbtgroups) {
+		ha_diag_warning("nbthread too large or not set, found %d CPUs, limiting to %d threads (maximum is %d per thread group and %d groups). Please set nbthreads and/or increase thread-groups in the global section to silence this warning.\n",
+				global.nbthread, MAX_THREADS_PER_GROUP * global.nbtgroups, MAX_THREADS_PER_GROUP, MAX_TGROUPS);
+		global.nbthread = MAX_THREADS_PER_GROUP * global.nbtgroups;
+	}
+	return;
+}
+
 
 /* Parse a string representing a thread set in one of the following forms:
  *
@@ -1708,6 +1998,35 @@ static int cfg_parse_nbthread(char **args, int section_type, struct proxy *curpx
 	return 0;
 }
 
+/* Parse the "thread-hard-limit" global directive, which takes an integer
+ * argument that contains the desired maximum number of threads that will
+ * not be crossed.
+ */
+static int cfg_parse_thread_hard_limit(char **args, int section_type, struct proxy *curpx,
+                              const struct proxy *defpx, const char *file, int line,
+                              char **err)
+{
+	long nbthread;
+	char *errptr;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	nbthread = strtol(args[1], &errptr, 10);
+	if (!*args[1] || *errptr) {
+		memprintf(err, "'%s' passed a missing or unparsable integer value in '%s'", args[0], args[1]);
+		return -1;
+	}
+
+	if (nbthread < 1 || nbthread > MAX_THREADS) {
+		memprintf(err, "'%s' value must be at least 1 (was %ld)", args[0], nbthread);
+		return -1;
+	}
+
+	global.thread_limit = nbthread;
+	return 0;
+}
+
 /* Parse the "thread-group" global directive, which takes an integer argument
  * that designates a thread group, and a list of threads to put into that group.
  */
@@ -1854,6 +2173,7 @@ static int cfg_parse_thread_groups(char **args, int section_type, struct proxy *
 
 /* config keyword parsers */
 static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "thread-hard-limit", cfg_parse_thread_hard_limit, 0 },
 	{ CFG_GLOBAL, "nbthread",       cfg_parse_nbthread, 0 },
 	{ CFG_GLOBAL, "thread-group",   cfg_parse_thread_group, 0 },
 	{ CFG_GLOBAL, "thread-groups",  cfg_parse_thread_groups, 0 },

@@ -1,5 +1,4 @@
 varnishtest "Test the strict rewriting mode"
-#REQUIRE_VERSION=2.2
 
 # This config tests the strict-mode of HTTP rules.
 
@@ -63,6 +62,10 @@ server s2 {
 
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         tune.bufsize 2048
         tune.maxrewrite 128
 

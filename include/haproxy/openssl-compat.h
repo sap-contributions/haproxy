@@ -46,7 +46,40 @@
 
 #ifdef USE_QUIC_OPENSSL_COMPAT
 #include <haproxy/quic_openssl_compat.h>
+#else
+#define HAVE_OPENSSL_QUIC_CLIENT_SUPPORT
+#if defined(OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND)
+/* This macro is defined by the new OpenSSL 3.5.0 QUIC TLS API and it is not
+ * defined by quictls.
+ */
+
+#if defined(USE_QUIC) && (OPENSSL_VERSION_NUMBER < 0x30500010L)
+#error "OpenSSL 3.5 QUIC API should only be used with OpenSSL 3.5.1 version and newer"
 #endif
+
+#define HAVE_OPENSSL_QUIC
+#define SSL_set_quic_transport_params   SSL_set_quic_tls_transport_params
+#define SSL_set_quic_early_data_enabled SSL_set_quic_tls_early_data_enabled
+#define SSL_quic_read_level(arg) -1
+
+enum ssl_encryption_level_t {
+	ssl_encryption_initial = 0,
+	ssl_encryption_early_data,
+	ssl_encryption_handshake,
+	ssl_encryption_application
+};
+
+#else
+/* QUIC TLS API */
+#define HAVE_OPENSSL_QUICTLS
+#endif
+#endif /* USE_QUIC_OPENSSL_COMPAT */
+
+#if defined(OPENSSL_IS_AWSLC)
+#define OPENSSL_NO_DH
+#define SSL_CTX_set1_sigalgs_list SSL_CTX_set1_sigalgs_list
+#endif
+
 
 #if defined(LIBRESSL_VERSION_NUMBER)
 /* LibreSSL is a fork of OpenSSL 1.0.1g but pretends to be 2.0.0, thus
@@ -69,7 +102,7 @@
 #define HAVE_SSL_EXTRACT_RANDOM
 #endif
 
-#if ((OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER))
+#if ((OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(OPENSSL_IS_BORINGSSL) && !defined(OPENSSL_IS_AWSLC) && !defined(LIBRESSL_VERSION_NUMBER))
 #define HAVE_SSL_RAND_KEEP_RANDOM_DEVICES_OPEN
 #endif
 
@@ -78,7 +111,7 @@
 #define HAVE_ASN1_TIME_TO_TM
 #endif
 
-#if (defined(SSL_CLIENT_HELLO_CB) || defined(OPENSSL_IS_BORINGSSL))
+#if (defined(SSL_CLIENT_HELLO_CB) || defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC))
 #define HAVE_SSL_CLIENT_HELLO_CB
 #endif
 
@@ -90,16 +123,21 @@
 #define HAVE_SSL_CTX_get0_privatekey
 #endif
 
-#if HA_OPENSSL_VERSION_NUMBER >= 0x1000104fL || defined(USE_OPENSSL_WOLFSSL) || defined(USE_OPENSSL_AWSLC)
+#if HA_OPENSSL_VERSION_NUMBER >= 0x1000104fL || defined(USE_OPENSSL_WOLFSSL) || defined(OPENSSL_IS_AWSLC)
 /* CRYPTO_memcmp() is present since openssl 1.0.1d */
 #define HAVE_CRYPTO_memcmp
+#endif
+
+#if !defined(USE_OPENSSL_WOLFSSL) && !defined(OPENSSL_IS_AWSLC) && !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+/* Defined if our SSL lib is really OpenSSL */
+#define HAVE_VANILLA_OPENSSL
 #endif
 
 #if (defined(SN_ct_cert_scts) && !defined(OPENSSL_NO_TLSEXT))
 #define HAVE_SSL_SCTL
 #endif
 
-#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) || defined(USE_OPENSSL_AWSLC) || (defined(USE_OPENSSL_WOLFSSL) && defined(HAVE_SECRET_CALLBACK))
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) || defined(OPENSSL_IS_AWSLC) || (defined(USE_OPENSSL_WOLFSSL) && defined(HAVE_SECRET_CALLBACK))
 #define HAVE_SSL_KEYLOG
 #endif
 
@@ -108,6 +146,32 @@
 #define HAVE_SSL_get0_verified_chain
 #endif
 
+#if defined(SSL_OP_NO_ANTI_REPLAY) || defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+#define HAVE_SSL_0RTT
+#endif
+
+/* At this time, wolfssl, libressl and the openssl QUIC compatibility do not support 0-RTT */
+#if defined(HAVE_SSL_0RTT) && !defined(USE_QUIC_OPENSSL_COMPAT) && !defined(LIBRESSL_VERSION_NUMBER) && !defined(USE_OPENSSL_WOLFSSL)
+#define HAVE_SSL_0RTT_QUIC
+#endif
+
+
+#if (defined(SSL_CTX_set_security_level) || HA_OPENSSL_VERSION_NUMBER >= 0x1010100fL) && !defined(OPENSSL_IS_AWSLC)
+#define HAVE_SSL_SET_SECURITY_LEVEL
+#endif
+
+#if ((defined(LIBRESSL_VERSION_NUMBER) && (LIBRESSL_VERSION_NUMBER >= 0x3030600L)) || (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) || defined(OPENSSL_IS_AWSLC)) && !defined(USE_OPENSSL_WOLFSSL)
+#define HAVE_JWS
+#endif
+
+#if (defined(HAVE_JWS) && defined(HAVE_ASN1_TIME_TO_TM))
+#define HAVE_ACME
+#endif
+
+#if !defined(HAVE_SSL_SET_SECURITY_LEVEL)
+/* define a nope function for set_security_level */
+#define SSL_CTX_set_security_level(ctx, level) ({})
+#endif
 
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
 #define HAVE_OSSL_PARAM
@@ -123,6 +187,12 @@
 #define HASSL_DH DH
 #define HASSL_DH_free DH_free
 #define HASSL_DH_up_ref DH_up_ref
+#endif
+
+#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB || AWSLC_API_VERSION >= 29) && (!defined(OPENSSL_NO_OCSP)))
+#define HAVE_SSL_OCSP
+#else
+typedef void OCSP_CERTID;
 #endif
 
 #if ((HA_OPENSSL_VERSION_NUMBER < 0x1000000fL) && !defined(X509_get_X509_PUBKEY))
@@ -162,19 +232,6 @@ static inline STACK_OF(X509) *X509_chain_up_ref(STACK_OF(X509) *chain)
 
 #endif
 
-#ifdef OPENSSL_IS_BORINGSSL
-/*
- * Functions missing in BoringSSL
- */
-
-static inline X509_CRL *X509_OBJECT_get0_X509_CRL(const X509_OBJECT *a)
-{
-    if (a == NULL || a->type != X509_LU_CRL) {
-        return NULL;
-    }
-    return a->data.crl;
-}
-#endif
 
 #if (HA_OPENSSL_VERSION_NUMBER < 0x1010000fL) && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070000fL)
 /*
@@ -372,6 +429,10 @@ static inline unsigned long ERR_peek_error_func(const char **func)
 #define EVP_CTRL_AEAD_SET_TAG   EVP_CTRL_GCM_SET_TAG
 #endif
 
+#if !defined(EVP_CTRL_AEAD_GET_TAG)
+#define EVP_CTRL_AEAD_GET_TAG EVP_CTRL_GCM_GET_TAG
+#endif
+
 /* Supported hash function for TLS tickets */
 #ifdef OPENSSL_NO_SHA256
 #define TLS_TICKET_HASH_FUNCT EVP_sha1
@@ -383,8 +444,12 @@ static inline unsigned long ERR_peek_error_func(const char **func)
 #define SSL_OP_CIPHER_SERVER_PREFERENCE 0
 #endif
 
-#ifndef SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION   /* needs OpenSSL >= 0.9.7 */
+/* needs OpenSSL >= 0.9.7 and renegotiation options on WolfSSL */
+#if !defined(SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION) || \
+	 (defined(USE_OPENSSL_WOLFSSL) && !defined(HAVE_SECURE_RENEGOTIATION) && !defined(HAVE_SERVER_RENEGOTIATION_INFO))
+#undef  SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION
 #define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION 0
+#undef  SSL_renegotiate_pending
 #define SSL_renegotiate_pending(arg) 0
 #endif
 
@@ -483,5 +548,41 @@ static inline unsigned long ERR_peek_error_func(const char **func)
 #define SSL_CTX_set1_sigalgs_list SSL_CTX_set1_sigalgs_list
 #endif
 
+#ifndef SSL_CTX_get_tlsext_status_cb
+# define SSL_CTX_get_tlsext_status_cb(ctx, cb) \
+	*(cb) = (void (*) (void))ctx->tlsext_status_cb
+#endif
+
 #endif /* USE_OPENSSL */
+
+#ifdef USE_KTLS
+
+#ifdef __linux__
+#include <linux/tls.h>
+#endif
+
+#if defined(HAVE_VANILLA_OPENSSL) && (OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+#define HA_USE_KTLS
+/*
+ * Only provided by internal/bio.h, but we need it
+ */
+#ifndef BIO_CTRL_SET_KTLS
+#define BIO_CTRL_SET_KTLS	72
+#endif
+#ifndef BIO_CTRL_SET_KTLS_TX_SEND_CTRL_MSG
+#define BIO_CTRL_SET_KTLS_TX_SEND_CTRL_MSG 74
+#endif
+#ifndef BIO_CTRL_CLEAR_KTLS_TX_CTRL_MSG
+#define BIO_CTRL_CLEAR_KTLS_TX_CTRL_MSG 75
+#endif
+
+#endif /* HAVE_VANILLA_OPENSSL && OPENSSL_VERSION_NUMBER >= 0x3000000fL */
+
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+#include <openssl/hkdf.h>
+#define HA_USE_KTLS
+#endif /* OPENSSL_IS_BORINGSSL || OPENSSL_IS_AWSLC */
+
+#endif /* USE_KTLS */
+
 #endif /* _HAPROXY_OPENSSL_COMPAT_H */

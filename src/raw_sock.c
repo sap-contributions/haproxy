@@ -72,12 +72,16 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 	 */
 	if (unlikely(!(fdtab[conn->handle.fd].state & FD_POLL_IN))) {
 		/* stop here if we reached the end of data */
-		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP)
+		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_hup);
 			goto out_read0;
+		}
 
 		/* report error on POLL_ERR before connection establishment */
 		if ((fdtab[conn->handle.fd].state & FD_POLL_ERR) && (conn->flags & CO_FL_WAIT_L4_CONN)) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errcode(conn, CO_ER_POLLERR);
 			errno = 0; /* let the caller do a getsockopt() if it wants it */
 			goto leave;
 		}
@@ -91,8 +95,10 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 			     SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 
 		if (ret <= 0) {
-			if (ret == 0)
+			if (ret == 0) {
+				conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_shutr);
 				goto out_read0;
+			}
 
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				/* there are two reasons for EAGAIN :
@@ -117,8 +123,20 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 				/* splice not supported on this end, disable it.
 				 * We can safely return -1 since there is no
 				 * chance that any data has been piped yet.
+				 * EINVAL, however, is a bit special.
+				 * If we're trying to splice from a KTLS
+				 * socket, the kernel may return EINVAL
+				 * to signal that the current TLS record
+				 * is not application data, and that we
+				 * have to call recvmsg() to get it.
+				 * This is not really an error, and doesn't
+				 * mean we won't be able to splice later.
+				 * Choosing EINVAL there is a bit unfortunate,
+				 * because it can mean many things, but we
+				 * should not get it for any other reason.
 				 */
-				retval = -1;
+				if (errno != EINVAL)
+					retval = -1;
 				goto leave;
 			}
 			else if (errno == EINTR) {
@@ -126,7 +144,11 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 				continue;
 			}
 			/* here we have another error */
-			conn->flags |= CO_FL_ERROR;
+			if (errno != EINVAL) {
+				conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_rcv_err);
+				conn->flags |= CO_FL_ERROR;
+				conn_set_errno(conn, errno);
+			}
 			break;
 		} /* ret <= 0 */
 
@@ -160,7 +182,7 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 
 /* Send as many bytes as possible from the pipe to the connection's socket.
  */
-int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe)
+int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count)
 {
 	int ret, done;
 
@@ -176,12 +198,16 @@ int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pip
 		/* it's already closed */
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH;
 		errno = EPIPE;
+		conn_set_errno(conn, errno);
 		return 0;
 	}
 
+	if (unlikely(count > pipe->data))
+		count = pipe->data;
+
 	done = 0;
-	while (pipe->data) {
-		ret = splice(pipe->cons, NULL, conn->handle.fd, NULL, pipe->data,
+	while (count) {
+		ret = splice(pipe->cons, NULL, conn->handle.fd, NULL, count,
 			     SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 
 		if (ret <= 0) {
@@ -193,11 +219,14 @@ int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pip
 				continue;
 
 			/* here we have another error */
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_snd_err);
 			conn->flags |= CO_FL_ERROR;
+			conn_set_errno(conn, errno);
 			break;
 		}
 
 		done += ret;
+		count -= ret;
 		pipe->data -= ret;
 	}
 	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && done) {
@@ -220,7 +249,7 @@ int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pip
  * errno is cleared before starting so that the caller knows that if it spots an
  * error without errno, it's pending and can be retrieved via getsockopt(SO_ERROR).
  */
-static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags)
+static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, void *msg_control, size_t *msg_controllen, int flags)
 {
 	ssize_t ret;
 	size_t try, done = 0;
@@ -238,12 +267,16 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 
 	if (unlikely(!(fdtab[conn->handle.fd].state & FD_POLL_IN))) {
 		/* stop here if we reached the end of data */
-		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP)
+		if ((fdtab[conn->handle.fd].state & (FD_POLL_ERR|FD_POLL_HUP)) == FD_POLL_HUP) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_hup);
 			goto read0;
+		}
 
 		/* report error on POLL_ERR before connection establishment */
 		if ((fdtab[conn->handle.fd].state & FD_POLL_ERR) && (conn->flags & CO_FL_WAIT_L4_CONN)) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_connect_poll_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errcode(conn, CO_ER_POLLERR);
 			goto leave;
 		}
 	}
@@ -254,6 +287,9 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	 * EINTR too.
 	 */
 	while (count > 0) {
+		struct msghdr msg;
+		struct iovec iov;
+
 		try = b_contig_space(buf);
 		if (!try)
 			break;
@@ -261,7 +297,17 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 		if (try > count)
 			try = count;
 
-		ret = recv(conn->handle.fd, b_tail(buf), try, 0);
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_control = msg_control;
+		if (msg_controllen)
+			msg.msg_controllen = *msg_controllen;
+		iov.iov_base = b_tail(buf);
+		iov.iov_len = try;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		ret = recvmsg(conn->handle.fd, &msg, 0);
+		if (ret > 0 && msg_controllen != NULL)
+			*msg_controllen = msg.msg_controllen;
 
 		if (ret > 0) {
 			b_add(buf, ret);
@@ -279,8 +325,10 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 				 * to read an unlikely close from the client since we'll
 				 * close first anyway.
 				 */
-				if (fdtab[conn->handle.fd].state & FD_POLL_HUP)
+				if (fdtab[conn->handle.fd].state & FD_POLL_HUP) {
+					conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_hup);
 					goto read0;
+				}
 
 				if (!(fdtab[conn->handle.fd].state & FD_LINGER_RISK) ||
 				    (cur_poller.flags & HAP_POLL_F_RDHUP)) {
@@ -293,6 +341,7 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 				break;
 		}
 		else if (ret == 0) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_shutr);
 			goto read0;
 		}
 		else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN) {
@@ -301,7 +350,9 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 			break;
 		}
 		else if (errno != EINTR) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_rcv_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errno(conn, errno);
 			break;
 		}
 	}
@@ -323,8 +374,11 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	 * of recv()'s return value 0, so we have no way to tell there was
 	 * an error without checking.
 	 */
-	if (unlikely(!done && fdtab[conn->handle.fd].state & FD_POLL_ERR))
+	if (unlikely(!done && fdtab[conn->handle.fd].state & FD_POLL_ERR)) {
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_err);
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+		conn_set_errcode(conn, CO_ER_POLLERR);
+	}
 	goto leave;
 }
 
@@ -340,7 +394,7 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
  * is responsible for this. It's up to the caller to update the buffer's contents
  * based on the return value.
  */
-static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags)
+static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, void *msg_control, size_t msg_controllen, int flags)
 {
 	ssize_t ret;
 	size_t try, done;
@@ -356,15 +410,19 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 
 	if (unlikely(fdtab[conn->handle.fd].state & FD_POLL_ERR)) {
 		/* an error was reported on the FD, we can't send anymore */
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_poll_err);
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_WR_SH | CO_FL_SOCK_RD_SH;
+		conn_set_errcode(conn, CO_ER_POLLERR);
 		errno = EPIPE;
 		return 0;
 	}
 
 	if (conn->flags & CO_FL_SOCK_WR_SH) {
 		/* it's already closed */
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_snd_err);
 		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH;
 		errno = EPIPE;
+		conn_set_errno(conn, errno);
 		return 0;
 	}
 
@@ -374,15 +432,23 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 	 * in which case we accept to do it once again.
 	 */
 	while (count) {
+		struct msghdr msg;
+		struct iovec iov;
 		try = b_contig_data(buf, done);
 		if (try > count)
 			try = count;
 
 		send_flag = MSG_DONTWAIT | MSG_NOSIGNAL;
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_control = msg_control;
+		msg.msg_controllen = msg_controllen;
+		iov.iov_base = b_peek(buf, done);
+		iov.iov_len = try;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
 		if (try < count || flags & CO_SFL_MSG_MORE)
 			send_flag |= MSG_MORE;
-
-		ret = send(conn->handle.fd, b_peek(buf, done), try, send_flag);
+		ret = sendmsg(conn->handle.fd, &msg, send_flag);
 
 		if (ret > 0) {
 			count -= ret;
@@ -402,7 +468,9 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 			break;
 		}
 		else if (errno != EINTR) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_snd_err);
 			conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+			conn_set_errno(conn, errno);
 			break;
 		}
 	}
@@ -452,6 +520,19 @@ static int raw_sock_remove_xprt(struct connection *conn, void *xprt_ctx, void *t
 	return -1;
 }
 
+static int raw_sock_get_capability(struct connection *conn, void *xprt_ctx, enum xprt_capabilities cap, void *arg)
+{
+	int *ret;
+
+	switch (cap) {
+		case XPRT_CAN_SPLICE:
+			ret = arg;
+			*ret = XPRT_CONN_CAN_SPLICE;
+			return 0;
+	}
+	return -1;
+}
+
 /* transport-layer operations for RAW sockets */
 static struct xprt_ops raw_sock = {
 	.snd_buf  = raw_sock_from_buf,
@@ -463,6 +544,7 @@ static struct xprt_ops raw_sock = {
 	.rcv_pipe = raw_sock_to_pipe,
 	.snd_pipe = raw_sock_from_pipe,
 #endif
+	.get_capability = raw_sock_get_capability,
 	.shutr    = NULL,
 	.shutw    = NULL,
 	.close    = raw_sock_close,

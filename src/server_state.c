@@ -53,7 +53,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	int srv_check_state, srv_agent_state;
 	int bk_f_forced_id;
 	int srv_f_forced_id;
-	int fqdn_set_by_cli;
+	int fqdn_changed;
 	const char *fqdn;
 	const char *port_st;
 	unsigned int port_svc;
@@ -112,12 +112,12 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	p = NULL;
 	errno = 0;
 	srv_admin_state = strtol(params[2], &p, 10);
-	fqdn_set_by_cli = !!(srv_admin_state & SRV_ADMF_HMAINT);
+	fqdn_changed = !!(srv_admin_state & SRV_ADMF_FQDN_CHANGED);
 
 	/* inherited statuses will be recomputed later.
-	 * Also disable SRV_ADMF_HMAINT flag (set from stats socket fqdn).
+	 * Also disable SRV_ADMF_FQDN_CHANGED flag (set from stats socket fqdn).
 	 */
-	srv_admin_state &= ~SRV_ADMF_IDRAIN & ~SRV_ADMF_IMAINT & ~SRV_ADMF_HMAINT & ~SRV_ADMF_RMAINT;
+	srv_admin_state &= ~SRV_ADMF_IDRAIN & ~SRV_ADMF_IMAINT & ~SRV_ADMF_RMAINT & ~SRV_ADMF_FQDN_CHANGED;
 
 	if ((p == params[2]) || errno == EINVAL || errno == ERANGE ||
 	    (srv_admin_state != 0 &&
@@ -322,6 +322,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	}
 
 	srv->last_change = ns_to_sec(now_ns) - srv_last_time_change;
+	HA_ATOMIC_STORE(&srv->counters.shared.tg[0]->last_state_change, srv->last_change);
 	srv->check.status = srv_check_status;
 	srv->check.result = srv_check_result;
 
@@ -372,7 +373,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 			 * So we must reset the 'set from stats socket FQDN' flag to be consistent with
 			 * any further FQDN modification.
 			 */
-			srv->next_admin &= ~SRV_ADMF_HMAINT;
+			srv->next_admin &= ~SRV_ADMF_FQDN_CHANGED;
 		}
 		else {
 			/* If the FDQN has been changed from stats socket,
@@ -380,10 +381,10 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 			 * from stats socket).
 			 * Also ensure the runtime resolver will process this resolution.
 			 */
-			if (fqdn_set_by_cli) {
+			if (fqdn_changed) {
 				srv_set_fqdn(srv, fqdn, 0);
 				srv->flags &= ~SRV_F_NO_RESOLUTION;
-				srv->next_admin |= SRV_ADMF_HMAINT;
+				srv->next_admin |= SRV_ADMF_FQDN_CHANGED;
 			}
 		}
 	}
@@ -392,8 +393,6 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	 */
 	else if (fqdn && !srv->hostname && srvrecord) {
 		int res;
-		int i;
-		char *tmp;
 
 		/* we can't apply previous state if SRV record has changed */
 		if (!srv->srvrq) {
@@ -416,17 +415,13 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 		 * since this server has an hostname
 		 */
 		LIST_DEL_INIT(&srv->srv_rec_item);
-		srv->host_dn.key = tmp = strdup(srv->hostname_dn);
-
-		/* convert the key in lowercase because tree
-		 * lookup is case sensitive but we don't care
-		 */
-		for (i = 0; tmp[i]; i++)
-			tmp[i] = tolower(tmp[i]);
+		srv->host_dn.key = srv->hostname_dn;
 
 		/* insert in tree and set the srvrq expiration date */
 		ebis_insert(&srv->srvrq->named_servers, &srv->host_dn);
-		task_schedule(srv->srvrq_check, tick_add(now_ms, srv->srvrq->resolvers->hold.timeout));
+		task_schedule(srv->srvrq_check, tick_add(now_ms, srv->srvrq->resolvers->timeout.resolve +
+							 srv->srvrq->resolvers->resolve_retries *
+							 srv->srvrq->resolvers->timeout.retry));
 
 		/* Unset SRV_F_MAPPORTS for SRV records.
 		 * SRV_F_MAPPORTS is unfortunately set by parse_server()

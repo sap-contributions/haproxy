@@ -27,6 +27,8 @@
 
 #define MEM_F_SHARED	0x1
 #define MEM_F_EXACT	0x2
+#define MEM_F_UAF	0x4
+#define MEM_F_STATREG	0x8 /* static registration: do not free it! */
 
 /* A special pointer for the pool's free_list that indicates someone is
  * currently manipulating it. Serves as a short-lived lock.
@@ -51,6 +53,7 @@
 #define POOL_DBG_TAG        0x00000080  // place a tag at the end of the area
 #define POOL_DBG_POISON     0x00000100  // poison memory area on pool_alloc()
 #define POOL_DBG_UAF        0x00000200  // enable use-after-free protection
+#define POOL_DBG_BACKUP     0x00000400  // backup the object contents on free()
 
 
 /* This is the head of a thread-local cache */
@@ -61,6 +64,20 @@ struct pool_cache_head {
 	struct pool_head *pool; /* assigned pool, for debugging only */
 	ulong fill_pattern;  /* pattern used to fill the area on free */
 } THREAD_ALIGNED(64);
+
+/* This describes a pool registration, which is what was passed to
+ * create_pool() and that might have been merged with an existing pool.
+ */
+struct pool_registration {
+	struct list list;    /* link element */
+	const char *name;    /* name of the pool */
+	const char *file;    /* where the pool is declared */
+	unsigned int line;   /* line in the file where the pool is declared, 0 if none */
+	unsigned int size;   /* expected object size */
+	unsigned int flags;  /* MEM_F_* */
+	unsigned int type_align;  /* type-imposed alignment; 0=unspecified */
+	unsigned int align;  /* expected alignment; 0=unspecified */
+};
 
 /* This represents one item stored in the thread-local cache. <by_pool> links
  * the object to the list of objects in the pool, and <by_lru> links the object
@@ -112,11 +129,14 @@ struct pool_head {
 	unsigned int minavail;	/* how many chunks are expected to be used */
 	unsigned int size;	/* chunk size */
 	unsigned int flags;	/* MEM_F_* */
+	unsigned int align;     /* alignment size */
 	unsigned int users;	/* number of pools sharing this zone */
 	unsigned int alloc_sz;	/* allocated size (includes hidden fields) */
+	unsigned int sum_size;	/* sum of all registered users' size */
 	struct list list;	/* list of all known pools */
 	void *base_addr;        /* allocation address, for free() */
 	char name[12];		/* name of the pool */
+	struct list regs;       /* registrations: alt names for this pool */
 
 	/* heavily read-write part */
 	THREAD_ALIGN(64);

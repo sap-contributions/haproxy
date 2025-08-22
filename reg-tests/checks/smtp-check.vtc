@@ -1,5 +1,4 @@
 varnishtest "Health-checks: SMTP health-check"
-#REQUIRE_VERSION=2.2
 #REGTEST_TYPE=slow
 feature ignore_unknown_macro
 
@@ -65,6 +64,11 @@ syslog S5 -level notice {
 
 
 haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         mode tcp
         timeout client "${HAPROXY_TEST_TIMEOUT-5s}"

@@ -12,8 +12,9 @@
 
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
-#include <haproxy/pipe-t.h>
+#include <haproxy/pipe.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
@@ -22,10 +23,11 @@
 struct mux_pt_ctx {
 	struct sedesc *sd;
 	struct connection *conn;
+	uint32_t term_evts_log;
 	struct wait_event wait_event;
 };
 
-DECLARE_STATIC_POOL(pool_head_pt_ctx, "mux_pt", sizeof(struct mux_pt_ctx));
+DECLARE_STATIC_TYPED_POOL(pool_head_pt_ctx, "mux_pt", struct mux_pt_ctx);
 
 /* trace source and events */
 static void pt_trace(enum trace_level level, uint64_t mask,
@@ -199,6 +201,16 @@ static void pt_trace(enum trace_level level, uint64_t mask, const struct trace_s
 	}
 }
 
+static inline void mux_pt_report_term_evt(struct mux_pt_ctx *ctx, enum muxc_term_event_type type)
+{
+	struct connection *conn = ctx->conn;
+	enum term_event_loc loc = tevt_loc_muxc;
+
+	if (conn_is_back(conn))
+		loc += 8;
+	ctx->term_evts_log = tevt_report_event(ctx->term_evts_log, loc, type);
+}
+
 static void mux_pt_destroy(struct mux_pt_ctx *ctx)
 {
 	struct connection *conn = NULL;
@@ -297,6 +309,7 @@ static int mux_pt_init(struct connection *conn, struct proxy *prx, struct sessio
 	ctx->wait_event.tasklet->process = mux_pt_io_cb;
 	ctx->wait_event.events = 0;
 	ctx->conn = conn;
+	ctx->term_evts_log = 0;
 
 	if (!sc) {
 		ctx->sd = sedesc_new();
@@ -322,8 +335,8 @@ static int mux_pt_init(struct connection *conn, struct proxy *prx, struct sessio
 	}
 	conn->ctx = ctx;
 	se_fl_set(ctx->sd, SE_FL_RCV_MORE);
-	if (global.tune.options & GTUNE_USE_SPLICE)
-		se_fl_set(ctx->sd, SE_FL_MAY_SPLICE);
+	if ((global.tune.options & GTUNE_USE_SPLICE) && !(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_PT))
+		se_fl_set(ctx->sd, SE_FL_MAY_FASTFWD_PROD|SE_FL_MAY_FASTFWD_CONS);
 
 	TRACE_LEAVE(PT_EV_CONN_NEW, conn);
 	return 0;
@@ -389,6 +402,8 @@ static int mux_pt_attach(struct connection *conn, struct sedesc *sd, struct sess
 		return -1;
 	ctx->sd = sd;
 	se_fl_set(ctx->sd, SE_FL_RCV_MORE);
+	if ((global.tune.options & GTUNE_USE_SPLICE) && !(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_PT))
+		se_fl_set(ctx->sd, SE_FL_MAY_FASTFWD_PROD|SE_FL_MAY_FASTFWD_CONS);
 
 	TRACE_LEAVE(PT_EV_STRM_NEW, conn, sd->sc);
 	return 0;
@@ -458,39 +473,28 @@ static int mux_pt_avail_streams(struct connection *conn)
 	return 1 - mux_pt_used_streams(conn);
 }
 
-static void mux_pt_shutr(struct stconn *sc, enum co_shr_mode mode)
+static void mux_pt_shut(struct stconn *sc, unsigned int mode, struct se_abort_info *reason)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
 
 	TRACE_ENTER(PT_EV_STRM_SHUT, conn, sc);
+	if (mode & (SE_SHW_SILENT|SE_SHW_NORMAL)) {
+		mux_pt_report_term_evt(ctx, muxc_tevt_type_shutw);
 
-	se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
-	if (conn_xprt_ready(conn) && conn->xprt->shutr)
-		conn->xprt->shutr(conn, conn->xprt_ctx,
-		    (mode == CO_SHR_DRAIN));
-	else if (mode == CO_SHR_DRAIN)
-		conn_ctrl_drain(conn);
-	if (se_fl_test(ctx->sd, SE_FL_SHW))
-		conn_full_close(conn);
+		if (conn_xprt_ready(conn) && conn->xprt->shutw)
+			conn->xprt->shutw(conn, conn->xprt_ctx, (mode & SE_SHW_NORMAL));
+		if (!(conn->flags & CO_FL_SOCK_WR_SH))
+			conn_sock_shutw(conn, (mode & SE_SHW_NORMAL));
+	}
 
-	TRACE_LEAVE(PT_EV_STRM_SHUT, conn, sc);
-}
-
-static void mux_pt_shutw(struct stconn *sc, enum co_shw_mode mode)
-{
-	struct connection *conn = __sc_conn(sc);
-	struct mux_pt_ctx *ctx = conn->ctx;
-
-	TRACE_ENTER(PT_EV_STRM_SHUT, conn, sc);
-
-	if (conn_xprt_ready(conn) && conn->xprt->shutw)
-		conn->xprt->shutw(conn, conn->xprt_ctx,
-		    (mode == CO_SHW_NORMAL));
-	if (!se_fl_test(ctx->sd, SE_FL_SHR))
-		conn_sock_shutw(conn, (mode == CO_SHW_NORMAL));
-	else
-		conn_full_close(conn);
+	if (mode & (SE_SHR_RESET|SE_SHR_DRAIN)) {
+		se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+		if (conn_xprt_ready(conn) && conn->xprt->shutr)
+			conn->xprt->shutr(conn, conn->xprt_ctx, (mode & SE_SHR_DRAIN));
+		else if (mode & SE_SHR_DRAIN)
+			conn_ctrl_drain(conn);
+	}
 
 	TRACE_LEAVE(PT_EV_STRM_SHUT, conn, sc);
 }
@@ -521,8 +525,9 @@ static size_t mux_pt_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count
 		goto end;
 	}
 	b_realign_if_empty(buf);
-	ret = conn->xprt->rcv_buf(conn, conn->xprt_ctx, buf, count, flags);
+	ret = conn->xprt->rcv_buf(conn, conn->xprt_ctx, buf, count, NULL, NULL, flags);
 	if (conn->flags & CO_FL_ERROR) {
+		mux_pt_report_term_evt(ctx, muxc_tevt_type_rcv_err);
 		se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 		if (conn_xprt_read0_pending(conn))
 			se_fl_set(ctx->sd, SE_FL_EOS);
@@ -530,6 +535,7 @@ static size_t mux_pt_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count
 		TRACE_DEVEL("error on connection", PT_EV_RX_DATA|PT_EV_CONN_ERR, conn, sc);
 	}
 	else if (conn_xprt_read0_pending(conn)) {
+		mux_pt_report_term_evt(ctx, muxc_tevt_type_shutr);
 		se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 		se_fl_set(ctx->sd, (SE_FL_EOI|SE_FL_EOS));
 		TRACE_DEVEL("read0 on connection", PT_EV_RX_DATA, conn, sc);
@@ -548,12 +554,13 @@ static size_t mux_pt_snd_buf(struct stconn *sc, struct buffer *buf, size_t count
 
 	TRACE_ENTER(PT_EV_TX_DATA, conn, sc, buf, (size_t[]){count});
 
-	ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, count, flags);
+	ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, count, NULL, 0, flags);
 
 	if (ret > 0)
 		b_del(buf, ret);
 
 	if (conn->flags & CO_FL_ERROR) {
+		mux_pt_report_term_evt(ctx, muxc_tevt_type_snd_err);
 		if (conn_xprt_read0_pending(conn))
 			se_fl_set(ctx->sd, SE_FL_EOS);
 		se_fl_set_error(ctx->sd);
@@ -562,6 +569,228 @@ static size_t mux_pt_snd_buf(struct stconn *sc, struct buffer *buf, size_t count
 
 	TRACE_LEAVE(PT_EV_TX_DATA, conn, sc, buf, (size_t[]){ret});
 	return ret;
+}
+
+static inline struct sedesc *mux_pt_opposite_sd(struct mux_pt_ctx *ctx)
+{
+	return se_opposite(ctx->sd);
+}
+
+static size_t mux_pt_nego_ff(struct stconn *sc, struct buffer *input, size_t count, unsigned int flags)
+{
+	struct connection *conn = __sc_conn(sc);
+	struct mux_pt_ctx *ctx = conn->ctx;
+	size_t ret = 0;
+
+	TRACE_ENTER(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){count});
+
+	/* Use kernel splicing if it is supported by the sender and if there
+	 * are no input data _AND_ no output data.
+	 *
+	 * TODO: It may be good to add a flag to send obuf data first if any,
+	 *       and then data in pipe, or the opposite. For now, it is not
+	 *       supported to mix data.
+	 */
+	if (!b_data(input) && (flags & NEGO_FF_FL_MAY_SPLICE)) {
+		int can_splice = XPRT_CONN_CAN_NOT_SPLICE;
+
+		if (conn->xprt->snd_pipe && conn->xprt->get_capability &&
+		    conn->xprt->get_capability(conn, conn->xprt_ctx, XPRT_CAN_SPLICE, &can_splice) == 0 &&
+		    can_splice == XPRT_CONN_CAN_SPLICE &&
+		    (ctx->sd->iobuf.pipe || (pipes_used < global.maxpipes && (ctx->sd->iobuf.pipe = get_pipe())))) {
+			ctx->sd->iobuf.offset = 0;
+			ctx->sd->iobuf.data = 0;
+			ret = count;
+			goto out;
+		}
+		/*
+		 * If can_splice is XPRT_CONN_COULD, it means
+		 * that it can not splice right now, but it may at a later
+		 * time, so don't disable it completely, just do not attempt
+		 * to splice right now. If we got that, then no pipe has
+		 * been allowed, so we should not try to splice.
+		 * Set CO_FL_WANT_SPLICING to let the upper layers know that
+		 * we would love to be able to use splicing if possible.
+		 */
+		if (can_splice == XPRT_CONN_COULD_SPLICE) {
+			conn->flags |= CO_FL_WANT_SPLICING;
+		} else {
+			ctx->sd->iobuf.flags |= IOBUF_FL_NO_SPLICING;
+			TRACE_DEVEL("Unable to allocate pipe for splicing, fallback to buffer", PT_EV_TX_DATA, conn, sc);
+		}
+	}
+	/* No buffer case */
+
+  out:
+	TRACE_LEAVE(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){ret});
+	return ret;
+}
+
+static size_t mux_pt_done_ff(struct stconn *sc)
+{
+	struct connection *conn = __sc_conn(sc);
+	struct mux_pt_ctx *ctx = conn->ctx;
+	struct sedesc *sd = ctx->sd;
+	size_t total = 0;
+
+	TRACE_ENTER(PT_EV_TX_DATA, conn, sc);
+
+	if (sd->iobuf.pipe) {
+		total = conn->xprt->snd_pipe(conn, conn->xprt_ctx, sd->iobuf.pipe, sd->iobuf.pipe->data);
+		if (!sd->iobuf.pipe->data) {
+			put_pipe(sd->iobuf.pipe);
+			sd->iobuf.pipe = NULL;
+		}
+	}
+	else {
+		BUG_ON(sd->iobuf.buf);
+	}
+
+  out:
+	if (conn->flags & CO_FL_ERROR) {
+		if (conn_xprt_read0_pending(conn))
+			se_fl_set(ctx->sd, SE_FL_EOS);
+		se_fl_set_error(ctx->sd);
+		if (sd->iobuf.pipe) {
+			put_pipe(sd->iobuf.pipe);
+			sd->iobuf.pipe = NULL;
+		}
+		TRACE_DEVEL("error on connection", PT_EV_TX_DATA|PT_EV_CONN_ERR, conn, sc);
+	}
+
+	TRACE_LEAVE(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){total});
+	return total;
+}
+
+static int mux_pt_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
+{
+	struct connection *conn = __sc_conn(sc);
+	struct mux_pt_ctx *ctx = conn->ctx;
+	struct sedesc *sdo = NULL;
+	size_t total = 0, try = 0;
+	unsigned int nego_flags = NEGO_FF_FL_NONE;
+        int ret = 0;
+
+	TRACE_ENTER(PT_EV_RX_DATA, conn, sc, 0, (size_t[]){count});
+
+	se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+	conn->flags &= ~CO_FL_WAIT_ROOM;
+	sdo = mux_pt_opposite_sd(ctx);
+	if (!sdo) {
+		TRACE_STATE("Opposite endpoint not available yet", PT_EV_RX_DATA, conn, sc);
+		goto out;
+	}
+
+	if (conn->xprt->rcv_pipe && !!(flags & CO_RFL_MAY_SPLICE) && !(sdo->iobuf.flags & IOBUF_FL_NO_SPLICING)) {
+		int can_splice = XPRT_CONN_CAN_NOT_SPLICE;
+
+		if (conn->xprt->get_capability &&
+		    conn->xprt->get_capability(conn, conn->xprt_ctx, XPRT_CAN_SPLICE, &can_splice) == 0 &&
+		    can_splice == XPRT_CONN_CAN_SPLICE)
+			nego_flags |= NEGO_FF_FL_MAY_SPLICE;
+		else if (can_splice == XPRT_CONN_COULD_SPLICE)
+			conn->flags |= CO_FL_WANT_SPLICING;
+	}
+
+
+	try = se_nego_ff(sdo, &BUF_NULL, count, nego_flags);
+	if (sdo->iobuf.flags & IOBUF_FL_NO_FF) {
+		/* Fast forwarding is not supported by the consumer */
+		se_fl_clr(ctx->sd, SE_FL_MAY_FASTFWD_PROD);
+		TRACE_DEVEL("Fast-forwarding not supported by opposite endpoint, disable it", PT_EV_RX_DATA, conn, sc);
+		goto end;
+	}
+	if (sdo->iobuf.flags & IOBUF_FL_FF_BLOCKED) {
+		se_fl_set(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+		TRACE_STATE("waiting for more room", PT_EV_RX_DATA|PT_EV_STRM_ERR, conn, sc);
+		goto out;
+	}
+
+	total += sdo->iobuf.data;
+
+	if (sdo->iobuf.pipe) {
+		/* Here, not data was xferred */
+		ret = conn->xprt->rcv_pipe(conn, conn->xprt_ctx, sdo->iobuf.pipe, try);
+		if (ret < 0) {
+			TRACE_ERROR("Error when trying to fast-forward data, disable it and abort",
+				    PT_EV_RX_DATA|PT_EV_STRM_ERR|PT_EV_CONN_ERR, conn, sc);
+			se_fl_clr(ctx->sd, SE_FL_MAY_FASTFWD_PROD);
+			BUG_ON(sdo->iobuf.pipe->data);
+			put_pipe(sdo->iobuf.pipe);
+			sdo->iobuf.pipe = NULL;
+			goto end;
+		}
+		total += ret;
+	}
+	else {
+		BUG_ON(sdo->iobuf.buf);
+		ret = -1; /* abort splicing for now and fallback to buffer mode */
+		goto end;
+	}
+
+	ret = total;
+	se_done_ff(sdo);
+
+	if (sdo->iobuf.pipe) {
+		se_fl_set(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+	}
+
+	TRACE_DEVEL("Data fast-forwarded", PT_EV_RX_DATA, conn, sc, 0, (size_t[]){ret});
+
+
+ out:
+	if (conn->flags & CO_FL_ERROR) {
+		mux_pt_report_term_evt(ctx, muxc_tevt_type_rcv_err);
+		if (conn_xprt_read0_pending(conn))
+			se_fl_set(ctx->sd, SE_FL_EOS);
+		se_fl_set(ctx->sd, SE_FL_ERROR);
+		TRACE_DEVEL("error on connection", PT_EV_RX_DATA|PT_EV_CONN_ERR, conn, sc);
+	}
+	else if (conn_xprt_read0_pending(conn))  {
+		mux_pt_report_term_evt(ctx, muxc_tevt_type_shutr);
+		se_fl_set(ctx->sd, (SE_FL_EOS|SE_FL_EOI));
+		TRACE_DEVEL("read0 on connection", PT_EV_RX_DATA, conn, sc);
+	}
+  end:
+	TRACE_LEAVE(PT_EV_RX_DATA, conn, sc, 0, (size_t[]){ret});
+	return ret;
+}
+
+static int mux_pt_resume_fastfwd(struct stconn *sc, unsigned int flags)
+{
+	struct connection *conn = __sc_conn(sc);
+	struct mux_pt_ctx *ctx = conn->ctx;
+	struct sedesc *sd = ctx->sd;
+	size_t total = 0;
+
+	TRACE_ENTER(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){flags});
+
+	if (sd->iobuf.pipe) {
+		total = conn->xprt->snd_pipe(conn, conn->xprt_ctx, sd->iobuf.pipe, sd->iobuf.pipe->data);
+		if (!sd->iobuf.pipe->data) {
+			put_pipe(sd->iobuf.pipe);
+			sd->iobuf.pipe = NULL;
+		}
+	}
+	else {
+		BUG_ON(sd->iobuf.buf);
+	}
+
+  out:
+	if (conn->flags & CO_FL_ERROR) {
+		mux_pt_report_term_evt(ctx, muxc_tevt_type_snd_err);
+		if (conn_xprt_read0_pending(conn))
+			se_fl_set(ctx->sd, SE_FL_EOS);
+		se_fl_set_error(ctx->sd);
+		if (sd->iobuf.pipe) {
+			put_pipe(sd->iobuf.pipe);
+			sd->iobuf.pipe = NULL;
+		}
+		TRACE_DEVEL("error on connection", PT_EV_TX_DATA|PT_EV_CONN_ERR, conn, sc);
+	}
+
+	TRACE_LEAVE(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){total});
+	return total;
 }
 
 /* Called from the upper layer, to subscribe <es> to events <event_type>. The
@@ -589,68 +818,75 @@ static int mux_pt_unsubscribe(struct stconn *sc, int event_type, struct wait_eve
 	return conn->xprt->unsubscribe(conn, conn->xprt_ctx, event_type, es);
 }
 
-#if defined(USE_LINUX_SPLICE)
-/* Send and get, using splicing */
-static int mux_pt_rcv_pipe(struct stconn *sc, struct pipe *pipe, unsigned int count)
-{
-	struct connection *conn = __sc_conn(sc);
-	struct mux_pt_ctx *ctx = conn->ctx;
-	int ret;
-
-	TRACE_ENTER(PT_EV_RX_DATA, conn, sc, 0, (size_t[]){count});
-
-	ret = conn->xprt->rcv_pipe(conn, conn->xprt_ctx, pipe, count);
-	if (conn->flags & CO_FL_ERROR) {
-		if (conn_xprt_read0_pending(conn))
-			se_fl_set(ctx->sd, SE_FL_EOS);
-		se_fl_set(ctx->sd, SE_FL_ERROR);
-		TRACE_DEVEL("error on connection", PT_EV_RX_DATA|PT_EV_CONN_ERR, conn, sc);
-	}
-	else if (conn_xprt_read0_pending(conn))  {
-		se_fl_set(ctx->sd, (SE_FL_EOS|SE_FL_EOI));
-		TRACE_DEVEL("read0 on connection", PT_EV_RX_DATA, conn, sc);
-	}
-
-	TRACE_LEAVE(PT_EV_RX_DATA, conn, sc, 0, (size_t[]){ret});
-	return (ret);
-}
-
-static int mux_pt_snd_pipe(struct stconn *sc, struct pipe *pipe)
-{
-	struct connection *conn = __sc_conn(sc);
-	struct mux_pt_ctx *ctx = conn->ctx;
-	int ret;
-
-	TRACE_ENTER(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){pipe->data});
-
-	ret = conn->xprt->snd_pipe(conn, conn->xprt_ctx, pipe);
-
-	if (conn->flags & CO_FL_ERROR) {
-		if (conn_xprt_read0_pending(conn))
-			se_fl_set(ctx->sd, SE_FL_EOS);
-		se_fl_set_error(ctx->sd);
-		TRACE_DEVEL("error on connection", PT_EV_TX_DATA|PT_EV_CONN_ERR, conn, sc);
-	}
-
-	TRACE_LEAVE(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){ret});
-	return ret;
-}
-#endif
-
 static int mux_pt_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *output)
 {
+	struct mux_pt_ctx *ctx = conn->ctx;
 	int ret = 0;
+
 	switch (mux_ctl) {
-	case MUX_STATUS:
+	case MUX_CTL_STATUS:
 		if (!(conn->flags & CO_FL_WAIT_XPRT))
 			ret |= MUX_STATUS_READY;
 		return ret;
-	case MUX_EXIT_STATUS:
+	case MUX_CTL_EXIT_STATUS:
 		return MUX_ES_UNKNOWN;
+	case MUX_CTL_GET_NBSTRM:
+		return mux_pt_used_streams(conn);
+	case MUX_CTL_GET_MAXSTRM:
+		return 1;
+	case MUX_CTL_TEVTS:
+		return ctx->term_evts_log;
 	default:
 		return -1;
 	}
 }
+
+static int mux_pt_sctl(struct stconn *sc, enum mux_sctl_type mux_sctl, void *output)
+{
+	int ret = 0;
+
+	switch (mux_sctl) {
+	case MUX_SCTL_SID:
+		if (output)
+			*((int64_t *)output) = 0;
+		return ret;
+
+	case MUX_SCTL_TEVTS:
+		return sc->sedesc->term_evts_log;
+
+	default:
+		return -1;
+	}
+}
+
+/* config parser for global "tune.pt.zero-copy-forwarding" */
+static int cfg_parse_pt_zero_copy_fwd(char **args, int section_type, struct proxy *curpx,
+				      const struct proxy *defpx, const char *file, int line,
+				      char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "on") == 0)
+		global.tune.no_zero_copy_fwd &= ~NO_ZERO_COPY_FWD_PT;
+	else if (strcmp(args[1], "off") == 0)
+		global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD_PT;
+	else {
+		memprintf(err, "'%s' expects 'on' or 'off'.", args[0]);
+		return -1;
+	}
+	return 0;
+}
+
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.pt.zero-copy-forwarding", cfg_parse_pt_zero_copy_fwd },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+
 
 /* The mux operations */
 const struct mux_ops mux_tcp_ops = {
@@ -658,12 +894,12 @@ const struct mux_ops mux_tcp_ops = {
 	.wake = mux_pt_wake,
 	.rcv_buf = mux_pt_rcv_buf,
 	.snd_buf = mux_pt_snd_buf,
+	.nego_fastfwd = mux_pt_nego_ff,
+	.done_fastfwd = mux_pt_done_ff,
+	.fastfwd = mux_pt_fastfwd,
+	.resume_fastfwd = mux_pt_resume_fastfwd,
 	.subscribe = mux_pt_subscribe,
 	.unsubscribe = mux_pt_unsubscribe,
-#if defined(USE_LINUX_SPLICE)
-	.rcv_pipe = mux_pt_rcv_pipe,
-	.snd_pipe = mux_pt_snd_pipe,
-#endif
 	.attach = mux_pt_attach,
 	.get_first_sc = mux_pt_get_first_sc,
 	.detach = mux_pt_detach,
@@ -671,8 +907,8 @@ const struct mux_ops mux_tcp_ops = {
 	.used_streams = mux_pt_used_streams,
 	.destroy = mux_pt_destroy_meth,
 	.ctl = mux_pt_ctl,
-	.shutr = mux_pt_shutr,
-	.shutw = mux_pt_shutw,
+	.sctl = mux_pt_sctl,
+	.shut = mux_pt_shut,
 	.flags = MX_FL_NONE,
 	.name = "PASS",
 };
@@ -683,12 +919,12 @@ const struct mux_ops mux_pt_ops = {
 	.wake = mux_pt_wake,
 	.rcv_buf = mux_pt_rcv_buf,
 	.snd_buf = mux_pt_snd_buf,
+	.nego_fastfwd = mux_pt_nego_ff,
+	.done_fastfwd = mux_pt_done_ff,
+	.fastfwd = mux_pt_fastfwd,
+	.resume_fastfwd = mux_pt_resume_fastfwd,
 	.subscribe = mux_pt_subscribe,
 	.unsubscribe = mux_pt_unsubscribe,
-#if defined(USE_LINUX_SPLICE)
-	.rcv_pipe = mux_pt_rcv_pipe,
-	.snd_pipe = mux_pt_snd_pipe,
-#endif
 	.attach = mux_pt_attach,
 	.get_first_sc = mux_pt_get_first_sc,
 	.detach = mux_pt_detach,
@@ -696,8 +932,8 @@ const struct mux_ops mux_pt_ops = {
 	.used_streams = mux_pt_used_streams,
 	.destroy = mux_pt_destroy_meth,
 	.ctl = mux_pt_ctl,
-	.shutr = mux_pt_shutr,
-	.shutw = mux_pt_shutw,
+	.sctl = mux_pt_sctl,
+	.shut = mux_pt_shut,
 	.flags = MX_FL_NONE|MX_FL_NO_UPG,
 	.name = "PASS",
 };

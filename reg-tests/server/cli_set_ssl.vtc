@@ -3,7 +3,6 @@ varnishtest "Set server ssl via CLI"
 feature ignore_unknown_macro
 
 # for "set server <srv> ssl"
-#REQUIRE_VERSION=2.4
 #REGTEST_TYPE=devel
 #REQUIRE_OPTIONS=OPENSSL
 
@@ -13,6 +12,10 @@ server s1 {
 
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         ssl-server-verify none
 
     defaults

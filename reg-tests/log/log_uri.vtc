@@ -1,8 +1,6 @@
 varnishtest "Verify logging of relative/absolute URI path"
 feature ignore_unknown_macro
 
-#REQUIRE_VERSION=2.4
-
 server s1 {
     rxreq
     txresp  -hdr "Connection: close"
@@ -21,6 +19,10 @@ syslog Slg_1 -level info {
 
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         nbthread 1
 
     defaults

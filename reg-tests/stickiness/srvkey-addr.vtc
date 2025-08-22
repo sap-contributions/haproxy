@@ -6,8 +6,6 @@ feature ignore_unknown_macro
 # do the job they are supposed to do.
 # If we remove one of the "stick on" rule, this script fails.
 
-#REQUIRE_VERSION=2.4
-
 server s_not_used_1 {}
 server s_not_used_2 {}
 server s_not_used_3 {}
@@ -33,6 +31,11 @@ server s2 {
 } -repeat 8 -start
 
 haproxy h1 -arg "-L A" -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         mode http
         timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
@@ -74,6 +77,11 @@ haproxy h1 -arg "-L A" -conf {
 }
 
 haproxy h2 -arg "-L B" -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         mode http
         timeout server "${HAPROXY_TEST_TIMEOUT-5s}"

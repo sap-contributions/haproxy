@@ -23,8 +23,11 @@
 
 #include <haproxy/buf-t.h>
 #include <haproxy/list-t.h>
+#include <haproxy/pool.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_tls-t.h>
+#include <haproxy/quic_pacing-t.h>
+#include <haproxy/quic_rx-t.h>
 #include <haproxy/quic_tx-t.h>
 
 struct buffer *qc_txb_alloc(struct quic_conn *qc);
@@ -32,20 +35,18 @@ void qc_txb_release(struct quic_conn *qc);
 int qc_purge_txbuf(struct quic_conn *qc, struct buffer *buf);
 struct buffer *qc_get_txb(struct quic_conn *qc);
 
-int qc_need_sending(struct quic_conn *qc, struct quic_enc_level *qel);
-int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels);
-int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx);
-int qc_may_probe_ipktns(struct quic_conn *qc);
-int quic_build_post_handshake_frames(struct quic_conn *qc);
-int qc_send_app_pkts(struct quic_conn *qc, struct list *frms);
+enum quic_tx_err qc_send_mux(struct quic_conn *qc, struct list *frms,
+                             struct quic_pacer *pacer);
+
+void qel_register_send(struct list *send_list, struct quic_enc_level *qel,
+                       struct list *frms);
+int qel_need_sending(struct quic_enc_level *qel, struct quic_conn *qc);
+int qc_send(struct quic_conn *qc, int old_data, struct list *send_list,
+            int max_dgrams);
+
 int qc_dgrams_retransmit(struct quic_conn *qc);
-int qc_notify_send(struct quic_conn *qc);
 void qc_prep_hdshk_fast_retrans(struct quic_conn *qc,
                                 struct list *ifrms, struct list *hfrms);
-int quic_generate_retry_token_aad(unsigned char *aad,
-                                  uint32_t version,
-                                  const struct quic_cid *scid,
-                                  const struct sockaddr_storage *addr);
 int send_retry(int fd, struct sockaddr_storage *addr,
                struct quic_rx_packet *pkt, const struct quic_version *qv);
 int send_stateless_reset(struct listener *l, struct sockaddr_storage *dstaddr,
@@ -63,6 +64,7 @@ static inline void quic_tx_packet_dgram_detach(struct quic_tx_packet *pkt)
 		pkt->prev->next = pkt->next;
 	if (pkt->next)
 		pkt->next->prev = pkt->prev;
+	pkt->prev = pkt->next = NULL;
 }
 
 
@@ -75,6 +77,7 @@ static inline void quic_tx_packet_refinc(struct quic_tx_packet *pkt)
 /* Decrement the reference counter of <pkt> */
 static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 {
+	BUG_ON(pkt->refcnt <= 0);
 	if (--pkt->refcnt == 0) {
 		BUG_ON(!LIST_ISEMPTY(&pkt->frms));
 		/* If there are others packet in the same datagram <pkt> is attached to,
@@ -84,5 +87,16 @@ static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 		pool_free(pool_head_quic_tx_packet, pkt);
 	}
 }
+
+/* Return the number of bytes which may be sent from <qc> connection when
+ * it has not already been validated. Note that this is the responsibility
+ * of the caller to check that the case with quic_peer_validated_addr().
+ * This latter BUG_ON() if 3 * qc->rx.bytes < qc->tx.prep_bytes.
+ */
+static inline size_t quic_may_send_bytes(struct quic_conn *qc)
+{
+	return 3 * qc->bytes.rx - qc->bytes.prep;
+}
+
 
 #endif /* _HAPROXY_QUIC_TX_H */

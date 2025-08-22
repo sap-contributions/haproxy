@@ -41,25 +41,18 @@
 #include <haproxy/version.h>
 
 
-/* Release memory allocated by most of HTTP actions. Concretly, it releases
+/* Release memory allocated by most of HTTP actions. Concretely, it releases
  * <arg.http>.
  */
 static void release_http_action(struct act_rule *rule)
 {
-	struct logformat_node *lf, *lfb;
-
 	istfree(&rule->arg.http.str);
 	if (rule->arg.http.re)
 		regex_free(rule->arg.http.re);
-	list_for_each_entry_safe(lf, lfb, &rule->arg.http.fmt, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
+	lf_expr_deinit(&rule->arg.http.fmt);
 }
 
-/* Release memory allocated by HTTP actions relying on an http reply. Concretly,
+/* Release memory allocated by HTTP actions relying on an http reply. Concretely,
  * it releases <.arg.http_reply>
  */
 static void release_act_http_reply(struct act_rule *rule)
@@ -123,13 +116,13 @@ static enum act_return http_action_set_req_line(struct act_rule *rule, struct pr
 	goto leave;
 
   fail_rewrite:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 
 	if (!(s->txn->req.flags & HTTP_MSGF_SOFT_RW)) {
 		ret = ACT_RET_ERR;
@@ -179,7 +172,7 @@ static enum act_parse_ret parse_set_req_line(const char **args, int *orig_arg, s
 	}
 	rule->action_ptr = http_action_set_req_line;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	if (!*args[cur_arg] ||
 	    (*args[cur_arg + 1] && strcmp(args[cur_arg + 1], "if") != 0 && strcmp(args[cur_arg + 1], "unless") != 0)) {
@@ -393,13 +386,13 @@ static enum act_return http_action_normalize_uri(struct act_rule *rule, struct p
 	goto leave;
 
   fail_rewrite:
-	_HA_ATOMIC_ADD(&sess->fe->fe_counters.failed_rewrites, 1);
+	_HA_ATOMIC_ADD(&sess->fe_tgcounters->failed_rewrites, 1);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_ADD(&s->be->be_counters.failed_rewrites, 1);
+		_HA_ATOMIC_ADD(&s->be_tgcounters->failed_rewrites, 1);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_ADD(&sess->listener->counters->failed_rewrites, 1);
+		_HA_ATOMIC_ADD(&sess->li_tgcounters->failed_rewrites, 1);
 	if (objt_server(s->target))
-		_HA_ATOMIC_ADD(&__objt_server(s->target)->counters.failed_rewrites, 1);
+		_HA_ATOMIC_ADD(&s->sv_tgcounters->failed_rewrites, 1);
 
 	if (!(s->txn->req.flags & HTTP_MSGF_SOFT_RW)) {
 		ret = ACT_RET_ERR;
@@ -569,13 +562,13 @@ static enum act_return http_action_replace_uri(struct act_rule *rule, struct pro
 	goto leave;
 
   fail_rewrite:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 
 	if (!(s->txn->req.flags & HTTP_MSGF_SOFT_RW)) {
 		ret = ACT_RET_ERR;
@@ -616,7 +609,7 @@ static enum act_parse_ret parse_replace_uri(const char **args, int *orig_arg, st
 
 	rule->action_ptr = http_action_replace_uri;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	if (!*args[cur_arg] || !*args[cur_arg+1] ||
 	    (*args[cur_arg+2] && strcmp(args[cur_arg+2], "if") != 0 && strcmp(args[cur_arg+2], "unless") != 0)) {
@@ -649,13 +642,13 @@ static enum act_return action_http_set_status(struct act_rule *rule, struct prox
                                               struct session *sess, struct stream *s, int flags)
 {
 	if (http_res_set_status(rule->arg.http.i, rule->arg.http.str, s) == -1) {
-		_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
 		if (s->flags & SF_BE_ASSIGNED)
-			_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 		if (sess->listener && sess->listener->counters)
-			_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+			_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 		if (objt_server(s->target))
-			_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+			_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 
 		if (!(s->txn->req.flags & HTTP_MSGF_SOFT_RW)) {
 			if (!(s->flags & SF_ERR_MASK))
@@ -680,7 +673,7 @@ static enum act_parse_ret parse_http_set_status(const char **args, int *orig_arg
 	rule->action = ACT_CUSTOM;
 	rule->action_ptr = action_http_set_status;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	/* Check if an argument is available */
 	if (!*args[*orig_arg]) {
@@ -724,10 +717,10 @@ static enum act_return http_action_reject(struct act_rule *rule, struct proxy *p
 	s->req.analysers &= AN_REQ_FLT_END;
 	s->res.analysers &= AN_RES_FLT_END;
 
-	_HA_ATOMIC_INC(&s->be->be_counters.denied_req);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_req);
+	_HA_ATOMIC_INC(&s->be_tgcounters->denied_req);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->denied_req);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->denied_req);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->denied_req);
 
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
@@ -1288,7 +1281,7 @@ static enum act_return http_action_auth(struct act_rule *rule, struct proxy *px,
 	req->analysers &= AN_REQ_FLT_END;
 
 	if (s->sess->fe == s->be) /* report it if the request was intercepted by the frontend */
-		_HA_ATOMIC_INC(&s->sess->fe->fe_counters.intercepted_req);
+		_HA_ATOMIC_INC(&s->sess->fe_tgcounters->intercepted_req);
 
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_LOCAL;
@@ -1317,7 +1310,7 @@ static enum act_parse_ret parse_http_auth(const char **args, int *orig_arg, stru
 	rule->flags |= ACT_FLAG_FINAL;
 	rule->action_ptr = http_action_auth;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (strcmp(args[cur_arg], "realm") == 0) {
@@ -1456,13 +1449,13 @@ static enum act_return http_action_set_header(struct act_rule *rule, struct prox
 	goto leave;
 
   fail_rewrite:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 
 	if (!(msg->flags & HTTP_MSGF_SOFT_RW)) {
 		ret = ACT_RET_ERR;
@@ -1497,7 +1490,7 @@ static enum act_parse_ret parse_http_set_header(const char **args, int *orig_arg
 		rule->action_ptr = http_action_set_header;
 	}
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (!*args[cur_arg] || !*args[cur_arg+1]) {
@@ -1528,10 +1521,6 @@ static enum act_parse_ret parse_http_set_header(const char **args, int *orig_arg
 		istfree(&rule->arg.http.str);
 		return ACT_RET_PRS_ERR;
 	}
-
-	free(px->conf.lfs_file);
-	px->conf.lfs_file = strdup(px->conf.args.file);
-	px->conf.lfs_line = px->conf.args.line;
 
 	/* some characters are totally forbidden in header names and
 	 * may happen by accident when writing configs, causing strange
@@ -1592,13 +1581,13 @@ static enum act_return http_action_replace_header(struct act_rule *rule, struct 
 	goto leave;
 
   fail_rewrite:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_rewrites);
+	_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
 	if (s->flags & SF_BE_ASSIGNED)
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
 	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->failed_rewrites);
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
 	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_rewrites);
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
 
 	if (!(msg->flags & HTTP_MSGF_SOFT_RW)) {
 		ret = ACT_RET_ERR;
@@ -1623,7 +1612,7 @@ static enum act_parse_ret parse_http_replace_header(const char **args, int *orig
 		rule->action = 1; // replace-value
 	rule->action_ptr = http_action_replace_header;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (!*args[cur_arg] || !*args[cur_arg+1] || !*args[cur_arg+2]) {
@@ -1660,10 +1649,6 @@ static enum act_parse_ret parse_http_replace_header(const char **args, int *orig
 		regex_free(rule->arg.http.re);
 		return ACT_RET_PRS_ERR;
 	}
-
-	free(px->conf.lfs_file);
-	px->conf.lfs_file = strdup(px->conf.args.file);
-	px->conf.lfs_line = px->conf.args.line;
 
 	*orig_arg = cur_arg + 1;
 	return ACT_RET_PRS_OK;
@@ -1726,7 +1711,7 @@ static enum act_parse_ret parse_http_del_header(const char **args, int *orig_arg
 	rule->action = PAT_MATCH_STR;
 	rule->action_ptr = http_action_del_header;
 	rule->release_ptr = release_http_action;
-	LIST_INIT(&rule->arg.http.fmt);
+	lf_expr_init(&rule->arg.http.fmt);
 
 	cur_arg = *orig_arg;
 	if (!*args[cur_arg]) {
@@ -1766,6 +1751,86 @@ static enum act_parse_ret parse_http_del_header(const char **args, int *orig_arg
 	*orig_arg = cur_arg + 1;
 	return ACT_RET_PRS_OK;
 }
+
+/* This function executes a pause action.
+ */
+static enum act_return http_action_pause(struct act_rule *rule, struct proxy *px,
+					 struct session *sess, struct stream *s, int flags)
+{
+
+	struct channel *chn = ((rule->from == ACT_F_HTTP_REQ) ? &s->req : &s->res);
+	struct sample *key;
+
+	if (!tick_isset(chn->analyse_exp)) {
+		int time;
+
+		if (rule->arg.timeout.expr) {
+			key = sample_fetch_as_type(px, sess, s, SMP_OPT_FINAL, rule->arg.timeout.expr, SMP_T_SINT);
+			if (!key)
+				return ACT_RET_CONT;
+			time = MS_TO_TICKS(key->data.u.sint);
+		}
+		else
+			time  = MS_TO_TICKS(rule->arg.timeout.value);
+		chn->analyse_exp = tick_add_ifset(now_ms, time);
+	}
+
+	if (tick_isset(chn->analyse_exp) && !tick_is_expired(chn->analyse_exp, now_ms))
+		return ACT_RET_YIELD;
+
+	chn->analyse_exp = TICK_ETERNITY;
+	return ACT_RET_CONT;
+}
+
+/* Parse a "pause" action. It returns ACT_RET_PRS_OK on success,
+ * ACT_RET_PRS_ERR on error.
+ */
+static enum act_parse_ret parse_http_pause(const char **args, int *orig_arg, struct proxy *px,
+					      struct act_rule *rule, char **err)
+{
+	const char *res;
+	int cur_arg;
+
+	rule->action = ACT_CUSTOM;
+	rule->action_ptr = http_action_pause;
+	rule->release_ptr = release_timeout_action;
+
+	cur_arg = *orig_arg;
+
+	res = parse_time_err(args[cur_arg], (unsigned int *)&rule->arg.timeout.value, TIME_UNIT_MS);
+        if (res == PARSE_TIME_OVER) {
+                memprintf(err, "timer overflow in argument '%s' to rule 'pause' (maximum value is 2147483647 ms or ~24.8 days)",
+                          args[cur_arg]);
+                return ACT_RET_PRS_ERR;
+        }
+        else if (res == PARSE_TIME_UNDER) {
+                memprintf(err, "timer underflow in argument '%s' to rule 'pause' (minimum value is 1 ms)",
+                          args[cur_arg]);
+                return ACT_RET_PRS_ERR;
+        }
+        /* res not NULL, parsing error */
+        else if (res) {
+                rule->arg.timeout.expr = sample_parse_expr((char **)args, &cur_arg, px->conf.args.file,
+                                                           px->conf.args.line, err, &px->conf.args, NULL);
+                if (!rule->arg.timeout.expr) {
+                        memprintf(err, "unexpected character '%c' in rule 'mause'", *res);
+                        return ACT_RET_PRS_ERR;
+                }
+        }
+        /* res NULL, parsing ok but value is 0 */
+        else if (!(rule->arg.timeout.value)) {
+                memprintf(err, "null value is not valid for a 'pause' rule");
+                return ACT_RET_PRS_ERR;
+        }
+	else {
+		/* a time volue was successfully parsed */
+		cur_arg++;
+	}
+
+	*orig_arg = cur_arg;
+	return ACT_RET_PRS_OK;
+}
+
 
 /* Release memory allocated by an http redirect action. */
 static void release_http_redir(struct act_rule *rule)
@@ -1863,7 +1928,7 @@ static enum act_return http_action_set_map(struct act_rule *rule, struct proxy *
 		elt = pat_ref_find_elt(ref, key->area);
 		if (elt) {
 			/* update entry if it exists */
-			pat_ref_set(ref, key->area, value->area, NULL, elt);
+			pat_ref_set_elt_duplicate(ref, elt, value->area, NULL);
 		}
 		else {
 			/* insert a new entry */
@@ -1901,23 +1966,10 @@ static enum act_return http_action_set_map(struct act_rule *rule, struct proxy *
 /* Release memory allocated by an http map/acl action. */
 static void release_http_map(struct act_rule *rule)
 {
-	struct logformat_node *lf, *lfb;
-
 	free(rule->arg.map.ref);
-	list_for_each_entry_safe(lf, lfb, &rule->arg.map.key, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-	if (rule->action == 1) {
-		list_for_each_entry_safe(lf, lfb, &rule->arg.map.value, list) {
-			LIST_DELETE(&lf->list);
-			release_sample_expr(lf->expr);
-			free(lf->arg);
-			free(lf);
-		}
-	}
+	lf_expr_deinit(&rule->arg.map.key);
+	if (rule->action == 1)
+		lf_expr_deinit(&rule->arg.map.value);
 }
 
 /* Parse a "add-acl", "del-acl", "set-map" or "del-map" actions. It takes one or
@@ -1979,8 +2031,8 @@ static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, s
 	}
 
 	/* key pattern */
-	LIST_INIT(&rule->arg.map.key);
-	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.key, LOG_OPT_HTTP, cap, err)) {
+	lf_expr_init(&rule->arg.map.key);
+	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.key, LOG_OPT_NONE, cap, err)) {
 		free(rule->arg.map.ref);
 		return ACT_RET_PRS_ERR;
 	}
@@ -1988,16 +2040,12 @@ static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, s
 	if (rule->action == 1) {
 		/* value pattern for set-map only */
 		cur_arg++;
-		LIST_INIT(&rule->arg.map.value);
-		if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.value, LOG_OPT_HTTP, cap, err)) {
+		lf_expr_init(&rule->arg.map.value);
+		if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.value, LOG_OPT_NONE, cap, err)) {
 			free(rule->arg.map.ref);
 			return ACT_RET_PRS_ERR;
 		}
 	}
-
-	free(px->conf.lfs_file);
-	px->conf.lfs_file = strdup(px->conf.args.file);
-	px->conf.lfs_line = px->conf.args.line;
 
 	*orig_arg = cur_arg + 1;
 	return ACT_RET_PRS_OK;
@@ -2044,13 +2092,14 @@ static enum act_return http_action_track_sc(struct act_rule *rule, struct proxy 
 	 * but here we're tracking after this ought to have been done so we have
 	 * to do it on purpose.
 	 */
-	if (rule->from == ACT_F_HTTP_RES && (unsigned)(s->txn->status - 400) < 100) {
+	if (rule->from == ACT_F_HTTP_RES &&
+	    http_status_matches(http_err_status_codes, s->txn->status)) {
 		ptr3 = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_ERR_CNT);
 		ptr4 = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_ERR_RATE);
 	}
 
-	if (rule->from == ACT_F_HTTP_RES && (unsigned)(s->txn->status - 500) < 100 &&
-	    s->txn->status != 501 && s->txn->status != 505) {
+	if (rule->from == ACT_F_HTTP_RES &&
+	    http_status_matches(http_fail_status_codes, s->txn->status)) {
 		ptr5 = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_FAIL_CNT);
 		ptr6 = stktable_data_ptr(t, ts, STKTABLE_DT_HTTP_FAIL_RATE);
 	}
@@ -2255,6 +2304,12 @@ static enum act_return http_action_return(struct act_rule *rule, struct proxy *p
 	struct channel *req = &s->req;
 
 	s->txn->status = rule->arg.http_reply->status;
+
+	if (!(s->flags & SF_ERR_MASK))
+		s->flags |= SF_ERR_LOCAL;
+	if (!(s->flags & SF_FINST_MASK))
+		s->flags |= ((rule->from == ACT_F_HTTP_REQ) ? SF_FINST_R : SF_FINST_H);
+
 	if (http_reply_message(s, rule->arg.http_reply) == -1)
 		return ACT_RET_ERR;
 
@@ -2264,13 +2319,8 @@ static enum act_return http_action_return(struct act_rule *rule, struct proxy *p
 		req->analysers &= AN_REQ_FLT_END;
 
 		if (s->sess->fe == s->be) /* report it if the request was intercepted by the frontend */
-			_HA_ATOMIC_INC(&s->sess->fe->fe_counters.intercepted_req);
+			_HA_ATOMIC_INC(&s->sess->fe_tgcounters->intercepted_req);
 	}
-
-	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_LOCAL;
-	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= ((rule->from == ACT_F_HTTP_REQ) ? SF_FINST_R : SF_FINST_H);
 
 	return ACT_RET_ABRT;
 }
@@ -2401,6 +2451,40 @@ static enum act_parse_ret parse_http_wait_for_body(const char **args, int *orig_
 	return ACT_RET_PRS_OK;
 }
 
+static enum log_orig_id do_log_http_req;
+static enum log_orig_id do_log_http_res;
+static enum log_orig_id do_log_http_after_res;
+
+static void init_do_log(void)
+{
+	do_log_http_req = log_orig_register("http-req");
+	BUG_ON(do_log_http_req == LOG_ORIG_UNSPEC);
+	do_log_http_res = log_orig_register("http-res");
+	BUG_ON(do_log_http_res == LOG_ORIG_UNSPEC);
+	do_log_http_after_res = log_orig_register("http-after-res");
+	BUG_ON(do_log_http_after_res == LOG_ORIG_UNSPEC);
+}
+
+INITCALL0(STG_PREPARE, init_do_log);
+
+static enum act_parse_ret parse_http_req_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_http_req, args, orig_arg, px, rule, err);
+}
+
+static enum act_parse_ret parse_http_res_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_http_res, args, orig_arg, px, rule, err);
+}
+
+static enum act_parse_ret parse_http_after_res_do_log(const char **args, int *orig_arg, struct proxy *px,
+                                                      struct act_rule *rule, char **err)
+{
+	return do_log_parse_act(do_log_http_after_res, args, orig_arg, px, rule, err);
+}
+
 /************************************************************************/
 /*   All supported http-request action keywords must be declared here.  */
 /************************************************************************/
@@ -2417,8 +2501,10 @@ static struct action_kw_list http_req_actions = {
 		{ "del-map",          parse_http_set_map,              KWF_MATCH_PREFIX },
 		{ "deny",             parse_http_deny,                 0 },
 		{ "disable-l7-retry", parse_http_req_disable_l7_retry, 0 },
+		{ "do-log",           parse_http_req_do_log,           0 },
 		{ "early-hint",       parse_http_set_header,           0 },
 		{ "normalize-uri",    parse_http_normalize_uri,        KWF_EXPERIMENTAL },
+		{ "pause",            parse_http_pause,                0 },
 		{ "redirect",         parse_http_redirect,             0 },
 		{ "reject",           parse_http_action_reject,        0 },
 		{ "replace-header",   parse_http_replace_header,       0 },
@@ -2455,6 +2541,8 @@ static struct action_kw_list http_res_actions = {
 		{ "del-header",      parse_http_del_header,     0 },
 		{ "del-map",         parse_http_set_map,        KWF_MATCH_PREFIX },
 		{ "deny",            parse_http_deny,           0 },
+		{ "do-log",          parse_http_res_do_log,     0 },
+		{ "pause",           parse_http_pause,          0 },
 		{ "redirect",        parse_http_redirect,       0 },
 		{ "replace-header",  parse_http_replace_header, 0 },
 		{ "replace-value",   parse_http_replace_header, 0 },
@@ -2464,6 +2552,7 @@ static struct action_kw_list http_res_actions = {
 		{ "set-status",      parse_http_set_status,     0 },
 		{ "strict-mode",     parse_http_strict_mode,    0 },
 		{ "track-sc",        parse_http_track_sc,       KWF_MATCH_PREFIX },
+		{ "set-timeout",     parse_http_set_timeout,    0 },
 		{ "wait-for-body",   parse_http_wait_for_body,  0 },
 		{ NULL, NULL }
 	}
@@ -2479,6 +2568,7 @@ static struct action_kw_list http_after_res_actions = {
 		{ "del-acl",          parse_http_set_map,       KWF_MATCH_PREFIX },
 		{ "del-header",      parse_http_del_header,     0 },
 		{ "del-map",          parse_http_set_map,       KWF_MATCH_PREFIX },
+		{ "do-log",          parse_http_after_res_do_log, 0 },
 		{ "replace-header",  parse_http_replace_header, 0 },
 		{ "replace-value",   parse_http_replace_header, 0 },
 		{ "set-header",      parse_http_set_header,     0 },

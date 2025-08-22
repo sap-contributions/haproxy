@@ -8,6 +8,10 @@ feature ignore_unknown_macro
 #test: converters, parsing and header injection logic
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         # WT: limit false-positives causing "HTTP header incomplete" due to
         # idle server connections being randomly used and randomly expiring
         # under us.
@@ -55,6 +59,10 @@ haproxy h1 -conf {
 #test: "default" and "no option forwarded"
 haproxy h2 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         # WT: limit false-positives causing "HTTP header incomplete" due to
         # idle server connections being randomly used and randomly expiring
         # under us.
@@ -151,6 +159,12 @@ client c1 -connect ${h1_fe1_sock} {
     expect resp.status == 200
     expect resp.http.nodename == "::1"
     expect resp.http.nodeport == "_id"
+
+    txreq -req GET -url /req4 \
+        -hdr "forwarded: for=127.9.0.1"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.nodename == "127.9.0.1"
 } -run
 
 client c2 -connect ${h2_fe1h2_sock} {

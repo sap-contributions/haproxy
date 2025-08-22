@@ -13,7 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <haproxy/acl.h>
+#include <haproxy/action.h>
 #include <haproxy/api.h>
+#include <haproxy/auth.h>
 #include <haproxy/base64.h>
 #include <haproxy/errors.h>
 #include <haproxy/list.h>
@@ -35,6 +38,7 @@ struct uri_auth *stats_check_init_uri_auth(struct uri_auth **root)
 
 		LIST_INIT(&u->http_req_rules);
 		LIST_INIT(&u->admin_rules);
+		stats_uri_auth_take(u);
 	} else
 		u = *root;
 
@@ -110,7 +114,7 @@ struct uri_auth *stats_set_realm(struct uri_auth **root, char *realm)
 }
 
 /*
- * Returns a default uri_auth with STAT_SHNODE flag enabled and
+ * Returns a default uri_auth with STAT_F_SHNODE flag enabled and
  * <node> set as the name if it is not empty.
  * Uses the pointer provided if not NULL and not initialized.
  */
@@ -128,7 +132,7 @@ struct uri_auth *stats_set_node(struct uri_auth **root, char *name)
 	if ((u = stats_check_init_uri_auth(root)) == NULL)
 		goto out_u;
 
-	if (!stats_set_flag(root, STAT_SHNODE))
+	if (!stats_set_flag(root, STAT_F_SHNODE))
 		goto out_u;
 
 	if (node_copy) {	
@@ -145,7 +149,7 @@ struct uri_auth *stats_set_node(struct uri_auth **root, char *name)
 }
 
 /*
- * Returns a default uri_auth with STAT_SHDESC flag enabled and
+ * Returns a default uri_auth with STAT_F_SHDESC flag enabled and
  * <description> set as the desc if it is not empty.
  * Uses the pointer provided if not NULL and not initialized.
  */
@@ -163,7 +167,7 @@ struct uri_auth *stats_set_desc(struct uri_auth **root, char *desc)
 	if ((u = stats_check_init_uri_auth(root)) == NULL)
 		goto out_u;
 
-	if (!stats_set_flag(root, STAT_SHDESC))
+	if (!stats_set_flag(root, STAT_F_SHDESC))
 		goto out_u;
 
 	if (desc_copy) {
@@ -308,6 +312,50 @@ struct uri_auth *stats_add_scope(struct uri_auth **root, char *scope)
 	free(u);
  out:
 	return NULL;
+}
+
+void stats_uri_auth_free(struct uri_auth *uri_auth)
+{
+	struct stat_scope *scope, *scopep;
+	struct stats_admin_rule *rule, *ruleb;
+
+	free(uri_auth->uri_prefix);
+	free(uri_auth->auth_realm);
+	free(uri_auth->node);
+	free(uri_auth->desc);
+
+	userlist_free(uri_auth->userlist);
+	free_act_rules(&uri_auth->http_req_rules);
+	list_for_each_entry_safe(rule, ruleb, &uri_auth->admin_rules, list) {
+		LIST_DELETE(&rule->list);
+		free_acl_cond(rule->cond);
+		free(rule);
+	}
+
+	scope = uri_auth->scope;
+	while (scope) {
+		scopep = scope;
+		scope = scope->next;
+		free(scopep->px_id);
+		free(scopep);
+	}
+
+	free(uri_auth);
+}
+
+void stats_uri_auth_drop(struct uri_auth *uri_auth)
+{
+	if (!uri_auth)
+		return;
+	if (HA_ATOMIC_SUB_FETCH(&uri_auth->refcount, 1) == 0)
+		stats_uri_auth_free(uri_auth);
+}
+
+void stats_uri_auth_take(struct uri_auth *uri_auth)
+{
+	if (!uri_auth)
+		return;
+	HA_ATOMIC_INC(&uri_auth->refcount);
 }
 
 /*

@@ -26,9 +26,11 @@
 
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
+#include <haproxy/arg-t.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/resolvers-t.h>
+#include <haproxy/sample-t.h>
 #include <haproxy/server-t.h>
 #include <haproxy/task.h>
 #include <haproxy/thread-t.h>
@@ -39,21 +41,29 @@
 __decl_thread(extern HA_SPINLOCK_T idle_conn_srv_lock);
 extern struct idle_conns idle_conns[MAX_THREADS];
 extern struct task *idle_conn_task;
-extern struct list servers_list;
+extern struct mt_list servers_list;
 extern struct dict server_key_dict;
 
 int srv_downtime(const struct server *s);
-int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
+void srv_settings_init(struct server *srv);
 void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl);
 int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, const struct proxy *defproxy, int parse_flags);
-int srv_update_addr(struct server *s, void *ip, int ip_sin_family, const char *updater);
-int server_parse_sni_expr(struct server *newsrv, struct proxy *px, char **err);
-const char *srv_update_addr_port(struct server *s, const char *addr, const char *port, char *updater);
+int srv_update_addr(struct server *s, void *ip, int ip_sin_family, struct server_inetaddr_updater updater);
+struct sample_expr *_parse_srv_expr(char *expr, struct arg_list *args_px,
+                                    const char *file, int linenum, char **err);
+int server_set_inetaddr(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater, struct buffer *msg);
+int server_set_inetaddr_warn(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater);
+void server_get_inetaddr(struct server *s, struct server_inetaddr *inetaddr);
+const char *srv_update_addr_port(struct server *s, const char *addr, const char *port, struct server_inetaddr_updater updater);
+const char *server_inetaddr_updater_by_to_str(enum server_inetaddr_updater_by by);
 const char *srv_update_check_addr_port(struct server *s, const char *addr, const char *port);
 const char *srv_update_agent_addr_port(struct server *s, const char *addr, const char *port);
-struct server *server_find_by_id(struct proxy *bk, int id);
-struct server *server_find_by_name(struct proxy *bk, const char *name);
+struct server *server_find_by_id_unique(struct proxy *bk, int id, uint32_t rid);
+struct server *server_find_by_name(struct proxy *px, const char *name);
+struct server *server_find_by_addr(struct proxy *px, const char *addr);
+struct server *server_find(struct proxy *bk, const char *name);
+struct server *server_find_unique(struct proxy *bk, const char *name, uint32_t rid);
 struct server *server_find_best_match(struct proxy *bk, char *name, int id, int *diff);
 void apply_server_state(void);
 void srv_compute_all_admin_states(struct proxy *px);
@@ -64,16 +74,16 @@ struct server *new_server(struct proxy *proxy);
 void srv_take(struct server *srv);
 struct server *srv_drop(struct server *srv);
 void srv_free_params(struct server *srv);
-int srv_init_per_thr(struct server *srv);
+int srv_init(struct server *srv);
 void srv_set_ssl(struct server *s, int use_ssl);
 const char *srv_adm_st_chg_cause(enum srv_adm_st_chg_cause cause);
 const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause);
 void srv_event_hdl_publish_check(struct server *srv, struct check *check);
+int srv_check_for_deletion(const char *bename, const char *svname, struct proxy **pb, struct server **ps, const char **pm);
 
 /* functions related to server name resolution */
 int srv_prepare_for_resolution(struct server *srv, const char *hostname);
-int srvrq_update_srv_status(struct server *s, int has_no_ip);
-int snr_update_srv_status(struct server *s, int has_no_ip);
+int srvrq_set_srv_down(struct server *s);
 int srv_set_fqdn(struct server *srv, const char *fqdn, int resolv_locked);
 const char *srv_update_fqdn(struct server *server, const char *fqdn, const char *updater, int dns_locked);
 int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *counters);
@@ -87,6 +97,7 @@ struct connection *srv_lookup_conn_next(struct connection *conn);
 
 void _srv_add_idle(struct server *srv, struct connection *conn, int is_safe);
 int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_safe);
+void srv_add_to_avail_list(struct server *srv, struct connection *conn);
 struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsigned int state);
 
 int srv_apply_track(struct server *srv, struct proxy *curproxy);
@@ -115,14 +126,6 @@ void server_recalc_eweight(struct server *sv, int must_update);
  */
 const char *server_parse_weight_change_request(struct server *sv,
 					       const char *weight_str);
-
-/*
- * Parses addr_str and configures sv accordingly. updater precise
- * the source of the change in the associated message log.
- * Returns NULL on success, error message string otherwise.
- */
-const char *server_parse_addr_change_request(struct server *sv,
-                                             const char *addr_str, const char *updater);
 
 /*
  * Parses maxconn_str and configures sv accordingly.
@@ -176,18 +179,34 @@ void srv_set_dyncookie(struct server *s);
 int srv_check_reuse_ws(struct server *srv);
 const struct mux_ops *srv_get_ws_proto(struct server *srv);
 
-/* increase the number of cumulated connections on the designated server */
+/* allocate a new server and return it (or NULL on failure). The structure is
+ * zeroed.
+ */
+static inline struct server *srv_alloc(void)
+{
+	return ha_aligned_zalloc_typed(1, struct server);
+}
+
+/* free a previously allocated server an nullifies the pointer */
+static inline void srv_free(struct server **srv_ptr)
+{
+	ha_aligned_free(*srv_ptr);
+	*srv_ptr = NULL;
+}
+
+/* increase the number of cumulated streams on the designated server */
 static inline void srv_inc_sess_ctr(struct server *s)
 {
-	_HA_ATOMIC_INC(&s->counters.cum_sess);
+	_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->cum_sess);
+	update_freq_ctr(&s->counters.shared.tg[tgid - 1]->sess_per_sec, 1);
 	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
-			     update_freq_ctr(&s->sess_per_sec, 1));
+	                     update_freq_ctr(&s->counters._sess_per_sec, 1));
 }
 
 /* set the time of last session on the designated server */
 static inline void srv_set_sess_last(struct server *s)
 {
-	s->counters.last_sess = ns_to_sec(now_ns);
+	HA_ATOMIC_STORE(&s->counters.shared.tg[tgid - 1]->last_sess,  ns_to_sec(now_ns));
 }
 
 /* returns the current server throttle rate between 0 and 100% */
@@ -313,8 +332,53 @@ static inline int srv_is_transparent(const struct server *srv)
 	/* A reverse server does not have any address but it is not used as a
 	 * transparent one.
 	 */
-	return (!is_addr(&srv->addr) && !(srv->flags & SRV_F_REVERSE)) ||
+	return (!is_addr(&srv->addr) && !(srv->flags & SRV_F_RHTTP)) ||
 	       (srv->flags & SRV_F_MAPPORTS);
+}
+
+/* Detach server from proxy list. It is supported to call this
+ * even if the server is not yet in the list
+ * Must be called under thread isolation or when it is safe to assume
+ * that the parent proxy doesn't is not skimming through the server list
+ */
+static inline void srv_detach(struct server *srv)
+{
+	struct proxy *px = srv->proxy;
+
+	if (px->srv == srv)
+		px->srv = srv->next;
+	else {
+		struct server *prev;
+
+		for (prev = px->srv; prev && prev->next != srv; prev = prev->next)
+			;
+
+		BUG_ON(!prev);
+
+		prev->next = srv->next;
+	}
+}
+
+/* Returns a pointer to the first server matching id <id> in backend <bk>.
+ * NULL is returned if no match is found.
+ */
+static inline struct server *server_find_by_id(struct proxy *bk, int id)
+{
+	struct eb32_node *eb32;
+
+	eb32 = eb32_lookup(&bk->conf.used_server_id, id);
+	return eb32 ? container_of(eb32, struct server, conf.id) : NULL;
+}
+
+
+static inline int srv_is_quic(const struct server *srv)
+{
+#ifdef USE_QUIC
+	return srv->addr_type.proto_type == PROTO_TYPE_DGRAM &&
+	       srv->addr_type.xprt_type == PROTO_TYPE_STREAM;
+#else
+	return 0;
+#endif
 }
 
 #endif /* _HAPROXY_SERVER_H */

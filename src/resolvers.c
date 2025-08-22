@@ -28,6 +28,7 @@
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
 #include <haproxy/dns.h>
+#include <haproxy/dns_ring.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/http_rules.h>
@@ -36,10 +37,10 @@
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/resolvers.h>
-#include <haproxy/ring.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/sock_inet.h>
 #include <haproxy/stats.h>
 #include <haproxy/stconn.h>
 #include <haproxy/task.h>
@@ -50,6 +51,10 @@
 #include <haproxy/vars.h>
 #include <haproxy/xxhash.h>
 
+#if defined(USE_PROMEX)
+#include <promex/promex.h>
+#endif
+
 
 struct list sec_resolvers  = LIST_HEAD_INIT(sec_resolvers);
 struct list resolv_srvrq_list = LIST_HEAD_INIT(resolv_srvrq_list);
@@ -59,12 +64,14 @@ static THREAD_LOCAL unsigned int recurse = 0; /* counter to track calls to publi
 static THREAD_LOCAL uint64_t resolv_query_id_seed = 0; /* random seed */
 struct resolvers *curr_resolvers = NULL;
 
-DECLARE_STATIC_POOL(resolv_answer_item_pool, "resolv_answer_item", sizeof(struct resolv_answer_item));
-DECLARE_STATIC_POOL(resolv_resolution_pool,  "resolv_resolution",  sizeof(struct resolv_resolution));
-DECLARE_POOL(resolv_requester_pool,  "resolv_requester",  sizeof(struct resolv_requester));
+DECLARE_STATIC_TYPED_POOL(resolv_answer_item_pool, "resolv_answer_item", struct resolv_answer_item);
+DECLARE_STATIC_TYPED_POOL(resolv_resolution_pool,  "resolv_resolution",  struct resolv_resolution);
+DECLARE_TYPED_POOL(resolv_requester_pool,  "resolv_requester",  struct resolv_requester);
 
 static unsigned int resolution_uuid = 1;
 unsigned int resolv_failed_resolutions = 0;
+uint resolv_accept_families = RSLV_AUTO_FAMILY;
+
 struct task *process_resolvers(struct task *t, void *context, unsigned int state);
 static void resolv_free_resolution(struct resolv_resolution *resolution);
 static void _resolv_unlink_resolution(struct resolv_requester *requester);
@@ -92,7 +99,7 @@ enum {
 	RSLV_STAT_END,
 };
 
-static struct name_desc resolv_stats[] = {
+static struct stat_col resolv_stats[] = {
 	[RSLV_STAT_ID]          = { .name = "id",          .desc = "ID" },
 	[RSLV_STAT_PID]         = { .name = "pid",         .desc = "Parent ID" },
 	[RSLV_STAT_SENT]        = { .name = "sent",        .desc = "Sent" },
@@ -114,26 +121,79 @@ static struct name_desc resolv_stats[] = {
 
 static struct dns_counters dns_counters;
 
-static void resolv_fill_stats(void *d, struct field *stats)
+static int resolv_fill_stats(void *d, struct field *stats, unsigned int *selected_field)
 {
 	struct dns_counters *counters = d;
-	stats[RSLV_STAT_ID]          = mkf_str(FO_CONFIG, counters->id);
-	stats[RSLV_STAT_PID]         = mkf_str(FO_CONFIG, counters->pid);
-	stats[RSLV_STAT_SENT]        = mkf_u64(FN_GAUGE, counters->sent);
-	stats[RSLV_STAT_SND_ERROR]   = mkf_u64(FN_GAUGE, counters->snd_error);
-	stats[RSLV_STAT_VALID]       = mkf_u64(FN_GAUGE, counters->app.resolver.valid);
-	stats[RSLV_STAT_UPDATE]      = mkf_u64(FN_GAUGE, counters->app.resolver.update);
-	stats[RSLV_STAT_CNAME]       = mkf_u64(FN_GAUGE, counters->app.resolver.cname);
-	stats[RSLV_STAT_CNAME_ERROR] = mkf_u64(FN_GAUGE, counters->app.resolver.cname_error);
-	stats[RSLV_STAT_ANY_ERR]     = mkf_u64(FN_GAUGE, counters->app.resolver.any_err);
-	stats[RSLV_STAT_NX]          = mkf_u64(FN_GAUGE, counters->app.resolver.nx);
-	stats[RSLV_STAT_TIMEOUT]     = mkf_u64(FN_GAUGE, counters->app.resolver.timeout);
-	stats[RSLV_STAT_REFUSED]     = mkf_u64(FN_GAUGE, counters->app.resolver.refused);
-	stats[RSLV_STAT_OTHER]       = mkf_u64(FN_GAUGE, counters->app.resolver.other);
-	stats[RSLV_STAT_INVALID]     = mkf_u64(FN_GAUGE, counters->app.resolver.invalid);
-	stats[RSLV_STAT_TOO_BIG]     = mkf_u64(FN_GAUGE, counters->app.resolver.too_big);
-	stats[RSLV_STAT_TRUNCATED]   = mkf_u64(FN_GAUGE, counters->app.resolver.truncated);
-	stats[RSLV_STAT_OUTDATED]    = mkf_u64(FN_GAUGE, counters->app.resolver.outdated);
+	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
+
+	for (; current_field < RSLV_STAT_END; current_field++) {
+		struct field metric = { 0 };
+
+		switch (current_field) {
+		case RSLV_STAT_ID:
+			metric = mkf_str(FO_CONFIG, counters->id);
+			break;
+		case RSLV_STAT_PID:
+			metric = mkf_str(FO_CONFIG, counters->pid);
+			break;
+		case RSLV_STAT_SENT:
+			metric = mkf_u64(FN_GAUGE, counters->sent);
+			break;
+		case RSLV_STAT_SND_ERROR:
+			metric = mkf_u64(FN_GAUGE, counters->snd_error);
+			break;
+		case RSLV_STAT_VALID:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.valid);
+			break;
+		case RSLV_STAT_UPDATE:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.update);
+			break;
+		case RSLV_STAT_CNAME:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.cname);
+			break;
+		case RSLV_STAT_CNAME_ERROR:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.cname_error);
+			break;
+		case RSLV_STAT_ANY_ERR:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.any_err);
+			break;
+		case RSLV_STAT_NX:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.nx);
+			break;
+		case RSLV_STAT_TIMEOUT:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.timeout);
+			break;
+		case RSLV_STAT_REFUSED:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.refused);
+			break;
+		case RSLV_STAT_OTHER:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.other);
+			break;
+		case RSLV_STAT_INVALID:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.invalid);
+			break;
+		case RSLV_STAT_TOO_BIG:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.too_big);
+			break;
+		case RSLV_STAT_TRUNCATED:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.truncated);
+			break;
+		case RSLV_STAT_OUTDATED:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.outdated);
+			break;
+		default:
+			/* not used for frontends. If a specific metric
+			 * is requested, return an error. Otherwise continue.
+			 */
+			if (selected_field != NULL)
+				return 0;
+			continue;
+		}
+		stats[current_field] = metric;
+		if (selected_field != NULL)
+			break;
+	}
+	return 1;
 }
 
 static struct stats_module rslv_stats_module = {
@@ -156,6 +216,23 @@ struct show_resolvers_ctx {
 	struct dns_nameserver *ns;
 };
 
+/* returns the currently accepted address families as a combination of
+ * RSLV_ACCEPT_IPV4 and RSLV_ACCEPT_IPV6 only. It will dynamically adapt adapt
+ * the IPv6 status to sock_inet6_seems_reachable if RSLV_AUTO_FAMILY is set,
+ * otherwise returns the relevant bits of resolv_accept_families.
+ */
+static inline int resolv_active_families(void)
+{
+	if (resolv_accept_families & RSLV_AUTO_FAMILY) {
+		/* Let's adjust our default resolver families based on apparent IPv6 connectivity */
+		if (is_inet6_reachable())
+			return RSLV_ACCEPT_IPV4 | RSLV_ACCEPT_IPV6;
+		else
+			return RSLV_ACCEPT_IPV4;
+	}
+	return resolv_accept_families & RSLV_ACCEPT_MASK;
+}
+
 /* Returns a pointer to the resolvers matching the id <id>. NULL is returned if
  * no match is found.
  */
@@ -166,6 +243,20 @@ struct resolvers *find_resolvers_by_id(const char *id)
 	list_for_each_entry(res, &sec_resolvers, list) {
 		if (strcmp(res->id, id) == 0)
 			return res;
+	}
+	return NULL;
+}
+
+/* Returns a pointer to the nameserver matching numerical <id> within <parent>
+ * resolver section. NULL is returned if no match is found.
+ */
+struct dns_nameserver *find_nameserver_by_resolvers_and_id(struct resolvers *parent, unsigned int id)
+{
+	struct dns_nameserver *ns;
+
+	list_for_each_entry(ns, &parent->nameservers, list) {
+		if (ns->puid == id)
+			return ns;
 	}
 	return NULL;
 }
@@ -645,18 +736,22 @@ static void leave_resolver_code()
  */
 static void resolv_srvrq_cleanup_srv(struct server *srv)
 {
+	struct server_inetaddr srv_addr;
+
 	_resolv_unlink_resolution(srv->resolv_requester);
 	HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
-	srvrq_update_srv_status(srv, 1);
+	srvrq_set_srv_down(srv);
+
+	ebpt_delete(&srv->host_dn);
+	srv->host_dn.key = NULL;
+
 	ha_free(&srv->hostname);
 	ha_free(&srv->hostname_dn);
 	srv->hostname_dn_len = 0;
-	memset(&srv->addr, 0, sizeof(srv->addr));
-	srv->svc_port = 0;
+	memset(&srv_addr, 0, sizeof(srv_addr));
+	/* unset server's addr AND port */
+	server_set_inetaddr(srv, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	srv->flags |= SRV_F_NO_RESOLUTION;
-
-	ebpt_delete(&srv->host_dn);
-	ha_free(&srv->host_dn.key);
 
 	HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	LIST_DEL_INIT(&srv->srv_rec_item);
@@ -762,7 +857,7 @@ static void resolv_check_response(struct resolv_resolution *res)
 
 				/* convert the key to lookup in lower case */
 				for (i = 0 ; item->data.target[i] ; i++)
-					target[i] = tolower(item->data.target[i]);
+					target[i] = tolower((unsigned char)item->data.target[i]);
 				target[i] = 0;
 
 				node = ebis_lookup(&srvrq->named_servers, target);
@@ -779,7 +874,7 @@ static void resolv_check_response(struct resolv_resolution *res)
 						if (srv->svc_port == item->port) {
 							/* server found, we remove it from tree */
 							ebpt_delete(node);
-							ha_free(&srv->host_dn.key);
+							srv->host_dn.key = NULL;
 							goto srv_found;
 						}
 
@@ -815,12 +910,16 @@ static void resolv_check_response(struct resolv_resolution *res)
 srv_found:
 			/* And update this server, if found (srv is locked here) */
 			if (srv) {
+				struct server_inetaddr srv_addr;
+				uint8_t ip_change = 0;
+
 				/* re-enable DNS resolution for this server by default */
 				srv->flags &= ~SRV_F_NO_RESOLUTION;
 				srv->srvrq_check->expire = TICK_ETERNITY;
 
-				srv->svc_port = item->port;
-				srv->flags   &= ~SRV_F_MAPPORTS;
+				server_get_inetaddr(srv, &srv_addr);
+				srv_addr.port.svc = item->port;
+				srv_addr.port.map = 0;
 
 				/* Check if an Additional Record is associated to this SRV record.
 				 * Perform some sanity checks too to ensure the record can be used.
@@ -833,10 +932,12 @@ srv_found:
 
 					switch (item->ar_item->type) {
 						case DNS_RTYPE_A:
-							srv_update_addr(srv, &item->ar_item->data.in4.sin_addr, AF_INET, "DNS additional record");
+							srv_addr.family = AF_INET;
+							srv_addr.addr.v4 = item->ar_item->data.in4.sin_addr;
 						break;
 						case DNS_RTYPE_AAAA:
-							srv_update_addr(srv, &item->ar_item->data.in6.sin6_addr, AF_INET6, "DNS additional record");
+							srv_addr.family = AF_INET6;
+							srv_addr.addr.v6 = item->ar_item->data.in6.sin6_addr;
 						break;
 					}
 
@@ -846,7 +947,14 @@ srv_found:
 					 * It is usless to perform an extra resolution
 					 */
 					_resolv_unlink_resolution(srv->resolv_requester);
+
+					ip_change = 1;
 				}
+
+				if (ip_change)
+					server_set_inetaddr_warn(srv, &srv_addr, SERVER_INETADDR_UPDATER_DNS_AR);
+				else
+					server_set_inetaddr(srv, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 
 				if (!srv->hostname_dn) {
 					const char *msg = NULL;
@@ -872,9 +980,6 @@ srv_found:
 					if (!srv->resolv_requester || !srv->resolv_requester->resolution)
 						resolv_link_resolution(srv, OBJ_TYPE_SERVER, 1);
 				}
-
-				/* Update the server status */
-				srvrq_update_srv_status(srv, (srv->addr.ss_family != AF_INET && srv->addr.ss_family != AF_INET6));
 
 				if (!srv->resolv_opts.ignore_weight) {
 					char weight[9];
@@ -1548,11 +1653,11 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 		unsigned char ip_type;
 
 		record = eb32_entry(eb32, typeof(*record), link);
-		if (record->type == DNS_RTYPE_A) {
+		if (record->type == DNS_RTYPE_A && (resolv_active_families() & RSLV_ACCEPT_IPV4)) {
 			ip_type = AF_INET;
 			ip = &record->data.in4.sin_addr;
 		}
-		else if (record->type == DNS_RTYPE_AAAA) {
+		else if (record->type == DNS_RTYPE_AAAA && (resolv_active_families() & RSLV_ACCEPT_IPV6)) {
 			ip_type = AF_INET6;
 			ip = &record->data.in6.sin6_addr;
 		}
@@ -1726,7 +1831,7 @@ int resolv_dn_label_to_str(const char *dn, int dn_len, char *str, int str_len)
 			*ptr++ = '.';
 		/* copy the string at i+1 to lower case */
 		for (; sz > 0; sz--)
-			*(ptr++) = tolower(dn[++i]);
+			*(ptr++) = tolower((unsigned char)dn[++i]);
 	}
 	*ptr++ = '\0';
 	return (ptr - str);
@@ -1766,7 +1871,7 @@ int resolv_str_to_dn_label(const char *str, int str_len, char *dn, int dn_len)
 			offset = i+1;
 			continue;
 		}
-		dn[i+1] = tolower(str[i]);
+		dn[i+1] = tolower((unsigned char)str[i]);
 	}
 	dn[offset] = i - offset;
 	dn[i+1] = '\0';
@@ -1983,9 +2088,12 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 			hostname_dn     = &srv->hostname_dn;
 			hostname_dn_len = srv->hostname_dn_len;
 			resolvers       = srv->resolvers;
-			query_type      = ((srv->resolv_opts.family_prio == AF_INET)
+
+			query_type      = !(resolv_active_families() & RSLV_ACCEPT_IPV6) ? DNS_RTYPE_A :
+			                  !(resolv_active_families() & RSLV_ACCEPT_IPV4) ? DNS_RTYPE_AAAA :
+			                  (srv->resolv_opts.family_prio == AF_INET)
 					   ? DNS_RTYPE_A
-					   : DNS_RTYPE_AAAA);
+					   : DNS_RTYPE_AAAA;
 			break;
 
 		case OBJ_TYPE_SRVRQ:
@@ -2017,9 +2125,12 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 			hostname_dn     = &stream->resolv_ctx.hostname_dn;
 			hostname_dn_len = stream->resolv_ctx.hostname_dn_len;
 			resolvers       = stream->resolv_ctx.parent->arg.resolv.resolvers;
-			query_type      = ((stream->resolv_ctx.parent->arg.resolv.opts->family_prio == AF_INET)
+
+			query_type      = !(resolv_active_families() & RSLV_ACCEPT_IPV6) ? DNS_RTYPE_A :
+			                  !(resolv_active_families() & RSLV_ACCEPT_IPV4) ? DNS_RTYPE_AAAA :
+			                  (stream->resolv_ctx.parent->arg.resolv.opts->family_prio == AF_INET)
 					   ? DNS_RTYPE_A
-					   : DNS_RTYPE_AAAA);
+					   : DNS_RTYPE_AAAA;
 			break;
 		default:
 			goto err;
@@ -2249,7 +2360,7 @@ static int resolv_process_responses(struct dns_nameserver *ns)
 				if (!res->try)
 					goto report_res_error;
 			}
-			else {
+			else if (resolv_active_families() == (RSLV_ACCEPT_IPV4 | RSLV_ACCEPT_IPV6)) {
 				/* Fallback from A to AAAA or the opposite and re-send
 				 * the resolution immediately. try counter is not
 				 * decremented. */
@@ -2378,9 +2489,11 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 				/* Fallback from A to AAAA or the opposite and re-send
 				 * the resolution immediately. try counter is not
 				 * decremented. */
-				if (res->prefered_query_type == DNS_RTYPE_A)
+				if (res->prefered_query_type == DNS_RTYPE_A &&
+				    (resolv_active_families() & RSLV_ACCEPT_IPV6))
 					res->query_type = DNS_RTYPE_AAAA;
-				else if (res->prefered_query_type == DNS_RTYPE_AAAA)
+				else if (res->prefered_query_type == DNS_RTYPE_AAAA &&
+				         (resolv_active_families() & RSLV_ACCEPT_IPV4))
 					res->query_type = DNS_RTYPE_A;
 				else
 					res->try--;
@@ -2447,7 +2560,7 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 		if (resolv_run_resolution(res) != 1) {
 			res->last_resolution = now_ms;
 			LIST_DEL_INIT(&res->list);
-			LIST_APPEND(&resolvers->resolutions.wait, &res->list);
+			LIST_INSERT(&resolvers->resolutions.wait, &res->list);
 		}
 	}
 
@@ -2487,11 +2600,11 @@ static void resolvers_destroy(struct resolvers *resolvers)
 				fd_delete(ns->dgram->conn.t.sock.fd);
 				close(ns->dgram->conn.t.sock.fd);
 			}
-			ring_free(ns->dgram->ring_req);
+			dns_ring_free(ns->dgram->ring_req);
 			free(ns->dgram);
 		}
 		if (ns->stream) {
-			ring_free(ns->stream->ring_req);
+			dns_ring_free(ns->stream->ring_req);
 			task_destroy(ns->stream->task_req);
 			task_destroy(ns->stream->task_rsp);
 			free(ns->stream);
@@ -2549,6 +2662,7 @@ static void resolvers_deinit(void)
  */
 static int resolvers_finalize_config(void)
 {
+	const struct protocol *proto;
 	struct resolvers *resolvers;
 	struct proxy	     *px;
 	int err_code = 0;
@@ -2566,10 +2680,14 @@ static int resolvers_finalize_config(void)
 
 			if (ns->dgram) {
 				/* Check nameserver info */
-				if ((fd = socket(ns->dgram->conn.addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-					ha_alert("resolvers '%s': can't create socket for nameserver '%s'.\n",
-						 resolvers->id, ns->id);
-					err_code |= (ERR_ALERT|ERR_ABORT);
+				proto = protocol_lookup(ns->dgram->conn.addr.to.ss_family, PROTO_TYPE_DGRAM, 1);
+				BUG_ON(!proto);
+				if ((fd = socket(proto->fam->sock_domain, proto->sock_type, proto->sock_prot)) == -1) {
+					if (!resolvers->conf.implicit) {  /* emit a warning only if it was configured manually */
+						ha_alert("resolvers '%s': can't create socket for nameserver '%s'.\n",
+							 resolvers->id, ns->id);
+						err_code |= (ERR_ALERT|ERR_ABORT);
+					}
 					continue;
 				}
 				if (connect(fd, (struct sockaddr*)&ns->dgram->conn.addr.to, get_addr_len(&ns->dgram->conn.addr.to)) == -1) {
@@ -2682,14 +2800,15 @@ static int stats_dump_resolv_to_buffer(struct stconn *sc,
 	list_for_each_entry(mod, stat_modules, list) {
 		struct counters_node *counters = EXTRA_COUNTERS_GET(ns->extra_counters, mod);
 
-		mod->fill_stats(counters, stats + idx);
+		if (!mod->fill_stats(counters, stats + idx, NULL))
+			continue;
 		idx += mod->stats_count;
 	}
 
 	if (!stats_dump_one_line(stats, idx, appctx))
 		return 0;
 
-	if (!stats_putchk(appctx, NULL))
+	if (!stats_putchk(appctx, NULL, NULL))
 		goto full;
 
 	return 1;
@@ -2795,6 +2914,7 @@ int resolv_allocate_counters(struct list *stat_modules)
 				if (strcmp(mod->name, "resolvers") == 0) {
 					ns->counters = (struct dns_counters *)ns->extra_counters->data + mod->counters_off[COUNTERS_RSLV];
 					ns->counters->id = ns->id;
+					ns->counters->ns_puid = ns->puid;
 					ns->counters->pid = resolvers->id;
 				}
 			}
@@ -3236,10 +3356,14 @@ int check_action_do_resolve(struct act_rule *rule, struct proxy *px, char **err)
 
 void resolvers_setup_proxy(struct proxy *px)
 {
-	px->last_change = ns_to_sec(now_ns);
-	px->cap = PR_CAP_FE | PR_CAP_BE;
 	px->maxconn = 0;
 	px->conn_retries = 1;
+	px->conn_retries = 1; /* FIXME ignored since 91e785ed
+	                       * ("MINOR: stream: Rely on a per-stream max connection retries value")
+	                       * If this is really expected this should be set on the stream directly
+	                       * because the proxy is not part of the main proxy list and thus
+	                       * lacks the required post init for this setting to be considered
+	                       */
 	px->timeout.server = TICK_ETERNITY;
 	px->timeout.client = TICK_ETERNITY;
 	px->timeout.connect = 1000; // by default same than timeout.resolve
@@ -3369,7 +3493,9 @@ static int parse_resolve_conf(char **errmsg, char **warnmsg)
 		newnameserver->parent = curr_resolvers;
 		newnameserver->process_responses = resolv_process_responses;
 		newnameserver->conf.line = resolv_linenum;
+		newnameserver->puid = curr_resolvers->nb_nameservers;
 		LIST_APPEND(&curr_resolvers->nameservers, &newnameserver->list);
+		curr_resolvers->nb_nameservers++;
 	}
 
 resolv_out:
@@ -3385,6 +3511,7 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 {
 	struct resolvers *r = NULL;
 	struct proxy *p = NULL;
+	char *errmsg = NULL;
 	int err_code = 0;
 
 	if ((r = calloc(1, sizeof(*r))) == NULL) {
@@ -3393,25 +3520,32 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	}
 
 	/* allocate new proxy to tcp servers */
-	p = calloc(1, sizeof *p);
+	p = alloc_new_proxy(id, PR_CAP_FE | PR_CAP_BE, &errmsg);
 	if (!p) {
+		ha_free(&errmsg); // ignored
 		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
+		goto err_free_r;
 	}
 
-	init_new_proxy(p);
 	resolvers_setup_proxy(p);
 	p->parent = r;
-	p->id = strdup(id);
-	p->conf.args.file = p->conf.file = strdup(file);
+	p->conf.args.file = p->conf.file = copy_file_name(file);
 	p->conf.args.line = p->conf.line = linenum;
 	r->px = p;
 
 	/* default values */
 	LIST_APPEND(&sec_resolvers, &r->list);
 	r->conf.file = strdup(file);
+	if (!r->conf.file) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_p;
+	}
 	r->conf.line = linenum;
 	r->id = strdup(id);
+	if (!r->id) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_conf_file;
+	}
 	r->query_ids = EB_ROOT;
 	/* default maximum response size */
 	r->accepted_payload_size = 512;
@@ -3426,6 +3560,7 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	r->timeout.resolve = 1000;
 	r->timeout.retry   = 1000;
 	r->resolve_retries = 3;
+	r->nb_nameservers = 0;
 	LIST_INIT(&r->nameservers);
 	LIST_INIT(&r->resolutions.curr);
 	LIST_INIT(&r->resolutions.wait);
@@ -3434,11 +3569,15 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	*resolvers = r;
 
 out:
-	if (err_code & (ERR_FATAL|ERR_ABORT)) {
-		ha_free(&r);
-		ha_free(&p);
-	}
+	return err_code;
 
+/* free all allocated stuff and return err_code */
+err_free_conf_file:
+	ha_free((void **)&r->conf.file);
+err_free_p:
+	free_proxy(p);
+err_free_r:
+	ha_free(&r);
 	return err_code;
 }
 
@@ -3521,8 +3660,9 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			}
 		}
 
-		sk = str2sa_range(args[2], NULL, &port1, &port2, NULL, &proto,
-		                  &errmsg, NULL, NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_DGRAM | PA_O_STREAM | PA_O_DEFAULT_DGRAM);
+		sk = str2sa_range(args[2], NULL, &port1, &port2, NULL, &proto, NULL,
+		                  &errmsg, NULL, NULL, NULL,
+		                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_DGRAM | PA_O_STREAM | PA_O_DEFAULT_DGRAM);
 		if (!sk) {
 			ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -3570,8 +3710,10 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 		newnameserver->parent = curr_resolvers;
 		newnameserver->process_responses = resolv_process_responses;
 		newnameserver->conf.line = linenum;
+		newnameserver->puid = curr_resolvers->nb_nameservers;
 		/* the nameservers are linked backward first */
 		LIST_APPEND(&curr_resolvers->nameservers, &newnameserver->list);
+		curr_resolvers->nb_nameservers++;
 	}
 	else if (strcmp(args[0], "parse-resolv-conf") == 0) {
 		err_code |= parse_resolve_conf(&errmsg, &warnmsg);
@@ -3636,6 +3778,12 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		if (warn_if_lower(args[2], 100)) {
+			ha_alert("parsing [%s:%d] : '%s %s %u' looks suspiciously small for a value in milliseconds."
+				 " Please use an explicit unit ('%ums') if that was the intent.\n",
+				 file, linenum, args[0], args[1], time, time);
+			err_code |= ERR_WARN;
+		}
 	}
 	else if (strcmp(args[0], "accepted_payload_size") == 0) {
 		int i = 0;
@@ -3716,6 +3864,12 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 				curr_resolvers->px->timeout.connect = tout;
 			}
 
+			if (warn_if_lower(args[2], 100)) {
+				ha_alert("parsing [%s:%d] : '%s %s %u' looks suspiciously small for a value in milliseconds."
+					 " Please use an explicit unit ('%ums') if that was the intent.\n",
+					 file, linenum, args[0], args[1], tout, tout);
+				err_code |= ERR_WARN;
+			}
 		}
 		else {
 			ha_alert("parsing [%s:%d] : '%s' expects 'retry' or 'resolve' and <time> as arguments got '%s'.\n",
@@ -3742,14 +3896,15 @@ out:
  */
 int resolvers_create_default()
 {
-	int err_code = 0;
+	int err_code = ERR_NONE;
 
-	if (global.mode & MODE_MWORKER_WAIT) /* does not create the section if in wait mode */
-		return 0;
+	/* does not create the section if in master process */
+	if (master)
+		return ERR_NONE;
 
 	/* if the section already exists, do nothing */
 	if (find_resolvers_by_id("default"))
-		return 0;
+		return ERR_NONE;
 
 	curr_resolvers = NULL;
 	err_code |= resolvers_new(&curr_resolvers, "default", "<internal>", 0);
@@ -3775,7 +3930,7 @@ err:
 
 	/* we never return an error there, we only try to create this section
 	 * if that's possible */
-	return 0;
+	return ERR_NONE;
 }
 
 int cfg_post_parse_resolvers()
@@ -3805,7 +3960,135 @@ int cfg_post_parse_resolvers()
 	return err_code;
 }
 
+/* config parser for global "dns-accept-family", accepts "ipv4", "ipv6" or both delimited by a comma */
+static int cfg_parse_dns_accept_family(char **args, int section_type, struct proxy *curpx,
+                                       const struct proxy *defpx, const char *file, int line,
+                                       char **err)
+{
+	char *arg, *comma;
+	int accept_families = 0;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (!args[1][0])
+		goto usage;
+
+	for (arg = args[1]; arg && *arg; arg = comma) {
+		comma = strchr(arg, ',');
+		if (comma)
+			*(comma++) = 0;
+
+		if (strcmp(arg, "ipv4") == 0)
+			accept_families |= RSLV_ACCEPT_IPV4;
+		else if (strcmp(arg, "ipv6") == 0)
+			accept_families |= RSLV_ACCEPT_IPV6;
+		else if (strcmp(arg, "auto") == 0)
+			accept_families |= RSLV_AUTO_FAMILY;
+		else
+			goto usage;
+	}
+
+	/* we ignore the settings if it was forced on the cmdline, but we still
+	 * parse it for config validity checks.
+	 */
+	if (!(resolv_accept_families & RSLV_FORCED_FAMILY))
+		resolv_accept_families = accept_families;
+	return 0;
+ usage:
+	memprintf(err, "'%s' expects a comma-delimited list of 'ipv4' and 'ipv6' but got '%s'.", args[0], args[1]);
+	return -1;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "dns-accept-family",      cfg_parse_dns_accept_family   },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+
 REGISTER_CONFIG_SECTION("resolvers",      cfg_parse_resolvers, cfg_post_parse_resolvers);
 REGISTER_POST_DEINIT(resolvers_deinit);
 REGISTER_CONFIG_POSTPARSER("dns runtime resolver", resolvers_finalize_config);
 REGISTER_PRE_CHECK(resolvers_create_default);
+
+#if defined(USE_PROMEX)
+
+static int rslv_promex_metric_info(unsigned int id, struct promex_metric *metric, struct ist *desc)
+{
+	if (id >= RSLV_STAT_END)
+		return -1;
+	if (id == RSLV_STAT_ID  || id == RSLV_STAT_PID)
+		return 0;
+
+	*metric = (struct promex_metric){ .n = ist(resolv_stats[id].name), .type = PROMEX_MT_GAUGE, .flags = PROMEX_FL_MODULE_METRIC };
+	*desc = ist(resolv_stats[id].desc);
+	return 1;
+}
+
+static void *rslv_promex_start_ts(void *unused, unsigned int id)
+{
+	struct resolvers *resolver;
+
+	if (LIST_ISEMPTY(&sec_resolvers))
+		return NULL;
+
+	/* Find the first resolvers with at least one nameserver */
+	list_for_each_entry(resolver, &sec_resolvers, list) {
+		if (LIST_ISEMPTY(&resolver->nameservers))
+			continue;
+		return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+	}
+	return NULL;
+}
+
+static void *rslv_promex_next_ts(void *unused, void *metric_ctx, unsigned int id)
+{
+	struct dns_nameserver *ns = metric_ctx;
+	struct resolvers *resolver = ns->parent;
+
+	ns = LIST_NEXT(&ns->list, struct dns_nameserver *, list);
+	if (&ns->list == &resolver->nameservers) {
+		/* Find the next resolver with at least on nameserver */
+		resolver = LIST_NEXT(&resolver->list, struct resolvers *, list);
+		list_for_each_entry_from(resolver, &sec_resolvers, list) {
+			if (LIST_ISEMPTY(&resolver->nameservers))
+				continue;
+			return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+		}
+		ns = NULL;
+	}
+	return ns;
+}
+
+static int rslv_promex_fill_ts(void *unused, void *metric_ctx, unsigned int id, struct promex_label *labels, struct field *field)
+{
+	struct dns_nameserver *ns = metric_ctx;
+	struct resolvers *resolver = ns->parent;
+	struct field stats[RSLV_STAT_END];
+	int ret;
+
+	labels[0].name  = ist("resolver");
+	labels[0].value = ist(resolver->id);
+	labels[1].name  = ist("nameserver");
+	labels[1].value = ist(ns->id);
+
+	ret = resolv_fill_stats(ns->counters, stats, &id);
+	if (ret == 1)
+		*field = stats[id];
+	return ret;
+}
+
+static struct promex_module promex_resolver_module = {
+	.name        = IST("resolver"),
+	.metric_info = rslv_promex_metric_info,
+	.start_ts    = rslv_promex_start_ts,
+	.next_ts     = rslv_promex_next_ts,
+	.fill_ts     = rslv_promex_fill_ts,
+	.nb_metrics  = RSLV_STAT_END,
+};
+
+INITCALL1(STG_REGISTER, promex_register_module, &promex_resolver_module);
+
+#endif

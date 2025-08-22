@@ -6,7 +6,6 @@ feature ignore_unknown_macro
 # The first health-checks passed tests are checked for all these servers
 # thanks to syslog messages.
 
-#REQUIRE_VERSION=2.4
 #EXCLUDE_TARGETS=freebsd
 #REGTEST_TYPE=slow
 
@@ -57,6 +56,11 @@ server s38 {} -start
 server s39 {} -start
 
 haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
     defaults
         timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
         timeout server "${HAPROXY_TEST_TIMEOUT-5s}"

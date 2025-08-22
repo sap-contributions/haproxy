@@ -15,9 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
 
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
@@ -28,9 +29,12 @@
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
+#include <haproxy/obj_type.h>
 #include <haproxy/pool.h>
+#include <haproxy/protocol-t.h>
 #include <haproxy/proto_quic.h>
 #include <haproxy/proxy-t.h>
+#include <haproxy/quic_cid.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_rx.h>
 #include <haproxy/quic_sock.h>
@@ -43,7 +47,7 @@
 #include <haproxy/tools.h>
 #include <haproxy/trace.h>
 
-/* Log only first EACCES bind() error runtime occurence. */
+/* Log only first EACCES bind() error runtime occurrence. */
 static volatile char quic_bind_eacces_warn = 0;
 
 /* Retrieve a connection's source address. Returns -1 on failure. */
@@ -83,13 +87,13 @@ int quic_sock_get_dst(struct connection *conn, struct sockaddr *addr, socklen_t 
 		memcpy(addr, &qc->peer_addr, len);
 	} else {
 		struct sockaddr_storage *from;
+		struct listener *l = objt_listener(qc->target);
 
 		/* Return listener address if IP_PKTINFO or friends are not
 		 * supported by the socket.
 		 */
-		BUG_ON(!qc->li);
-		from = is_addr(&qc->local_addr) ? &qc->local_addr :
-		                                  &qc->li->rx.addr;
+		BUG_ON(!l);
+		from = is_addr(&qc->local_addr) ? &qc->local_addr : &l->rx.addr;
 		if (len > sizeof(*from))
 			len = sizeof(*from);
 		memcpy(addr, from, len);
@@ -158,7 +162,15 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 
  done:
 	*status = CO_AC_DONE;
-	return qc ? qc->conn : NULL;
+
+	if (qc) {
+		BUG_ON(l->rx.quic_curr_accept <= 0);
+		HA_ATOMIC_DEC(&l->rx.quic_curr_accept);
+		return qc->conn;
+	}
+	else {
+		return NULL;
+	}
 
  err:
 	/* in case of error reinsert the element to process it later. */
@@ -199,6 +211,48 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 	return t;
 }
 
+/* Retrieve the DCID from a QUIC datagram or packet at <pos> position,
+ * <end> being at one byte past the end of this datagram.
+ * Returns 1 if succeeded, 0 if not.
+ */
+static int quic_get_dgram_dcid(unsigned char *pos, const unsigned char *end,
+                               unsigned char **dcid, size_t *dcid_len)
+{
+	int ret = 0, long_header;
+	size_t minlen, skip;
+
+	TRACE_ENTER(QUIC_EV_CONN_RXPKT);
+
+	if (!(*pos & QUIC_PACKET_FIXED_BIT)) {
+		TRACE_PROTO("fixed bit not set", QUIC_EV_CONN_RXPKT);
+		goto err;
+	}
+
+	long_header = *pos & QUIC_PACKET_LONG_HEADER_BIT;
+	minlen = long_header ? QUIC_LONG_PACKET_MINLEN :
+		QUIC_SHORT_PACKET_MINLEN + QUIC_HAP_CID_LEN + QUIC_TLS_TAG_LEN;
+	skip = long_header ? QUIC_LONG_PACKET_DCID_OFF : QUIC_SHORT_PACKET_DCID_OFF;
+	if (end - pos < minlen)
+		goto err;
+
+	pos += skip;
+	*dcid_len = long_header ? *pos++ : QUIC_HAP_CID_LEN;
+	if (*dcid_len > QUIC_CID_MAXLEN || end - pos <= *dcid_len)
+		goto err;
+
+	*dcid = pos;
+
+	ret = 1;
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_RXPKT);
+	return ret;
+
+ err:
+	TRACE_PROTO("wrong datagram", QUIC_EV_CONN_RXPKT);
+	goto leave;
+}
+
+
 /* Retrieve the DCID from the datagram found at <pos> position and deliver it to the
  * correct datagram handler.
  * Return 1 if a correct datagram could be found, 0 if not.
@@ -232,6 +286,7 @@ static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner
 	}
 
 	/* All the members must be initialized! */
+	dgram->obj_type = OBJ_TYPE_DGRAM;
 	dgram->owner = owner;
 	dgram->buf = pos;
 	dgram->len = len;
@@ -240,6 +295,7 @@ static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner
 	dgram->saddr = *saddr;
 	dgram->daddr = *daddr;
 	dgram->qc = NULL;
+	dgram->flags = 0;
 
 	/* Attached datagram to its quic_receiver_buf and quic_dghdlrs. */
 	LIST_APPEND(dgrams, &dgram->recv_list);
@@ -286,8 +342,8 @@ static struct quic_dgram *quic_rxbuf_purge_dgrams(struct quic_receiver_buf *rbuf
 	return prev;
 }
 
-/* Receive data from datagram socket <fd>. Data are placed in <out> buffer of
- * length <len>.
+/* Receive a single message from datagram socket <fd>. Data are placed in <out>
+ * buffer of length <len>.
  *
  * Datagram addresses will be returned via the next arguments. <from> will be
  * the peer address and <to> the reception one. Note that <to> can only be
@@ -295,12 +351,16 @@ static struct quic_dgram *quic_rxbuf_purge_dgrams(struct quic_receiver_buf *rbuf
  * <to> will be set as AF_UNSPEC. The caller must specify <to_port> to ensure
  * that <to> address is completely filled.
  *
+ * Set <check_port> if communication with privileged port should be handle with
+ * constraint, which is desirable when interacting with QUIC clients on
+ * frontend side.
+ *
  * Returns value from recvmsg syscall.
  */
 static ssize_t quic_recv(int fd, void *out, size_t len,
                          struct sockaddr *from, socklen_t from_len,
                          struct sockaddr *to, socklen_t to_len,
-                         uint16_t dst_port)
+                         uint16_t dst_port, int check_port)
 {
 	union pktinfo {
 #ifdef IP_PKTINFO
@@ -341,6 +401,11 @@ static ssize_t quic_recv(int fd, void *out, size_t len,
 
 	if (ret < 0)
 		goto end;
+
+	if (check_port && unlikely(port_is_restricted((struct sockaddr_storage *)from, HA_PROTO_QUIC))) {
+		ret = -1;
+		goto end;
+	}
 
 	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
 		switch (cmsg->cmsg_level) {
@@ -474,7 +539,7 @@ void quic_lstnr_sock_fd_iocb(int fd)
 	ret = quic_recv(fd, dgram_buf, max_sz,
 	                (struct sockaddr *)&saddr, sizeof(saddr),
 	                (struct sockaddr *)&daddr, sizeof(daddr),
-	                get_net_port(&l->rx.addr));
+	                get_net_port(&l->rx.addr), 1);
 	if (ret <= 0)
 		goto out;
 
@@ -515,8 +580,136 @@ void quic_conn_sock_fd_iocb(int fd)
 	TRACE_LEAVE(QUIC_EV_CONN_RCV, qc);
 }
 
-/* Send a datagram stored into <buf> buffer with <sz> as size.
- * The caller must ensure there is at least <sz> bytes in this buffer.
+static void cmsg_set_saddr(struct msghdr *msg, struct cmsghdr **cmsg,
+                           struct sockaddr_storage *saddr)
+{
+	struct cmsghdr *c;
+#ifdef IP_PKTINFO
+	struct in_pktinfo *in;
+#endif /* IP_PKTINFO */
+#ifdef IPV6_RECVPKTINFO
+	struct in6_pktinfo *in6;
+#endif /* IPV6_RECVPKTINFO */
+	size_t sz = 0;
+
+	/* First determine size of ancillary data depending on the system support. */
+	switch (saddr->ss_family) {
+	case AF_INET:
+#if defined(IP_PKTINFO)
+		sz = sizeof(struct in_pktinfo);
+#elif defined(IP_RECVDSTADDR)
+		sz = sizeof(struct in_addr);
+#endif /* IP_PKTINFO || IP_RECVDSTADDR */
+		break;
+	case AF_INET6:
+#ifdef IPV6_RECVPKTINFO
+		sz = sizeof(struct in6_pktinfo);
+#endif /* IPV6_RECVPKTINFO */
+		break;
+	default:
+		break;
+	}
+
+	/* Size is null if system does not support send source address setting. */
+	if (!sz)
+		return;
+
+	/* Set first msg_controllen to be able to use CMSG_* macros. */
+	msg->msg_controllen += CMSG_SPACE(sz);
+
+	/* seems necessary to please gcc-13 */
+	ASSUME_NONNULL(CMSG_FIRSTHDR(msg));
+
+	*cmsg = !(*cmsg) ? CMSG_FIRSTHDR(msg) : CMSG_NXTHDR(msg, *cmsg);
+	ASSUME_NONNULL(*cmsg);
+	c = *cmsg;
+	c->cmsg_len = CMSG_LEN(sz);
+
+	switch (saddr->ss_family) {
+	case AF_INET:
+		c->cmsg_level = IPPROTO_IP;
+#if defined(IP_PKTINFO)
+		c->cmsg_type = IP_PKTINFO;
+		in = (struct in_pktinfo *)CMSG_DATA(c);
+		in->ipi_ifindex = 0;
+		in->ipi_addr.s_addr = 0;
+		memcpy(&in->ipi_spec_dst,
+		       &((struct sockaddr_in *)saddr)->sin_addr,
+		       sizeof(struct in_addr));
+#elif defined(IP_RECVDSTADDR)
+		c->cmsg_type = IP_SENDSRCADDR;
+		memcpy(CMSG_DATA(c),
+		       &((struct sockaddr_in *)saddr)->sin_addr,
+		       sizeof(struct in_addr));
+#endif /* IP_PKTINFO || IP_RECVDSTADDR */
+
+		break;
+
+	case AF_INET6:
+#ifdef IPV6_RECVPKTINFO
+		c->cmsg_level = IPPROTO_IPV6;
+		c->cmsg_type = IPV6_PKTINFO;
+		in6 = (struct in6_pktinfo *)CMSG_DATA(c);
+		in6->ipi6_ifindex = 0;
+		memcpy(&in6->ipi6_addr,
+		       &((struct sockaddr_in6 *)saddr)->sin6_addr,
+		       sizeof(struct in6_addr));
+#endif /* IPV6_RECVPKTINFO */
+
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void cmsg_set_gso(struct msghdr *msg, struct cmsghdr **cmsg,
+                         uint16_t gso_size)
+{
+#ifdef UDP_SEGMENT
+	struct cmsghdr *c;
+	size_t sz = sizeof(gso_size);
+
+	/* Set first msg_controllen to be able to use CMSG_* macros. */
+	msg->msg_controllen += CMSG_SPACE(sz);
+
+	/* seems necessary to please gcc-13 */
+	ASSUME_NONNULL(CMSG_FIRSTHDR(msg));
+
+	*cmsg = !(*cmsg) ? CMSG_FIRSTHDR(msg) : CMSG_NXTHDR(msg, *cmsg);
+	ASSUME_NONNULL(*cmsg);
+	c = *cmsg;
+	c->cmsg_len = CMSG_LEN(sz);
+
+	c->cmsg_level = SOL_UDP;
+	c->cmsg_type = UDP_SEGMENT;
+	c->cmsg_len = CMSG_LEN(sz);
+	write_u16(CMSG_DATA(c), gso_size);
+#endif
+}
+
+/* Return 1 if the source address may be used, 0 if not. */
+static int qc_may_use_saddr(struct quic_conn *qc)
+{
+	/* For QUIC backends, the connection fd is always initialized */
+	/* Not useful for connection using the listener socket */
+	if (qc_test_fd(qc))
+		return 0;
+
+	/* Connection to a listener from here.
+	 * The source address may be used when using listener socket (fd=-1) if
+	 * possible. This is not useful if the listening socket is bound to
+	 * a specific address. It is even prohibited on FreeBSD.
+	 */
+	return (!is_addr(&__objt_listener(qc->target)->rx.addr) &&
+	        is_addr(&qc->local_addr));
+}
+
+/* Send a datagram stored into <buf> buffer with <sz> as size. The caller must
+ * ensure there is at least <sz> bytes in this buffer.
+ *
+ * If <gso_size> is non null, it will be used as value for UDP_SEGMENT option.
+ * This allows to transmit multiple datagrams in a single syscall.
  *
  * Returns the total bytes sent over the socket. 0 is returned if a transient
  * error is encountered which allows send to be retry later. A negative value
@@ -527,122 +720,95 @@ void quic_conn_sock_fd_iocb(int fd)
  * done by removing the <qc> arg and replace it with address/port.
  */
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
-               int flags)
+               int flags, uint16_t gso_size)
 {
 	ssize_t ret;
+	struct msghdr msg;
+	struct iovec vec;
+	struct cmsghdr *cmsg __maybe_unused = NULL;
+
+	union {
+#ifdef IP_PKTINFO
+		char buf[CMSG_SPACE(sizeof(struct in_pktinfo)) + CMSG_SPACE(sizeof(gso_size))];
+#endif /* IP_PKTINFO */
+#ifdef IPV6_RECVPKTINFO
+		char buf6[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(gso_size))];
+#endif /* IPV6_RECVPKTINFO */
+		char bufaddr[CMSG_SPACE(sizeof(struct in_addr)) + CMSG_SPACE(sizeof(gso_size))];
+		struct cmsghdr align;
+	} ancillary_data;
+
+	/* man 3 cmsg
+	 *
+	 * When initializing a buffer that will contain a
+	 * series of cmsghdr structures (e.g., to be sent with
+	 * sendmsg(2)), that buffer should first be
+	 * zero-initialized to ensure the correct operation of
+	 * CMSG_NXTHDR().
+	 */
+	memset(&ancillary_data, 0, sizeof(ancillary_data));
+
+	vec.iov_base = b_peek(buf, b_head_ofs(buf));
+	vec.iov_len = sz;
+
+	/* man 2 sendmsg
+	 *
+	 * The msg_name field is used on an unconnected socket to specify the
+	 * target address for a datagram. It points to a buffer containing the
+	 * address; the msg_namelen field should  be  set to the size of the
+	 * address. For a connected socket, these fields should be specified
+	 * as NULL and 0, respectively.
+         */
+	if (!qc_test_fd(qc)) {
+		msg.msg_name = &qc->peer_addr;
+		msg.msg_namelen = get_addr_len(&qc->peer_addr);
+	}
+	else {
+		msg.msg_name = NULL;
+		msg.msg_namelen = 0;
+	}
+
+	msg.msg_iov = &vec;
+	msg.msg_iovlen = 1;
+	msg.msg_control = NULL;
+	msg.msg_controllen = 0;
+	msg.msg_flags = 0;
+
+	if (qc_test_fd(qc) && !fd_send_ready(qc->fd))
+		return 0;
+
+	if (qc_may_use_saddr(qc)) {
+		msg.msg_control = ancillary_data.bufaddr;
+		cmsg_set_saddr(&msg, &cmsg, &qc->local_addr);
+	}
+
+	/* Set GSO parameter if datagram size is bigger than MTU. */
+	if (gso_size) {
+		/* GSO size must be less than total data to sent for multiple datagrams. */
+		BUG_ON_HOT(b_data(buf) <= gso_size);
+
+		if (!msg.msg_control)
+			msg.msg_control = ancillary_data.bufaddr;
+		cmsg_set_gso(&msg, &cmsg, gso_size);
+	}
 
 	do {
-		if (qc_test_fd(qc)) {
-			if (!fd_send_ready(qc->fd))
-				return 0;
-
-			ret = send(qc->fd, b_peek(buf, b_head_ofs(buf)), sz,
-			           MSG_DONTWAIT | MSG_NOSIGNAL);
-		}
-#if defined(IP_PKTINFO) || defined(IP_RECVDSTADDR) || defined(IPV6_RECVPKTINFO)
-		else if (is_addr(&qc->local_addr)) {
-			struct msghdr msg = { 0 };
-			struct iovec vec;
-			struct cmsghdr *cmsg;
-#ifdef IP_PKTINFO
-			struct in_pktinfo in;
-#endif /* IP_PKTINFO */
-#ifdef IPV6_RECVPKTINFO
-			struct in6_pktinfo in6;
-#endif /* IPV6_RECVPKTINFO */
-			union {
-#ifdef IP_PKTINFO
-				char buf[CMSG_SPACE(sizeof(in))];
-#endif /* IP_PKTINFO */
-#ifdef IPV6_RECVPKTINFO
-				char buf6[CMSG_SPACE(sizeof(in6))];
-#endif /* IPV6_RECVPKTINFO */
-				char bufaddr[CMSG_SPACE(sizeof(struct in_addr))];
-				struct cmsghdr align;
-			} u;
-
-			vec.iov_base = b_peek(buf, b_head_ofs(buf));
-			vec.iov_len = sz;
-			msg.msg_name = &qc->peer_addr;
-			msg.msg_namelen = get_addr_len(&qc->peer_addr);
-			msg.msg_iov = &vec;
-			msg.msg_iovlen = 1;
-
-			switch (qc->local_addr.ss_family) {
-			case AF_INET:
-#if defined(IP_PKTINFO)
-				memset(&in, 0, sizeof(in));
-				memcpy(&in.ipi_spec_dst,
-				       &((struct sockaddr_in *)&qc->local_addr)->sin_addr,
-				       sizeof(struct in_addr));
-
-				msg.msg_control = u.buf;
-				msg.msg_controllen = sizeof(u.buf);
-
-				cmsg = CMSG_FIRSTHDR(&msg);
-				cmsg->cmsg_level = IPPROTO_IP;
-				cmsg->cmsg_type = IP_PKTINFO;
-				cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
-				memcpy(CMSG_DATA(cmsg), &in, sizeof(in));
-#elif defined(IP_RECVDSTADDR)
-				msg.msg_control = u.bufaddr;
-				msg.msg_controllen = sizeof(u.bufaddr);
-
-				cmsg = CMSG_FIRSTHDR(&msg);
-				cmsg->cmsg_level = IPPROTO_IP;
-				cmsg->cmsg_type = IP_SENDSRCADDR;
-				cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
-				memcpy(CMSG_DATA(cmsg),
-				       &((struct sockaddr_in *)&qc->local_addr)->sin_addr,
-				       sizeof(struct in_addr));
-#endif /* IP_PKTINFO || IP_RECVDSTADDR */
-				break;
-
-			case AF_INET6:
-#ifdef IPV6_RECVPKTINFO
-				memset(&in6, 0, sizeof(in6));
-				memcpy(&in6.ipi6_addr,
-				       &((struct sockaddr_in6 *)&qc->local_addr)->sin6_addr,
-				       sizeof(struct in6_addr));
-
-				msg.msg_control = u.buf6;
-				msg.msg_controllen = sizeof(u.buf6);
-
-				cmsg = CMSG_FIRSTHDR(&msg);
-				cmsg->cmsg_level = IPPROTO_IPV6;
-				cmsg->cmsg_type = IPV6_PKTINFO;
-				cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
-				memcpy(CMSG_DATA(cmsg), &in6, sizeof(in6));
-#endif /* IPV6_RECVPKTINFO */
-				break;
-
-			default:
-				break;
-			}
-
-			ret = sendmsg(qc->li->rx.fd, &msg,
-			              MSG_DONTWAIT|MSG_NOSIGNAL);
-		}
-#endif /* IP_PKTINFO || IP_RECVDSTADDR || IPV6_RECVPKTINFO */
-		else {
-			ret = sendto(qc->li->rx.fd, b_peek(buf, b_head_ofs(buf)), sz,
-			             MSG_DONTWAIT|MSG_NOSIGNAL,
-			             (struct sockaddr *)&qc->peer_addr,
-			             get_addr_len(&qc->peer_addr));
-		}
+		ret = sendmsg(qc_fd(qc), &msg, MSG_DONTWAIT|MSG_NOSIGNAL);
 	} while (ret < 0 && errno == EINTR);
 
 	if (ret < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK ||
 		    errno == ENOTCONN || errno == EINPROGRESS) {
+			/* transient error */
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				qc->cntrs.socket_full++;
 			else
 				qc->cntrs.sendto_err++;
 
-			/* transient error */
-			fd_want_send(qc->fd);
-			fd_cant_send(qc->fd);
+			if (qc_test_fd(qc)) {
+				fd_want_send(qc->fd);
+				fd_cant_send(qc->fd);
+			}
 			TRACE_PRINTF(TRACE_LEVEL_USER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
 			             "UDP send failure errno=%d (%s)", errno, strerror(errno));
 			return 0;
@@ -652,7 +818,7 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 			qc->cntrs.sendto_err_unknown++;
 			TRACE_PRINTF(TRACE_LEVEL_USER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
 			             "UDP send failure errno=%d (%s)", errno, strerror(errno));
-			return -1;
+			return -errno;
 		}
 	}
 
@@ -669,39 +835,33 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 int qc_rcv_buf(struct quic_conn *qc)
 {
 	struct sockaddr_storage saddr = {0}, daddr = {0};
-	struct quic_transport_params *params;
 	struct quic_dgram *new_dgram = NULL;
 	struct buffer buf = BUF_NULL;
-	size_t max_sz;
 	unsigned char *dgram_buf;
-	struct listener *l;
 	ssize_t ret = 0;
+	struct listener *l = objt_listener(qc->target);
 
 	/* Do not call this if quic-conn FD is uninitialized. */
 	BUG_ON(qc->fd < 0);
 
 	TRACE_ENTER(QUIC_EV_CONN_RCV, qc);
-	l = qc->li;
-
-	params = &l->bind_conf->quic_params;
-	max_sz = params->max_udp_payload_size;
 
 	do {
-		if (!b_alloc(&buf))
+		if (!b_alloc(&buf, DB_MUX_RX))
 			break; /* TODO subscribe for memory again available. */
 
 		b_reset(&buf);
-		BUG_ON(b_contig_space(&buf) < max_sz);
+		BUG_ON(b_contig_space(&buf) < qc->max_udp_payload);
 
 		/* Allocate datagram on first loop or after requeuing. */
 		if (!new_dgram && !(new_dgram = pool_alloc(pool_head_quic_dgram)))
 			break; /* TODO subscribe for memory again available. */
 
 		dgram_buf = (unsigned char *)b_tail(&buf);
-		ret = quic_recv(qc->fd, dgram_buf, max_sz,
+		ret = quic_recv(qc->fd, dgram_buf, qc->max_udp_payload,
 		                (struct sockaddr *)&saddr, sizeof(saddr),
 		                (struct sockaddr *)&daddr, sizeof(daddr),
-		                get_net_port(&qc->local_addr));
+		                get_net_port(&qc->local_addr), !!l);
 		if (ret <= 0) {
 			/* Subscribe FD for future reception. */
 			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN)
@@ -712,6 +872,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 
 		b_add(&buf, ret);
 
+		new_dgram->obj_type = OBJ_TYPE_DGRAM;
 		new_dgram->buf = dgram_buf;
 		new_dgram->len = ret;
 		new_dgram->dcid_len = 0;
@@ -719,6 +880,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 		new_dgram->saddr = saddr;
 		new_dgram->daddr = daddr;
 		new_dgram->qc = NULL;  /* set later via quic_dgram_parse() */
+		new_dgram->flags = 0;
 
 		TRACE_DEVEL("read datagram", QUIC_EV_CONN_RCV, qc, new_dgram);
 
@@ -728,7 +890,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 			continue;
 		}
 
-		if (!qc_check_dcid(qc, new_dgram->dcid, new_dgram->dcid_len)) {
+		if (l && !qc_check_dcid(qc, new_dgram->dcid, new_dgram->dcid_len)) {
 			/* Datagram received by error on the connection FD, dispatch it
 			 * to its associated quic-conn.
 			 *
@@ -742,7 +904,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 			TRACE_STATE("datagram for other connection on quic-conn socket, requeue it", QUIC_EV_CONN_RCV, qc);
 
 			rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), rxbuf_el);
-			ALREADY_CHECKED(rxbuf);
+			ASSUME_NONNULL(rxbuf);
 			cspace = b_contig_space(&rxbuf->buf);
 
 			tmp_dgram = quic_rxbuf_purge_dgrams(rxbuf);
@@ -786,7 +948,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 			continue;
 		}
 
-		quic_dgram_parse(new_dgram, qc, qc->li);
+		quic_dgram_parse(new_dgram, qc, qc->target);
 		/* A datagram must always be consumed after quic_parse_dgram(). */
 		BUG_ON(new_dgram->buf);
 	} while (ret > 0);
@@ -808,11 +970,13 @@ int qc_rcv_buf(struct quic_conn *qc)
  *
  * Return the socket FD or a negative error code. On error, socket is marked as
  * uninitialized.
+ * Note: This function must not be run for backends connection.
  */
 void qc_alloc_fd(struct quic_conn *qc, const struct sockaddr_storage *src,
                  const struct sockaddr_storage *dst)
 {
-	struct bind_conf *bc = qc->li->bind_conf;
+	struct listener *l = __objt_listener(qc->target);
+	struct bind_conf *bc = l->bind_conf;
 	struct proxy *p = bc->frontend;
 	int fd = -1;
 	int ret;
@@ -865,7 +1029,7 @@ void qc_alloc_fd(struct quic_conn *qc, const struct sockaddr_storage *src,
 			}
 
 			/* Fallback to listener socket for this receiver instance. */
-			HA_ATOMIC_STORE(&qc->li->rx.quic_mode, QUIC_SOCK_MODE_LSTNR);
+			HA_ATOMIC_STORE(&l->rx.quic_mode, QUIC_SOCK_MODE_LSTNR);
 		}
 		goto err;
 	}
@@ -914,20 +1078,19 @@ void qc_want_recv(struct quic_conn *qc)
 struct quic_accept_queue *quic_accept_queues;
 
 /* Install <qc> on the queue ready to be accepted. The queue task is then woken
- * up. If <qc> accept is already scheduled or done, nothing is done.
+ * up.
  */
 void quic_accept_push_qc(struct quic_conn *qc)
 {
 	struct quic_accept_queue *queue = &quic_accept_queues[tid];
-	struct li_per_thread *lthr = &qc->li->per_thr[ti->ltid];
+	struct listener *l = __objt_listener(qc->target);
+	struct li_per_thread *lthr = &l->per_thr[ti->ltid];
 
-	/* early return if accept is already in progress/done for this
-	 * connection
-	 */
-	if (qc->flags & QUIC_FL_CONN_ACCEPT_REGISTERED)
-		return;
+	/* A connection must only be accepted once per instance. */
+	BUG_ON(qc->flags & QUIC_FL_CONN_ACCEPT_REGISTERED);
 
 	BUG_ON(MT_LIST_INLIST(&qc->accept_list));
+	HA_ATOMIC_INC(&l->rx.quic_curr_accept);
 
 	qc->flags |= QUIC_FL_CONN_ACCEPT_REGISTERED;
 	/* 1. insert the listener in the accept queue
@@ -952,18 +1115,40 @@ void quic_accept_push_qc(struct quic_conn *qc)
 struct task *quic_accept_run(struct task *t, void *ctx, unsigned int i)
 {
 	struct li_per_thread *lthr;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	struct quic_accept_queue *queue = &quic_accept_queues[tid];
 
-	mt_list_for_each_entry_safe(lthr, &queue->listeners, quic_accept.list, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(lthr, &queue->listeners, quic_accept.list, back) {
 		listener_accept(lthr->li);
-		if (!MT_LIST_ISEMPTY(&lthr->quic_accept.conns))
+		if (!MT_LIST_ISEMPTY(&lthr->quic_accept.conns)) {
+			/* entry is left in queue */
 			tasklet_wakeup((struct tasklet*)t);
-		else
-			MT_LIST_DELETE_SAFE(elt1);
+		}
+		else {
+			mt_list_unlock_self(&lthr->quic_accept.list);
+			lthr = NULL; /* delete it */
+		}
 	}
 
-	return NULL;
+	return t;
+}
+
+/* Returns the maximum number of QUIC connections waiting for handshake to
+ * complete in parallel on listener <l> instance. This is directly based on
+ * listener backlog value.
+ */
+int quic_listener_max_handshake(const struct listener *l)
+{
+	return listener_backlog(l) / 2;
+}
+
+/* Returns the value which is considered as the maximum number of QUIC
+ * connections waiting to be accepted for listener <l> instance. This is
+ * directly based on listener backlog value.
+ */
+int quic_listener_max_accept(const struct listener *l)
+{
+	return listener_backlog(l) / 2;
 }
 
 static int quic_alloc_accept_queues(void)

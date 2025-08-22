@@ -6,6 +6,8 @@
 #endif
 
 #include <inttypes.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #define QUIC_STATELESS_RESET_TOKEN_LEN 16
 
@@ -20,8 +22,8 @@ struct tp_cid {
 struct tp_preferred_address {
 	uint16_t ipv4_port;
 	uint16_t ipv6_port;
-	uint8_t ipv4_addr[4];
-	uint8_t ipv6_addr[16];
+	struct in_addr  ipv4_addr;
+	struct in6_addr ipv6_addr;
 	struct tp_cid cid;
 	uint8_t stateless_reset_token[QUIC_STATELESS_RESET_TOKEN_LEN];
 };
@@ -42,6 +44,7 @@ struct tp_version_information {
 #define QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT      30000 /* milliseconds */
 #define QUIC_TP_DFLT_FRONT_MAX_STREAMS_BIDI        100
 #define QUIC_TP_DFLT_BACK_MAX_IDLE_TIMEOUT       30000 /* milliseconds */
+#define QUIC_TP_DFLT_FRONT_STREAM_DATA_RATIO        90
 
 /* Types of QUIC transport parameters */
 #define QUIC_TP_ORIGINAL_DESTINATION_CONNECTION_ID  0x00
@@ -110,6 +113,13 @@ struct quic_transport_params {
 	struct tp_cid initial_source_connection_id;
 	struct tp_preferred_address preferred_address;                    /* Forbidden for clients */
 	struct tp_version_information version_information;
+};
+
+/* Return type for QUIC TP decode function */
+enum quic_tp_dec_err {
+	QUIC_TP_DEC_ERR_NONE = 0,  /* no error */
+	QUIC_TP_DEC_ERR_INVAL,     /* invalid value as per RFC 9000 */
+	QUIC_TP_DEC_ERR_TRUNC,     /* field encoding too small or too large */
 };
 
 #endif /* USE_QUIC */

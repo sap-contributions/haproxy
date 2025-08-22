@@ -30,6 +30,9 @@
 #define HLUA_SET_RUN(__hlua)         do {(__hlua)->flags |= HLUA_RUN;} while(0)
 #define HLUA_CLR_RUN(__hlua)         do {(__hlua)->flags &= ~HLUA_RUN;} while(0)
 #define HLUA_IS_RUNNING(__hlua)      ((__hlua)->flags & HLUA_RUN)
+#define HLUA_SET_BUSY(__hlua)        do {(__hlua)->flags |= HLUA_BUSY;} while(0)
+#define HLUA_CLR_BUSY(__hlua)        do {(__hlua)->flags &= ~HLUA_BUSY;} while(0)
+#define HLUA_IS_BUSY(__hlua)         ((__hlua)->flags & HLUA_BUSY)
 #define HLUA_SET_CTRLYIELD(__hlua)   do {(__hlua)->flags |= HLUA_CTRLYIELD;} while(0)
 #define HLUA_CLR_CTRLYIELD(__hlua)   do {(__hlua)->flags &= ~HLUA_CTRLYIELD;} while(0)
 #define HLUA_IS_CTRLYIELDING(__hlua) ((__hlua)->flags & HLUA_CTRLYIELD)
@@ -47,6 +50,7 @@
 #define HLUA_INIT(__hlua) do { (__hlua)->T = 0; } while(0)
 
 /* Lua HAProxy integration functions. */
+void hlua_yield_asap(lua_State *L);
 const char *hlua_traceback(lua_State *L, const char* sep);
 void hlua_ctx_destroy(struct hlua *lua);
 void hlua_init();

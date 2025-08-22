@@ -5,8 +5,6 @@ varnishtest "Delete server via cli"
 
 feature ignore_unknown_macro
 
-#REQUIRE_VERSION=2.4
-
 # static server
 server s1 -repeat 3 {
 	rxreq
@@ -22,6 +20,11 @@ server s2 -repeat 3 {
 } -start
 
 haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
 	defaults
 		mode http
 		timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"

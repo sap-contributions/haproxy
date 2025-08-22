@@ -1,5 +1,6 @@
 #include <import/eb64tree.h>
 
+#include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_loss.h>
 #include <haproxy/quic_tls.h>
@@ -151,12 +152,13 @@ struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
  * Always succeeds.
  */
 void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
-                           struct list *lost_pkts)
+                           struct list *lost_pkts, uint32_t *bytes_lost)
 {
 	struct eb_root *pkts;
 	struct eb64_node *node;
 	struct quic_loss *ql;
 	unsigned int loss_delay;
+	uint64_t pktthresh;
 
 	TRACE_ENTER(QUIC_EV_CONN_PKTLOSS, qc);
 	TRACE_PROTO("TX loss", QUIC_EV_CONN_PKTLOSS, qc, pktns);
@@ -171,10 +173,32 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 		QUIC_LOSS_TIME_THRESHOLD_MULTIPLICAND / QUIC_LOSS_TIME_THRESHOLD_DIVISOR;
 
 	node = eb64_first(pkts);
+
+	/* RFC 9002 6.1.1. Packet Threshold
+	 * The RECOMMENDED initial value for the packet reordering threshold
+	 * (kPacketThreshold) is 3, based on best practices for TCP loss detection
+	 * [RFC5681] [RFC6675]. In order to remain similar to TCP, implementations
+	 * SHOULD NOT use a packet threshold less than 3; see [RFC5681].
+
+	 * Some networks may exhibit higher degrees of packet reordering, causing a
+	 * sender to detect spurious losses. Additionally, packet reordering could be
+	 * more common with QUIC than TCP because network elements that could observe
+	 * and reorder TCP packets cannot do that for QUIC and also because QUIC
+	 * packet numbers are encrypted.
+	 */
+
+	/* Dynamic packet reordering threshold calculation depending on the distance
+	 * (in packets) between the last transmitted packet and the oldest still in
+	 * flight before loss detection.
+	 */
+	pktthresh = pktns->tx.next_pn - 1 - eb64_entry(node, struct quic_tx_packet, pn_node)->pn_node.key;
+	/* Apply a ratio to this threshold and add it to QUIC_LOSS_PACKET_THRESHOLD. */
+	pktthresh = pktthresh * global.tune.quic_reorder_ratio / 100 + QUIC_LOSS_PACKET_THRESHOLD;
 	while (node) {
 		struct quic_tx_packet *pkt;
 		int64_t largest_acked_pn;
 		unsigned int loss_time_limit, time_sent;
+		int reordered;
 
 		pkt = eb64_entry(&node->node, struct quic_tx_packet, pn_node);
 		largest_acked_pn = pktns->rx.largest_acked_pn;
@@ -182,12 +206,24 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 		if ((int64_t)pkt->pn_node.key > largest_acked_pn)
 			break;
 
-		time_sent = pkt->time_sent;
+		time_sent = pkt->time_sent_ms;
 		loss_time_limit = tick_add(time_sent, loss_delay);
-		if (tick_is_le(loss_time_limit, now_ms) ||
-			(int64_t)largest_acked_pn >= pkt->pn_node.key + QUIC_LOSS_PACKET_THRESHOLD) {
+
+		reordered = (int64_t)largest_acked_pn >= pkt->pn_node.key + pktthresh;
+		if (reordered)
+			ql->nb_reordered_pkt++;
+
+		if (tick_is_le(loss_time_limit, now_ms) || reordered) {
+			struct quic_cc *cc = &qc->path->cc;
+
+			/* Delivery rate sampling is applied to ack-eliciting packet only. */
+			if ((pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) &&
+			    cc->algo->on_pkt_lost)
+				cc->algo->on_pkt_lost(cc, pkt, pkt->rs.lost);
 			eb64_delete(&pkt->pn_node);
 			LIST_APPEND(lost_pkts, &pkt->list);
+			if (bytes_lost)
+				*bytes_lost += pkt->len;
 			ql->nb_lost_pkt++;
 		}
 		else {
@@ -204,3 +240,85 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 	TRACE_LEAVE(QUIC_EV_CONN_PKTLOSS, qc);
 }
 
+/* Handle <pkts> list of lost packets detected at <now_us> handling their TX
+ * frames. Send a packet loss event to the congestion controller if in flight
+ * packet have been lost. Also frees the packet in <pkts> list.
+ *
+ * Returns 1 on success else 0 if loss limit has been exceeded. A
+ * CONNECTION_CLOSE was prepared to close the connection ASAP.
+ */
+int qc_release_lost_pkts(struct quic_conn *qc, struct quic_pktns *pktns,
+                         struct list *pkts, uint64_t now_us)
+{
+	struct quic_tx_packet *pkt, *tmp, *oldest_lost, *newest_lost;
+	uint tot_lost = 0;
+	int close = 0;
+
+	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc);
+
+	if (LIST_ISEMPTY(pkts))
+		goto leave;
+
+	/* Oldest will point to first list entry and newest on the last. First,
+	 * initialize them to point on the same entry. Newest pointer will be
+	 * updated along the loop. Release all other packet in between.
+	 */
+	newest_lost = oldest_lost = LIST_ELEM(pkts->n, struct quic_tx_packet *, list);
+	list_for_each_entry_safe(pkt, tmp, pkts, list) {
+		struct list tmp = LIST_HEAD_INIT(tmp);
+
+		pkt->pktns->tx.in_flight -= pkt->in_flight_len;
+		qc->path->prep_in_flight -= pkt->in_flight_len;
+		qc->path->in_flight -= pkt->in_flight_len;
+		if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING)
+			qc->path->ifae_pkts--;
+		/* Treat the frames of this lost packet. */
+		if (!qc_handle_frms_of_lost_pkt(qc, pkt, &pktns->tx.frms))
+			close = 1;
+		LIST_DELETE(&pkt->list);
+
+		/* Move newest so that it will point on the last list entry.
+		 * Release every intermediary packet.
+		 */
+		if (oldest_lost != newest_lost)
+			quic_tx_packet_refdec(newest_lost);
+		newest_lost = pkt;
+		tot_lost++;
+	}
+
+	if (!close) {
+		struct quic_cc *cc = &qc->path->cc;
+		/* Sent a congestion event to the controller */
+		struct quic_cc_event ev = { };
+
+		ev.type = QUIC_CC_EVT_LOSS;
+		ev.loss.time_sent = newest_lost->time_sent_ms;
+		ev.loss.count = tot_lost;
+
+		quic_cc_event(cc, &ev);
+		if (cc->algo->congestion_event)
+		    cc->algo->congestion_event(cc, newest_lost->time_sent_ms);
+
+		/* If an RTT have been already sampled, <rtt_min> has been set.
+		 * We must check if we are experiencing a persistent congestion.
+		 * If this is the case, the congestion controller must re-enter
+		 * slow start state.
+		 */
+		if (qc->path->loss.rtt_min && newest_lost != oldest_lost) {
+			unsigned int period = newest_lost->time_sent_ms - oldest_lost->time_sent_ms;
+
+			if (quic_loss_persistent_congestion(&qc->path->loss, period,
+							    now_ms, qc->max_ack_delay) &&
+			    qc->path->cc.algo->slow_start)
+				qc->path->cc.algo->slow_start(&qc->path->cc);
+		}
+	}
+
+	quic_tx_packet_refdec(oldest_lost);
+	if (newest_lost != oldest_lost)
+		quic_tx_packet_refdec(newest_lost);
+
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
+	return !close;
+}

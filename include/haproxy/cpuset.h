@@ -44,14 +44,12 @@ int ha_cpuset_ffs(const struct hap_cpuset *set);
  */
 void ha_cpuset_assign(struct hap_cpuset *dst, struct hap_cpuset *src);
 
+/* returns true if the sets are equal */
+int ha_cpuset_isequal(const struct hap_cpuset *dst, const struct hap_cpuset *src);
+
 /* Returns the biggest index plus one usable on the platform.
  */
 int ha_cpuset_size(void);
-
-/* Detects CPUs that are bound to the current process. Returns the number of
- * CPUs detected or 0 if the detection failed.
- */
-int ha_cpuset_detect_bound(struct hap_cpuset *set);
 
 /* Parse cpu sets. Each CPU set is either a unique number between 0 and
  * ha_cpuset_size() - 1 or a range with two such numbers delimited by a dash
@@ -62,15 +60,18 @@ int ha_cpuset_detect_bound(struct hap_cpuset *set);
  */
 int parse_cpu_set(const char **args, struct hap_cpuset *cpu_set, char **err);
 
+/* Print a cpu-set as compactly as possible and returns the output length.
+ * Returns >size if it cannot emit anything due to length constraints, in which
+ * case it will match what is at least needed to go further, and may return 0
+ * for an empty set. It will emit series of comma-delimited ranges in the form
+ * "beg[-end]".
+ */
+int print_cpu_set(char *output, size_t size, const struct hap_cpuset *cpu_set);
+
 /* Parse a linux cpu map string representing to a numeric cpu mask map
  * The cpu map string is a list of 4-byte hex strings separated by commas, with
  * most-significant byte first, one bit per cpu number.
  */
 void parse_cpumap(char *cpumap_str, struct hap_cpuset *cpu_set);
-
-/* Returns true if at least one cpu-map directive was configured, otherwise
- * false.
- */
-int cpu_map_configured(void);
 
 #endif /* _HAPROXY_CPUSET_H */

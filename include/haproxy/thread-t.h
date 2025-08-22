@@ -41,7 +41,7 @@
 #define __decl_rwlock(lock)
 #define __decl_aligned_rwlock(lock)
 
-#elif !defined(DEBUG_THREAD) && !defined(DEBUG_FULL)
+#elif (DEBUG_THREAD < 1) && !defined(DEBUG_FULL)
 
 /************** THREADS ENABLED WITHOUT DEBUGGING **************/
 
@@ -94,11 +94,25 @@
 #define __HA_SPINLOCK_T     unsigned long
 #define __HA_RWLOCK_T       unsigned long
 
+/* Type used as a shared value from a global counter. Manipulation to the
+ * global value is thread-safe. Share counter can be increased/decreased
+ * without modifying the global value to reduce contention. The global value is
+ * modified only when the configured limit is reached.
+ *
+ * Typically a cshared is declared as a thread-local variable, with a reference
+ * to a process global value.
+ */
+struct cshared {
+	uint64_t *global;
+	int diff;
+	int lim;
+};
+
 
 /* When thread debugging is enabled, we remap HA_SPINLOCK_T and HA_RWLOCK_T to
  * complex structures which embed debugging info.
  */
-#if !defined(DEBUG_THREAD) && !defined(DEBUG_FULL)
+#if (DEBUG_THREAD < 2) && !defined(DEBUG_FULL)
 
 #define HA_SPINLOCK_T        __HA_SPINLOCK_T
 #define HA_RWLOCK_T          __HA_RWLOCK_T
@@ -110,17 +124,14 @@
 
 /* Debugging information that is only used when thread debugging is enabled */
 
+/* This is aligned as it's already 256B per lock label, so better simplify the
+ * address calculations in the fast path than save a few bytes in BSS.
+ */
 struct lock_stat {
-	uint64_t nsec_wait_for_write;
-	uint64_t nsec_wait_for_read;
-	uint64_t nsec_wait_for_seek;
-	uint64_t num_write_locked;
-	uint64_t num_write_unlocked;
-	uint64_t num_read_locked;
-	uint64_t num_read_unlocked;
-	uint64_t num_seek_locked;
-	uint64_t num_seek_unlocked;
-};
+	uint64_t nsec_wait;
+	uint64_t num_unlocked;
+	uint64_t buckets[30]; // operations per time buckets (1-2ns to 0.5-1s)
+} ALIGNED(256);
 
 struct ha_spinlock_state {
 	unsigned long owner; /* a bit is set to 1 << tid for the lock owner */
@@ -161,5 +172,62 @@ struct ha_rwlock {
 };
 
 #endif  /* DEBUG_THREAD */
+
+/* WARNING!!! if you update this enum, please also keep lock_label() up to date
+ * below.
+ */
+enum lock_label {
+	TASK_RQ_LOCK,
+	TASK_WQ_LOCK,
+	LISTENER_LOCK,
+	PROXY_LOCK,
+	SERVER_LOCK,
+	LBPRM_LOCK,
+	SIGNALS_LOCK,
+	STK_TABLE_LOCK,
+	STK_TABLE_UPDT_LOCK,
+	STK_SESS_LOCK,
+	APPLETS_LOCK,
+	PEER_LOCK,
+	SHCTX_LOCK,
+	SSL_LOCK,
+	SSL_GEN_CERTS_LOCK,
+	PATREF_LOCK,
+	PATEXP_LOCK,
+	VARS_LOCK,
+	COMP_POOL_LOCK,
+	LUA_LOCK,
+	NOTIF_LOCK,
+	SPOE_APPLET_LOCK,
+	DNS_LOCK,
+	PID_LIST_LOCK,
+	PIPES_LOCK,
+	TLSKEYS_REF_LOCK,
+	AUTH_LOCK,
+	RING_LOCK,
+	DICT_LOCK,
+	PROTO_LOCK,
+	QUEUE_LOCK,
+	CKCH_LOCK,
+	SNI_LOCK,
+	SSL_SERVER_LOCK,
+	SFT_LOCK, /* sink forward target */
+	IDLE_CONNS_LOCK,
+	OCSP_LOCK,
+	QC_CID_LOCK,
+	CACHE_LOCK,
+	GUID_LOCK,
+	JWT_LOCK,
+	OTHER_LOCK,
+	/* WT: make sure never to use these ones outside of development,
+	 * we need them for lock profiling!
+	 */
+	DEBUG1_LOCK,
+	DEBUG2_LOCK,
+	DEBUG3_LOCK,
+	DEBUG4_LOCK,
+	DEBUG5_LOCK,
+	LOCK_LABELS
+};
 
 #endif /* _HAPROXY_THREAD_T_H */

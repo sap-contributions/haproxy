@@ -98,6 +98,7 @@ enum h1m_state {
 #define H1_MF_UPG_WEBSOCKET     0x00008000 // Set for a Websocket upgrade handshake
 #define H1_MF_TE_CHUNKED        0x00010000 // T-E "chunked"
 #define H1_MF_TE_OTHER          0x00020000 // T-E other than supported ones found (only "chunked" is supported for now)
+#define H1_MF_UPG_H2C           0x00040000 // "h2c" or "h2" used as upgrade token
 
 /* Mask to use to reset H1M flags when we restart headers parsing.
  *
@@ -130,6 +131,7 @@ struct h1m {
 	uint64_t curr_len;          // content-length or last chunk length
 	uint64_t body_len;          // total known size of the body length
 	uint32_t next;              // next byte to parse, relative to buffer's head
+	unsigned int err_code;      // the HTTP status code corresponding to the error, if it can be specified (0: unset)
 	int err_pos;                // position in the byte stream of the first error (H1 or H2)
 	int err_state;              // state where the first error was met (H1 or H2)
 };
@@ -150,12 +152,12 @@ union h1_sl {                          /* useful start line pointers, relative t
 	} st;                          /* status line : field, length */
 };
 
+extern int h1_do_not_close_on_insecure_t_e;
+
 int h1_headers_to_hdr_list(char *start, const char *stop,
                            struct http_hdr *hdr, unsigned int hdr_num,
                            struct h1m *h1m, union h1_sl *slp);
-int h1_measure_trailers(const struct buffer *buf, unsigned int ofs, unsigned int max);
 
-int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value);
 int h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value);
 void h1_parse_connection_header(struct h1m *h1m, struct ist *value);
 void h1_parse_upgrade_header(struct h1m *h1m, struct ist value);
@@ -203,8 +205,8 @@ static inline const char *h1m_state_str(enum h1m_state msg_state)
 	}
 }
 
-/* This function may be called only in HTTP_MSG_CHUNK_CRLF. It reads the CRLF or
- * a possible LF alone at the end of a chunk. The caller should adjust msg->next
+/* This function may be called only in HTTP_MSG_CHUNK_CRLF. It reads the CRLF
+ * at the end of a chunk. The caller should adjust msg->next
  * in order to include this part into the next forwarding phase.  Note that the
  * caller must ensure that head+start points to the first byte to parse.  It
  * returns the number of bytes parsed on success, so the caller can set msg_state
@@ -221,16 +223,17 @@ static inline int h1_skip_chunk_crlf(const struct buffer *buf, int start, int st
 	if (stop <= start)
 		return 0;
 
+	if (unlikely(*ptr != '\r')) // negative position to stop
+		return ptr - __b_peek(buf, stop);
+
 	/* NB: we'll check data availability at the end. It's not a
 	 * problem because whatever we match first will be checked
 	 * against the correct length.
 	 */
-	if (*ptr == '\r') {
-		bytes++;
-		ptr++;
-		if (ptr >= b_wrap(buf))
-			ptr = b_orig(buf);
-	}
+	bytes++;
+	ptr++;
+	if (ptr >= b_wrap(buf))
+		ptr = b_orig(buf);
 
 	if (bytes > stop - start)
 		return 0;
@@ -302,14 +305,12 @@ static inline int h1_parse_chunk_size(const struct buffer *buf, int start, int s
 	 * for the end of chunk size.
 	 */
 	while (1) {
-		if (likely(HTTP_IS_CRLF(*ptr))) {
-			/* we now have a CR or an LF at ptr */
-			if (likely(*ptr == '\r')) {
-				if (++ptr >= end)
-					ptr = b_orig(buf);
-				if (--stop == 0)
-					return 0;
-			}
+		if (likely(*ptr == '\r')) {
+			/* we now have a CR, it must be followed by a LF */
+			if (++ptr >= end)
+				ptr = b_orig(buf);
+			if (--stop == 0)
+				return 0;
 
 			if (*ptr != '\n')
 				goto error;
@@ -357,6 +358,7 @@ static inline struct h1m *h1m_init_req(struct h1m *h1m)
 	h1m->flags = H1_MF_NONE;
 	h1m->curr_len = 0;
 	h1m->body_len = 0;
+	h1m->err_code = 0;
 	h1m->err_pos = -2;
 	h1m->err_state = 0;
 	return h1m;
@@ -370,6 +372,7 @@ static inline struct h1m *h1m_init_res(struct h1m *h1m)
 	h1m->flags = H1_MF_RESP;
 	h1m->curr_len = 0;
 	h1m->body_len = 0;
+	h1m->err_code = 0;
 	h1m->err_pos = -2;
 	h1m->err_state = 0;
 	return h1m;

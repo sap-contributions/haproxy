@@ -21,8 +21,9 @@
 #include <haproxy/backend.h>
 #include <haproxy/errors.h>
 #include <haproxy/queue.h>
-#include <haproxy/server-t.h>
+#include <haproxy/server.h>
 #include <haproxy/tools.h>
+#include <haproxy/xxhash.h>
 
 /* Return next tree node after <node> which must still be in the tree, or be
  * NULL. Lookup wraps around the end to the beginning. If the next node is the
@@ -58,6 +59,77 @@ static inline void chash_dequeue_srv(struct server *s)
 	}
 }
 
+/* Compute a key that can be used to insert a node into the CHASH tree. Servers
+ * have a base key, which can be computed in several ways (see
+ * chash_compute_server_key) and this function uses that seed to generate hash
+ * keys for however many nodes need to be inserted into the tree.
+ */
+static inline u32 chash_compute_node_key(struct server *s, unsigned node_index)
+{
+	return full_hash(s->lb_server_key + node_index);
+}
+
+/* Compute the base server key that will be used to compute node keys. Servers
+ * may be configured to determine their hashes either from their ID, address, or
+ * address+port; the latter options allow independent HAProxy instances to agree
+ * on routing decisions, regardless of their order in the server list (which may
+ * be arbitrary, since it could depend on factors such as the order of entries
+ * in a DNS SRV record). If an address is not known or if the server is
+ * configured with `hash-key id` (the default) then the key will be determined
+ * from the server's puid.
+ */
+static inline u32 chash_compute_server_key(struct server *s)
+{
+	enum srv_hash_key hash_key = s->hash_key;
+	struct server_inetaddr srv_addr;
+	u32 key;
+
+	/* If hash-key is addr or addr-port then we need the address, but if we
+	 * can't determine the address then we fall back on hashing the puid.
+	 */
+	switch (hash_key) {
+	case SRV_HASH_KEY_ADDR:
+	case SRV_HASH_KEY_ADDR_PORT:
+		server_get_inetaddr(s, &srv_addr);
+		if (srv_addr.family != AF_INET && srv_addr.family != AF_INET6) {
+			hash_key = SRV_HASH_KEY_ID;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	if (hash_key == SRV_HASH_KEY_ADDR_PORT) {
+		key = full_hash(srv_addr.port.svc);
+	} else {
+		key = 0;
+	}
+
+	switch (hash_key) {
+	case SRV_HASH_KEY_ADDR_PORT:
+	case SRV_HASH_KEY_ADDR:
+		switch (srv_addr.family) {
+		case AF_INET:
+			key = full_hash(key + srv_addr.addr.v4.s_addr);
+			break;
+		case AF_INET6:
+			key = XXH32(srv_addr.addr.v6.s6_addr, 16, key);
+			break;
+		default:
+			break;
+		}
+		break;
+
+	case SRV_HASH_KEY_ID:
+	default:
+		key = full_hash(s->puid);
+		break;
+	}
+
+	return key;
+}
+
 /* Adjust the number of entries of a server in its tree. The server must appear
  * as many times as its weight indicates it. If it's there too often, we remove
  * the last occurrences. If it's not there enough, we add more occurrences. To
@@ -67,6 +139,15 @@ static inline void chash_dequeue_srv(struct server *s)
  */
 static inline void chash_queue_dequeue_srv(struct server *s)
 {
+	u32 server_key = chash_compute_server_key(s);
+
+	/* If the server key changed then we must rehash all the nodes. */
+	if (server_key != s->lb_server_key) {
+		chash_dequeue_srv(s);
+		s->lb_nodes_tot = 0;
+		s->lb_server_key = server_key;
+	}
+
 	while (s->lb_nodes_now > s->next_eweight) {
 		if (s->lb_nodes_now >= s->lb_nodes_tot) // should always be false anyway
 			s->lb_nodes_now = s->lb_nodes_tot;
@@ -95,7 +176,7 @@ static inline void chash_queue_dequeue_srv(struct server *s)
 			    (s->next_eweight - s->lb_nodes_tot) * sizeof(*s->lb_nodes));
 			for (j = s->lb_nodes_tot; j < s->next_eweight; j++) {
 				s->lb_nodes[j].server = s;
-				s->lb_nodes[j].node.key = full_hash(s->puid * SRV_EWGHT_RANGE + j);
+				s->lb_nodes[j].node.key = chash_compute_node_key(s, j);
 			}
 			s->lb_nodes_tot = s->next_eweight;
 		}
@@ -238,9 +319,6 @@ static void chash_update_server_weight(struct server *srv)
 	int old_state, new_state;
 	struct proxy *p = srv->proxy;
 
-	if (!srv_lb_status_changed(srv))
-		return;
-
 	/* If changing the server's weight changes its state, we simply apply
 	 * the procedures we already have for status change. If the state
 	 * remains down, the server is not in any tree, so it's as easy as
@@ -326,6 +404,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 	struct eb_root *root;
 	unsigned int dn, dp;
 	int loop;
+	int hashafnty;
 
 	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
 
@@ -371,7 +450,17 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 	}
 
 	loop = 0;
-	while (nsrv == avoid || (p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv))) {
+	hashafnty = p->options3 & PR_O3_HASHAFNTY_MASK;
+
+	while (nsrv == avoid ||
+			(p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv)) ||
+			(hashafnty == PR_O3_HASHAFNTY_MAXCONN &&
+				nsrv->maxconn &&
+				nsrv->served >= srv_dynamic_maxconn(nsrv)) ||
+			(hashafnty == PR_O3_HASHAFNTY_MAXQUEUE &&
+				nsrv->maxconn &&
+				nsrv->maxqueue &&
+				nsrv->served + nsrv->queueslength >= srv_dynamic_maxconn(nsrv) + nsrv->maxqueue)) {
 		next = eb32_next(next);
 		if (!next) {
 			next = eb32_first(root);
@@ -443,7 +532,7 @@ struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid)
 		 * case we simply remember it for later use if needed.
 		 */
 		s = eb32_entry(node, struct tree_occ, node)->server;
-		if (!s->maxconn || (!s->queue.length && s->served < srv_dynamic_maxconn(s))) {
+		if (!s->maxconn || (!s->queueslength && s->served < srv_dynamic_maxconn(s))) {
 			if (s != srvtoavoid) {
 				srv = s;
 				break;
@@ -464,7 +553,7 @@ struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid)
 }
 
 /* This function is responsible for building the active and backup trees for
- * constistent hashing. The servers receive an array of initialized nodes
+ * consistent hashing. The servers receive an array of initialized nodes
  * with their assigned keys. It also sets p->lbprm.wdiv to the eweight to
  * uweight ratio.
  * Return 0 in case of success, -1 in case of allocation failure.
@@ -505,9 +594,10 @@ int chash_init_server_tree(struct proxy *p)
 			ha_alert("failed to allocate lb_nodes for server %s.\n", srv->id);
 			return -1;
 		}
+		srv->lb_server_key = chash_compute_server_key(srv);
 		for (node = 0; node < srv->lb_nodes_tot; node++) {
 			srv->lb_nodes[node].server = srv;
-			srv->lb_nodes[node].node.key = full_hash(srv->puid * SRV_EWGHT_RANGE + node);
+			srv->lb_nodes[node].node.key = chash_compute_node_key(srv, node);
 		}
 
 		if (srv_currently_usable(srv))

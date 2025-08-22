@@ -8,9 +8,11 @@
 
 size_t qcs_http_rcv_buf(struct qcs *qcs, struct buffer *buf, size_t count,
                         char *fin);
+
+int qcs_http_handle_standalone_fin(struct qcs *qcs);
+
 size_t qcs_http_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count,
                         char *fin);
-size_t qcs_http_reset_buf(struct qcs *qcs, struct buffer *buf, size_t count);
 
 #endif /* USE_QUIC */
 

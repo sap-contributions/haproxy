@@ -42,7 +42,7 @@ struct comp_state {
 };
 
 /* Pools used to allocate comp_state structs */
-DECLARE_STATIC_POOL(pool_head_comp_state, "comp_state", sizeof(struct comp_state));
+DECLARE_STATIC_TYPED_POOL(pool_head_comp_state, "comp_state", struct comp_state);
 
 static THREAD_LOCAL struct buffer tmpbuf;
 static THREAD_LOCAL struct buffer zbuf;
@@ -73,9 +73,9 @@ comp_flt_init(struct proxy *px, struct flt_conf *fconf)
 static int
 comp_flt_init_per_thread(struct proxy *px, struct flt_conf *fconf)
 {
-	if (b_alloc(&tmpbuf) == NULL)
+	if (b_alloc(&tmpbuf, DB_PERMANENT) == NULL)
 		return -1;
-	if (b_alloc(&zbuf) == NULL)
+	if (b_alloc(&zbuf, DB_PERMANENT) == NULL)
 		return -1;
 	return 0;
 }
@@ -137,6 +137,9 @@ comp_prepare_compress_request(struct comp_state *st, struct stream *s, struct ht
 	struct http_txn *txn = s->txn;
 	struct http_hdr_ctx ctx;
 	struct comp_type *comp_type;
+	unsigned int comp_minsize = 0;
+	int32_t pos;
+	unsigned long long len = 0;
 
 	ctx.blk = NULL;
 	/* Already compressed, don't bother */
@@ -146,6 +149,25 @@ comp_prepare_compress_request(struct comp_state *st, struct stream *s, struct ht
 	if (!(msg->flags & HTTP_MSGF_VER_11) || !(txn->req.flags & HTTP_MSGF_VER_11))
 		return;
 	comp_type = NULL;
+
+	/* compress only if body size is >= than the min size */
+	if ((s->be->comp && (comp_minsize = s->be->comp->minsize_req)) ||
+		(strm_fe(s)->comp && (comp_minsize = strm_fe(s)->comp->minsize_req))) {
+		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+			struct htx_blk *blk = htx_get_blk(htx, pos);
+			enum htx_blk_type type = htx_get_blk_type(blk);
+
+			if (type == HTX_BLK_TLR || type == HTX_BLK_EOT)
+				break;
+			if (type == HTX_BLK_DATA)
+				len += htx_get_blksz(blk);
+		}
+		if (htx->extra != HTX_UNKOWN_PAYLOAD_LENGTH)
+			len += htx->extra;
+		/* small requests should not be compressed */
+		if (len < comp_minsize)
+			goto fail;
+	}
 
 	/*
 	 * We don't want to compress content-types not listed in the "compression type" directive if any. If no content-type was found but configuration
@@ -183,10 +205,12 @@ comp_prepare_compress_request(struct comp_state *st, struct stream *s, struct ht
 
 	if (txn->meth == HTTP_METH_HEAD)
 		return;
-	if (s->be->comp->algo_req != NULL)
+	if (s->be->comp && s->be->comp->algo_req != NULL)
 		st->comp_algo[COMP_DIR_REQ] = s->be->comp->algo_req;
-	else if (strm_fe(s)->comp->algo_req != NULL)
+	else if (strm_fe(s)->comp && strm_fe(s)->comp->algo_req != NULL)
 		st->comp_algo[COMP_DIR_REQ] = strm_fe(s)->comp->algo_req;
+	else
+		goto fail; /* no algo selected: nothing to do */
 
 
 	/* limit compression rate */
@@ -369,14 +393,14 @@ comp_http_payload(struct stream *s, struct filter *filter, struct http_msg *msg,
 
 	if (st->comp_ctx[dir] && st->comp_ctx[dir]->cur_lvl > 0) {
 		update_freq_ctr(&global.comp_bps_in, consumed);
-		_HA_ATOMIC_ADD(&strm_fe(s)->fe_counters.comp_in[dir], consumed);
-		_HA_ATOMIC_ADD(&s->be->be_counters.comp_in[dir], consumed);
+		_HA_ATOMIC_ADD(&s->sess->fe_tgcounters->comp_in[dir], consumed);
+		_HA_ATOMIC_ADD(&s->be_tgcounters->comp_in[dir], consumed);
 		update_freq_ctr(&global.comp_bps_out, to_forward);
-		_HA_ATOMIC_ADD(&strm_fe(s)->fe_counters.comp_out[dir], to_forward);
-		_HA_ATOMIC_ADD(&s->be->be_counters.comp_out[dir], to_forward);
+		_HA_ATOMIC_ADD(&s->sess->fe_tgcounters->comp_out[dir], to_forward);
+		_HA_ATOMIC_ADD(&s->be_tgcounters->comp_out[dir], to_forward);
 	} else {
-		_HA_ATOMIC_ADD(&strm_fe(s)->fe_counters.comp_byp[dir], consumed);
-		_HA_ATOMIC_ADD(&s->be->be_counters.comp_byp[dir], consumed);
+		_HA_ATOMIC_ADD(&s->sess->fe_tgcounters->comp_byp[dir], consumed);
+		_HA_ATOMIC_ADD(&s->be_tgcounters->comp_byp[dir], consumed);
 	}
 	return to_forward;
 
@@ -395,9 +419,9 @@ comp_http_end(struct stream *s, struct filter *filter,
 		goto end;
 
 	if (strm_fe(s)->mode == PR_MODE_HTTP)
-		_HA_ATOMIC_INC(&strm_fe(s)->fe_counters.p.http.comp_rsp);
+		_HA_ATOMIC_INC(&s->sess->fe_tgcounters->p.http.comp_rsp);
 	if ((s->flags & SF_BE_ASSIGNED) && (s->be->mode == PR_MODE_HTTP))
-		_HA_ATOMIC_INC(&s->be->be_counters.p.http.comp_rsp);
+		_HA_ATOMIC_INC(&s->be_tgcounters->p.http.comp_rsp);
  end:
 	return 1;
 }
@@ -491,6 +515,7 @@ set_compression_header(struct comp_state *st, struct stream *s, struct http_msg 
 			goto error;
 	}
 
+	chn_prod(msg->chn)->flags |= SC_FL_NO_FASTFWD;
 	return 1;
 
   error:
@@ -622,6 +647,9 @@ select_compression_response_header(struct comp_state *st, struct stream *s, stru
 	struct http_txn *txn = s->txn;
 	struct http_hdr_ctx ctx;
 	struct comp_type *comp_type;
+	unsigned int comp_minsize = 0;
+	int32_t pos;
+	unsigned long long len = 0;
 
 	/* no common compression algorithm was found in request header */
 	if (st->comp_algo[COMP_DIR_RES] == NULL)
@@ -647,6 +675,25 @@ select_compression_response_header(struct comp_state *st, struct stream *s, stru
 
 	if (!(msg->flags & HTTP_MSGF_XFER_LEN) || msg->flags & HTTP_MSGF_BODYLESS)
 		goto fail;
+
+	/* compress only if body size is >= than the min size */
+	if ((s->be->comp && (comp_minsize = s->be->comp->minsize_res)) ||
+		(strm_fe(s)->comp && (comp_minsize = strm_fe(s)->comp->minsize_res))) {
+		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+			struct htx_blk *blk = htx_get_blk(htx, pos);
+			enum htx_blk_type type = htx_get_blk_type(blk);
+
+			if (type == HTX_BLK_TLR || type == HTX_BLK_EOT)
+				break;
+			if (type == HTX_BLK_DATA)
+				len += htx_get_blksz(blk);
+		}
+		if (htx->extra != HTX_UNKOWN_PAYLOAD_LENGTH)
+			len += htx->extra;
+		/* small responses should not be compressed */
+		if (len < comp_minsize)
+			goto fail;
+	}
 
 	/* content is already compressed */
 	ctx.blk = NULL;
@@ -779,6 +826,7 @@ parse_compression_options(char **args, int section, struct proxy *proxy,
 {
 	struct comp    *comp;
 	int ret = 0;
+	const char *res;
 
 	if (proxy->comp == NULL) {
 		comp = calloc(1, sizeof(*comp));
@@ -794,12 +842,6 @@ parse_compression_options(char **args, int section, struct proxy *proxy,
 	else
 		comp = proxy->comp;
 
-	if (proxy->mode != PR_MODE_TCP && proxy->mode != PR_MODE_HTTP) {
-		memprintf(err, "parsing [%s:%d] : '%s' requires TCP or HTTP mode.",
-			  file, line, args[0]);
-		ret = -1;
-		goto end;
-	}
 	if (strcmp(args[1], "algo") == 0 || strcmp(args[1], "algo-res") == 0) {
 		struct comp_ctx *ctx;
 		int              cur_arg = 2;
@@ -903,6 +945,32 @@ parse_compression_options(char **args, int section, struct proxy *proxy,
 			continue;
 		}
 	}
+	else if (strcmp(args[1], "minsize-req") == 0) {
+		if (*(args[2]) == 0) {
+			memprintf(err, "'%s' expects an integer argument.", args[1]);
+			ret = -1;
+			goto end;
+		}
+		res = parse_size_err(args[2], &comp->minsize_req);
+		if (res != NULL) {
+			memprintf(err, "unexpected '%s' after size passed to '%s'", res, args[1]);
+			ret = -1;
+			goto end;
+		}
+	}
+	else if (strcmp(args[1], "minsize-res") == 0) {
+		if (*(args[2]) == 0) {
+			memprintf(err, "'%s' expects an integer argument.", args[1]);
+			ret = -1;
+			goto end;
+		}
+		res = parse_size_err(args[2], &comp->minsize_res);
+		if (res != NULL) {
+			memprintf(err, "unexpected '%s' after size passed to '%s'", res, args[1]);
+			ret = -1;
+			goto end;
+		}
+	}
 	else if (strcmp(args[1], "direction") == 0) {
 		if (!args[2]) {
 			memprintf(err, "'%s' expects 'request', 'response', or 'both'.", args[0]);
@@ -924,7 +992,7 @@ parse_compression_options(char **args, int section, struct proxy *proxy,
 		}
 	}
 	else {
-		memprintf(err, "'%s' expects 'algo', 'type' 'direction' or 'offload'",
+		memprintf(err, "'%s' expects 'algo', 'type', 'direction', 'offload', 'minsize-req' or 'minsize-res'.",
 			  args[0]);
 		ret = -1;
 		goto end;

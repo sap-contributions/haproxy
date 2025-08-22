@@ -38,7 +38,7 @@ int h1_parse_msg_tlrs(struct h1m *h1m, struct htx *dsthtx,
 		      struct buffer *srcbuf, size_t ofs, size_t max);
 
 /* Returns the URI of an HTX message in the most common format for a H1 peer. It
- * is the path part of an absolute URI when the URI was normalized, ortherwise
+ * is the path part of an absolute URI when the URI was normalized, otherwise
  * it is the whole URI, as received. Concretely, it is only a special case for
  * URIs received from H2 clients, to be able to send a relative path the H1
  * servers.
@@ -65,6 +65,7 @@ int h1_format_htx_reqline(const struct htx_sl *sl, struct buffer *chk);
 int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk);
 int h1_format_htx_hdr(const struct ist n, const struct ist v, struct buffer *chk);
 int h1_format_htx_data(const struct ist data, struct buffer *chk, int chunked);
+int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf);
 
 #endif /* _HAPROXY_H1_HTX_H */
 

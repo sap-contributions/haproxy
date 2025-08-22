@@ -20,17 +20,17 @@ struct xprt_handshake_ctx {
 	void *xprt_ctx;
 };
 
-DECLARE_STATIC_POOL(xprt_handshake_ctx_pool, "xprt_handshake_ctx", sizeof(struct xprt_handshake_ctx));
+DECLARE_STATIC_TYPED_POOL(xprt_handshake_ctx_pool, "xprt_handshake_ctx", struct xprt_handshake_ctx);
 
 /* This XPRT doesn't take care of sending or receiving data, once its handshake
  * is done, it just removes itself
  */
-static size_t xprt_handshake_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags)
+static size_t xprt_handshake_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, void *msg_control, size_t msg_controllen, int flags)
 {
 	return 0;
 }
 
-static size_t xprt_handshake_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags)
+static size_t xprt_handshake_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, void *msg_control, size_t *msg_controllen, int flags)
 {
 	return 0;
 }
@@ -115,7 +115,7 @@ out:
 		 */
 		if (was_conn_ctx) {
 			if (!ctx->conn->mux)
-				ret = conn_create_mux(ctx->conn);
+				ret = conn_create_mux(ctx->conn, NULL);
 			if (ret >= 0 && !woke && ctx->conn->mux && ctx->conn->mux->wake)
 				ret = ctx->conn->mux->wake(ctx->conn);
 		}

@@ -72,8 +72,6 @@ struct protocol proto_udp4 = {
 	.rx_enable      = sock_enable,
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
-	.receivers      = LIST_HEAD_INIT(proto_udp4.receivers),
-	.nb_receivers   = 0,
 #ifdef SO_REUSEPORT
 	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
 #endif
@@ -109,8 +107,6 @@ struct protocol proto_udp6 = {
 	.rx_enable      = sock_enable,
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
-	.receivers      = LIST_HEAD_INIT(proto_udp6.receivers),
-	.nb_receivers   = 0,
 #ifdef SO_REUSEPORT
 	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
 #endif
@@ -146,6 +142,33 @@ int udp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	if (!(listener->rx.flags & RX_F_BOUND)) {
 		msg = "receiving socket not bound";
 		goto udp_return;
+	}
+
+	/* we may want to adjust the output buffer (tune.sndbuf.backend) */
+	if (global.tune.frontend_rcvbuf)
+		setsockopt(listener->rx.fd, SOL_SOCKET, SO_RCVBUF, &global.tune.frontend_rcvbuf, sizeof(global.tune.frontend_rcvbuf));
+
+	if (global.tune.frontend_sndbuf)
+		setsockopt(listener->rx.fd, SOL_SOCKET, SO_SNDBUF, &global.tune.frontend_sndbuf, sizeof(global.tune.frontend_sndbuf));
+
+	if (listener->rx.flags & RX_F_PASS_PKTINFO) {
+		/* set IP_PKTINFO to retrieve destination address on recv */
+		switch (listener->rx.addr.ss_family) {
+		case AF_INET:
+#if defined(IP_PKTINFO)
+			setsockopt(listener->rx.fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+#elif defined(IP_RECVDSTADDR)
+			setsockopt(listener->rx.fd, IPPROTO_IP, IP_RECVDSTADDR, &one, sizeof(one));
+#endif /* IP_PKTINFO || IP_RECVDSTADDR */
+			break;
+		case AF_INET6:
+#ifdef IPV6_RECVPKTINFO
+			setsockopt(listener->rx.fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one));
+#endif
+			break;
+		default:
+			break;
+		}
 	}
 
 	listener_set_state(listener, LI_LISTEN);

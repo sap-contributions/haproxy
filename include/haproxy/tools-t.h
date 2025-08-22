@@ -22,6 +22,9 @@
 #ifndef _HAPROXY_TOOLS_T_H
 #define _HAPROXY_TOOLS_T_H
 
+#include <netinet/in.h>
+#include <import/cebtree.h>
+
 /* size used for max length of decimal representation of long long int. */
 #define NB_LLMAX_STR (sizeof("-9223372036854775807")-1)
 
@@ -44,10 +47,21 @@
 /* return the largest possible integer of type <ret>, with all bits set */
 #define MAX_RANGE(ret) (~(typeof(ret))0)
 
+/* DEFVAL() returns either the second argument as-is, or <def> if absent. This
+ * is for use in macros arguments.
+ */
+#define DEFVAL(_def,...) _FIRST_ARG(NULL, ##__VA_ARGS__, (_def))
+
 /* DEFNULL() returns either the argument as-is, or NULL if absent. This is for
  * use in macros arguments.
  */
-#define DEFNULL(...) _FIRST_ARG(NULL, ##__VA_ARGS__, NULL)
+#define DEFNULL(...) DEFVAL(NULL, ##__VA_ARGS__)
+
+/* DEFZERO() returns either the argument as-is, or 0 if absent. This is for
+ * use in macros arguments.
+ */
+#define DEFZERO(...) DEFVAL(0, ##__VA_ARGS__)
+
 #define _FIRST_ARG(a, b, ...) b
 
 /* options flags for parse_line() */
@@ -155,6 +169,40 @@ struct net_addr {
 			struct in6_addr mask;
 		} v6;
 	} addr;
+};
+
+/* holds socket and xprt types for a given address */
+struct net_addr_type {
+	int proto_type; // socket layer
+	int xprt_type;  // transport layer
+};
+
+/* To easily pass context to cbor encode functions
+ */
+struct cbor_encode_ctx {
+	/* function pointer that cbor encode functions will use to encode a
+	 * single byte.
+	 *
+	 * The function needs to return the position of the last written byte
+	 * on success and NULL on failure. The function cannot write past <stop>
+	 */
+	char *(*e_fct_byte)(struct cbor_encode_ctx *ctx,
+	                    char *start, char *stop, uint8_t byte);
+
+	/* to provide some user-context to the encode_fct_* funcs */
+	void *e_fct_ctx;
+};
+
+/* An indexed file name node, to be used at various places where a config file
+ * location is expected. These elements live forever and are only released on
+ * deinit. The goal is to use them in place of a regular "char* file" in many
+ * structures so that they can remain referenced without being strduped nor
+ * refcounted. Refcounts might appear in the future. The root is file_names in
+ * tools.c.
+ */
+struct file_name_node {
+	struct ceb_node node; /* indexing node */
+	char name[VAR_ARRAY]; /* storage, used with cebus_*() */
 };
 
 #endif /* _HAPROXY_TOOLS_T_H */

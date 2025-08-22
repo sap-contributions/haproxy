@@ -25,22 +25,24 @@
 #include <haproxy/log.h>
 #include <haproxy/namespace.h>
 #include <haproxy/net_helper.h>
-#include <haproxy/proto_reverse_connect.h>
+#include <haproxy/proto_rhttp.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
+#include <haproxy/server.h>
 #include <haproxy/session.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
+#include <haproxy/tcpcheck.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
 
 
-DECLARE_POOL(pool_head_connection,     "connection",     sizeof(struct connection));
-DECLARE_POOL(pool_head_conn_hash_node, "conn_hash_node", sizeof(struct conn_hash_node));
-DECLARE_POOL(pool_head_sockaddr,       "sockaddr",       sizeof(struct sockaddr_storage));
-DECLARE_POOL(pool_head_pp_tlv_128,     "pp_tlv_128",     sizeof(struct conn_tlv_list) + HA_PP2_TLV_VALUE_128);
-DECLARE_POOL(pool_head_pp_tlv_256,     "pp_tlv_256",     sizeof(struct conn_tlv_list) + HA_PP2_TLV_VALUE_256);
+DECLARE_TYPED_POOL(pool_head_connection,     "connection",     struct connection, 0, 64);
+DECLARE_TYPED_POOL(pool_head_conn_hash_node, "conn_hash_node", struct conn_hash_node);
+DECLARE_TYPED_POOL(pool_head_sockaddr,       "sockaddr",       struct sockaddr_storage);
+DECLARE_TYPED_POOL(pool_head_pp_tlv_128,     "pp_tlv_128",     struct conn_tlv_list, HA_PP2_TLV_VALUE_128);
+DECLARE_TYPED_POOL(pool_head_pp_tlv_256,     "pp_tlv_256",     struct conn_tlv_list, HA_PP2_TLV_VALUE_256);
 
 struct idle_conns idle_conns[MAX_THREADS] = { };
 struct xprt_ops *registered_xprt[XPRT_ENTRIES] = { NULL, };
@@ -82,8 +84,11 @@ void conn_delete_from_tree(struct connection *conn)
 	eb64_delete(&conn->hash_node->node);
 }
 
-int conn_create_mux(struct connection *conn)
+int conn_create_mux(struct connection *conn, int *closed_connection)
 {
+	if (closed_connection)
+		*closed_connection = 0;
+
 	if (conn_is_back(conn)) {
 		struct server *srv;
 		struct stconn *sc = conn->ctx;
@@ -107,11 +112,12 @@ int conn_create_mux(struct connection *conn)
 		 * server list.
 		 */
 		if (srv && ((srv->proxy->options & PR_O_REUSE_MASK) == PR_O_REUSE_ALWS) &&
-		    !(conn->flags & CO_FL_PRIVATE) && conn->mux->avail_streams(conn) > 0)
-			eb64_insert(&srv->per_thr[tid].avail_conns, &conn->hash_node->node);
+		    !(conn->flags & CO_FL_PRIVATE) && conn->mux->avail_streams(conn) > 0) {
+			srv_add_to_avail_list(srv, conn);
+		}
 		else if (conn->flags & CO_FL_PRIVATE) {
 			/* If it fail now, the same will be done in mux->detach() callback */
-			session_add_conn(sess, conn, conn->target);
+			session_add_conn(sess, conn);
 		}
 		return 0;
 fail:
@@ -124,7 +130,7 @@ fail:
 
 			/* If mux init failed, consider connection on error.
 			 * This is necessary to ensure connection is freed by
-			 * proto-reverse-connect receiver task.
+			 * proto-rhttp receiver task.
 			 */
 			if (!conn->mux)
 				conn->flags |= CO_FL_ERROR;
@@ -132,11 +138,16 @@ fail:
 			/* If connection is interrupted  without CO_FL_ERROR, receiver task won't free it. */
 			BUG_ON(!(conn->flags & CO_FL_ERROR));
 
-			task_wakeup(l->rx.reverse_connect.task, TASK_WOKEN_ANY);
+			task_wakeup(l->rx.rhttp.task, TASK_WOKEN_RES);
 		}
 		return -1;
-	} else
-		return conn_complete_session(conn);
+	} else {
+
+		int ret = conn_complete_session(conn);
+		if (ret == -1 && closed_connection)
+			*closed_connection = 1;
+		return ret;
+	}
 
 }
 
@@ -154,7 +165,7 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 	 * done with the handshake, attempt to create one.
 	 */
 	if (unlikely(!conn->mux) && !(conn->flags & CO_FL_WAIT_XPRT)) {
-		ret = conn_create_mux(conn);
+		ret = conn_create_mux(conn, NULL);
 		if (ret < 0)
 			goto done;
 	}
@@ -269,12 +280,7 @@ int conn_install_mux_fe(struct connection *conn, void *ctx)
 		struct ist mux_proto;
 		const char *alpn_str = NULL;
 		int alpn_len = 0;
-		int mode;
-
-		if (bind_conf->frontend->mode == PR_MODE_HTTP)
-			mode = PROTO_MODE_HTTP;
-		else
-			mode = PROTO_MODE_TCP;
+		int mode = conn_pr_mode_to_proto_mode(bind_conf->frontend->mode);
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
 		mux_proto = ist2(alpn_str, alpn_len);
@@ -283,7 +289,7 @@ int conn_install_mux_fe(struct connection *conn, void *ctx)
 			return -1;
 	}
 
-	/* Ensure a valid protocol is selected if connection is targetted by a
+	/* Ensure a valid protocol is selected if connection is targeted by a
 	 * tcp-request session attach-srv rule.
 	 */
 	if (conn->reverse.target && !(mux_ops->flags & MX_FL_REVERSABLE)) {
@@ -324,12 +330,7 @@ int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess
 		struct ist mux_proto;
 		const char *alpn_str = NULL;
 		int alpn_len = 0;
-		int mode;
-
-		if (prx->mode == PR_MODE_HTTP)
-			mode = PROTO_MODE_HTTP;
-		else
-			mode = PROTO_MODE_TCP;
+		int mode = conn_pr_mode_to_proto_mode(prx->mode);
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
 		mux_proto = ist2(alpn_str, alpn_len);
@@ -367,12 +368,7 @@ int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *ses
 		struct ist mux_proto;
 		const char *alpn_str = NULL;
 		int alpn_len = 0;
-		int mode;
-
-		if ((check->tcpcheck_rules->flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_HTTP_CHK)
-			mode = PROTO_MODE_HTTP;
-		else
-			mode = PROTO_MODE_TCP;
+		int mode = tcpchk_rules_type_to_proto_mode(check->tcpcheck_rules->flags);
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
 		mux_proto = ist2(alpn_str, alpn_len);
@@ -467,12 +463,13 @@ void conn_init(struct connection *conn, void *target)
 	conn->send_proxy_ofs = 0;
 	conn->handle.fd = DEAD_FD_MAGIC;
 	conn->err_code = CO_ER_NONE;
+	conn->term_evts_log = 0;
 	conn->target = target;
 	conn->destroy_cb = NULL;
 	conn->proxy_netns = NULL;
 	MT_LIST_INIT(&conn->toremove_list);
 	if (conn_is_back(conn))
-		LIST_INIT(&conn->session_list);
+		LIST_INIT(&conn->sess_el);
 	else
 		LIST_INIT(&conn->stopping_list);
 	LIST_INIT(&conn->tlv_list);
@@ -509,14 +506,19 @@ static int conn_backend_init(struct connection *conn)
  */
 static void conn_backend_deinit(struct connection *conn)
 {
-	/* If the connection is owned by the session, remove it from its list
-	 */
-	if (conn_is_back(conn) && LIST_INLIST(&conn->session_list)) {
+	/* If the connection is owned by the session, remove it from its list. */
+	if (LIST_INLIST(&conn->sess_el))
 		session_unown_conn(conn->owner, conn);
-	}
-	else if (!(conn->flags & CO_FL_PRIVATE)) {
-		if (obj_type(conn->target) == OBJ_TYPE_SERVER)
-			srv_release_conn(__objt_server(conn->target), conn);
+
+	if (obj_type(conn->target) == OBJ_TYPE_SERVER) {
+		struct server *srv = __objt_server(conn->target);
+
+		/* If the connection is not private, it is accounted by the server. */
+		if (!(conn->flags & CO_FL_PRIVATE)) {
+			srv_release_conn(srv, conn);
+		}
+		if (srv->flags & SRV_F_STRICT_MAXCONN)
+			_HA_ATOMIC_DEC(&srv->curr_total_conns);
 	}
 
 	/* Make sure the connection is not left in the idle connection tree */
@@ -589,11 +591,31 @@ void conn_free(struct connection *conn)
 
 	if (conn_reverse_in_preconnect(conn)) {
 		struct listener *l = conn_active_reverse_listener(conn);
-		rev_notify_preconn_err(l);
+		rhttp_notify_preconn_err(l);
+		HA_ATOMIC_DEC(&th_ctx->nb_rhttp_conns);
 	}
+	else if (conn->flags & CO_FL_REVERSED) {
+		HA_ATOMIC_DEC(&th_ctx->nb_rhttp_conns);
+	}
+
 
 	conn_force_unsubscribe(conn);
 	pool_free(pool_head_connection, conn);
+}
+
+/* Close all <conn> internal layers accordingly prior to freeing it. */
+void conn_release(struct connection *conn)
+{
+	if (conn->mux) {
+		conn->mux->destroy(conn->ctx);
+	}
+	else {
+		conn_stop_tracking(conn);
+		conn_full_close(conn);
+		if (conn->destroy_cb)
+			conn->destroy_cb(conn);
+		conn_free(conn);
+	}
 }
 
 struct conn_hash_node *conn_alloc_hash_node(struct connection *conn)
@@ -678,6 +700,74 @@ int xprt_add_hs(struct connection *conn)
 	return 0;
 }
 
+/* returns a short name for an error, typically the same as the enum name
+ * without the "CO_ER_" prefix, or an empty string for no error (better eye
+ * catching in logs). This is more compact for some debug cases.
+ */
+const char *conn_err_code_name(struct connection *c)
+{
+	switch (c->err_code) {
+	case CO_ER_NONE:             return "";
+	case CO_ER_CONF_FDLIM:       return "CONF_FDLIM";
+	case CO_ER_PROC_FDLIM:       return "PROC_FDLIM";
+	case CO_ER_SYS_FDLIM:        return "SYS_FDLIM";
+	case CO_ER_SYS_MEMLIM:       return "SYS_MEMLIM";
+	case CO_ER_NOPROTO:          return "NOPROTO";
+	case CO_ER_SOCK_ERR:         return "SOCK_ERR";
+	case CO_ER_PORT_RANGE:       return "PORT_RANGE";
+	case CO_ER_CANT_BIND:        return "CANT_BIND";
+	case CO_ER_FREE_PORTS:       return "FREE_PORTS";
+	case CO_ER_ADDR_INUSE:       return "ADDR_INUSE";
+	case CO_ER_PRX_EMPTY:        return "PRX_EMPTY";
+	case CO_ER_PRX_ABORT:        return "PRX_ABORT";
+	case CO_ER_PRX_TIMEOUT:      return "PRX_TIMEOUT";
+	case CO_ER_PRX_TRUNCATED:    return "PRX_TRUNCATED";
+	case CO_ER_PRX_NOT_HDR:      return "PRX_NOT_HDR";
+	case CO_ER_PRX_BAD_HDR:      return "PRX_BAD_HDR";
+	case CO_ER_PRX_BAD_PROTO:    return "PRX_BAD_PROTO";
+	case CO_ER_CIP_EMPTY:        return "CIP_EMPTY";
+	case CO_ER_CIP_ABORT:        return "CIP_ABORT";
+	case CO_ER_CIP_TIMEOUT:      return "CIP_TIMEOUT";
+	case CO_ER_CIP_TRUNCATED:    return "CIP_TRUNCATED";
+	case CO_ER_CIP_BAD_MAGIC:    return "CIP_BAD_MAGIC";
+	case CO_ER_CIP_BAD_PROTO:    return "CIP_BAD_PROTO";
+	case CO_ER_SSL_EMPTY:        return "SSL_EMPTY";
+	case CO_ER_SSL_ABORT:        return "SSL_ABORT";
+	case CO_ER_SSL_TIMEOUT:      return "SSL_TIMEOUT";
+	case CO_ER_SSL_TOO_MANY:     return "SSL_TOO_MANY";
+	case CO_ER_SSL_NO_MEM:       return "SSL_NO_MEM";
+	case CO_ER_SSL_RENEG:        return "SSL_RENEG";
+	case CO_ER_SSL_CA_FAIL:      return "SSL_CA_FAIL";
+	case CO_ER_SSL_CRT_FAIL:     return "SSL_CRT_FAIL";
+	case CO_ER_SSL_MISMATCH:     return "SSL_MISMATCH";
+	case CO_ER_SSL_MISMATCH_SNI: return "SSL_MISMATCH_SNI";
+	case CO_ER_SSL_HANDSHAKE:    return "SSL_HANDSHAKE";
+	case CO_ER_SSL_HANDSHAKE_HB: return "SSL_HANDSHAKE_HB";
+	case CO_ER_SSL_KILLED_HB:    return "SSL_KILLED_HB";
+	case CO_ER_SSL_NO_TARGET:    return "SSL_NO_TARGET";
+	case CO_ER_SSL_EARLY_FAILED: return "SSL_EARLY_FAILED";
+	case CO_ER_SOCKS4_SEND:      return "SOCKS4_SEND";
+	case CO_ER_SOCKS4_RECV:      return "SOCKS4_RECV";
+	case CO_ER_SOCKS4_DENY:      return "SOCKS4_DENY";
+	case CO_ER_SOCKS4_ABORT:     return "SOCKS4_ABORT";
+	case CO_ER_SSL_FATAL:        return "SSL_FATAL";
+	case CO_ER_REVERSE:          return "REVERSE";
+	case CO_ER_POLLERR:          return "POLLERR";
+	case CO_ER_EREFUSED:         return "EREFUSED";
+	case CO_ER_ERESET:           return "ERESET";
+	case CO_ER_EUNREACH:         return "EUNREACH";
+	case CO_ER_ENOMEM:           return "ENOMEM";
+	case CO_ER_EBADF:            return "EBADF";
+	case CO_ER_EFAULT:           return "EFAULT";
+	case CO_ER_EINVAL:           return "EINVAL";
+	case CO_ER_ENCONN:           return "ENCONN";
+	case CO_ER_ENSOCK:           return "ENSOCK";
+	case CO_ER_ENOBUFS:          return "ENOBUFS";
+	case CO_ER_EPIPE:            return "EPIPE";
+	}
+	return NULL;
+}
+
 /* returns a human-readable error code for conn->err_code, or NULL if the code
  * is unknown.
  */
@@ -733,11 +823,55 @@ const char *conn_err_code_str(struct connection *c)
 	case CO_ER_SOCKS4_DENY:    return "SOCKS4 Proxy deny the request";
 	case CO_ER_SOCKS4_ABORT:   return "SOCKS4 Proxy handshake aborted by server";
 
-	case CO_ERR_SSL_FATAL:     return "SSL fatal error";
+	case CO_ER_SSL_FATAL:      return "SSL fatal error";
 
 	case CO_ER_REVERSE:        return "Reverse connect failure";
+
+	case CO_ER_POLLERR:        return "Poller reported POLLERR";
+	case CO_ER_EREFUSED:       return "ECONNREFUSED returned by OS";
+	case CO_ER_ERESET:         return "ECONNRESET returned by OS";
+	case CO_ER_EUNREACH:       return "ENETUNREACH returned by OS";
+	case CO_ER_ENOMEM:         return "ENOMEM returned by OS";
+	case CO_ER_EBADF:          return "EBADF returned by OS";
+	case CO_ER_EFAULT:         return "EFAULT returned by OS";
+	case CO_ER_EINVAL:         return "EINVAL returned by OS";
+	case CO_ER_ENCONN:         return "ENCONN returned by OS";
+	case CO_ER_ENSOCK:         return "ENSOCK returned by OS";
+	case CO_ER_ENOBUFS:        return "ENOBUFS returned by OS";
+	case CO_ER_EPIPE:          return "EPIPE returned by OS";
 	}
 	return NULL;
+}
+
+/* Try to set conn->err_code to a meaningful value based on the errno value
+ * passed in <err>. Values of errno are meant to be set on return from recv/
+ * send mostly, so not all of them are handled. Any existing err_code is
+ * preserved.
+ */
+void conn_set_errno(struct connection *conn, int err)
+{
+	uchar code = 0;
+
+	if (conn->err_code)
+		return;
+
+	switch (err) {
+	case ECONNREFUSED: code = CO_ER_EREFUSED; break;
+	case ECONNRESET:   code = CO_ER_ERESET;   break;
+	case EHOSTUNREACH: code = CO_ER_EUNREACH; break;
+	case ENETUNREACH:  code = CO_ER_EUNREACH; break;
+	case ENOMEM:       code = CO_ER_ENOMEM;   break;
+	case EBADF:        code = CO_ER_EBADF;    break;
+	case EFAULT:       code = CO_ER_EFAULT;   break;
+	case EINVAL:       code = CO_ER_EINVAL;   break;
+	case ENOTCONN:     code = CO_ER_ENCONN;   break;
+	case ENOTSOCK:     code = CO_ER_ENSOCK;   break;
+	case ENOBUFS:      code = CO_ER_ENOBUFS;  break;
+	case EPIPE:        code = CO_ER_EPIPE;    break;
+	default:           code = CO_ER_SOCK_ERR; break;
+	}
+
+	conn->err_code = code;
 }
 
 /* Send a message over an established connection. It makes use of send() and
@@ -774,7 +908,7 @@ int conn_ctrl_send(struct connection *conn, const void *buf, int len, int flags)
 	/* snd_buf() already takes care of updating conn->flags and handling
 	 * the FD polling status.
 	 */
-	ret = xprt->snd_buf(conn, NULL, &buffer, buffer.data, flags);
+	ret = xprt->snd_buf(conn, NULL, &buffer, buffer.data, NULL, 0, flags);
 	if (conn->flags & CO_FL_ERROR)
 		ret = -1;
 	return ret;
@@ -806,7 +940,7 @@ int conn_unsubscribe(struct connection *conn, void *xprt_ctx, int event_type, st
 /* Called from the upper layer, to subscribe <es> to events <event_type>.
  * The <es> struct is not allowed to differ from the one passed during a
  * previous call to subscribe(). If the connection's ctrl layer is ready,
- * the wait_event is immediately woken up and the subcription is cancelled.
+ * the wait_event is immediately woken up and the subscription is cancelled.
  * It always returns zero.
  */
 int conn_subscribe(struct connection *conn, void *xprt_ctx, int event_type, struct wait_event *es)
@@ -1107,110 +1241,111 @@ int conn_recv_proxy(struct connection *conn, int flag)
 			break;
 		}
 
-		/* TLV parsing */
-		while (tlv_offset < total_v2_len) {
-			struct ist tlv;
-			struct tlv *tlv_packet = NULL;
-			struct conn_tlv_list *new_tlv = NULL;
-			size_t data_len = 0;
-
-			/* Verify that we have at least TLV_HEADER_SIZE bytes left */
-			if (tlv_offset + TLV_HEADER_SIZE > total_v2_len)
-				goto bad_header;
-
-			tlv_packet = (struct tlv *) &trash.area[tlv_offset];
-			tlv = ist2((const char *)tlv_packet->value, get_tlv_length(tlv_packet));
-			tlv_offset += istlen(tlv) + TLV_HEADER_SIZE;
-
-			/* Verify that the TLV length does not exceed the total PROXYv2 length */
-			if (tlv_offset > total_v2_len)
-				goto bad_header;
-
-			/* Prepare known TLV types */
-			switch (tlv_packet->type) {
-			case PP2_TYPE_CRC32C: {
-				uint32_t n_crc32c;
-
-				/* Verify that this TLV is exactly 4 bytes long */
-				if (istlen(tlv) != PP2_CRC32C_LEN)
-					goto bad_header;
-
-				n_crc32c = read_n32(istptr(tlv));
-				write_n32(istptr(tlv), 0); // compute with CRC==0
-
-				if (hash_crc32c(trash.area, total_v2_len) != n_crc32c)
-					goto bad_header;
-				break;
-			}
-#ifdef USE_NS
-			case PP2_TYPE_NETNS: {
-				const struct netns_entry *ns;
-
-				ns = netns_store_lookup(istptr(tlv), istlen(tlv));
-				if (ns)
-					conn->proxy_netns = ns;
-				break;
-			}
-#endif
-			case PP2_TYPE_AUTHORITY: {
-				/* For now, keep the length restriction by HAProxy */
-				if (istlen(tlv) > HA_PP2_AUTHORITY_MAX)
-					goto bad_header;
-
-				break;
-			}
-			case PP2_TYPE_UNIQUE_ID: {
-				if (istlen(tlv) > UNIQUEID_LEN)
-					goto bad_header;
-				break;
-			}
-			default:
-				break;
-			}
-
-			/* If we did not find a known TLV type that we can optimize for, we generically allocate it */
-			data_len = get_tlv_length(tlv_packet);
-
-			/* Prevent attackers from allocating too much memory */
-			if (unlikely(data_len > HA_PP2_MAX_ALLOC))
-				goto fail;
-
-			/* Alloc memory based on data_len */
-			if (data_len > HA_PP2_TLV_VALUE_256)
-				new_tlv = malloc(get_tlv_length(tlv_packet) + sizeof(struct conn_tlv_list));
-			else if (data_len <= HA_PP2_TLV_VALUE_128)
-				new_tlv = pool_alloc(pool_head_pp_tlv_128);
-			else
-				new_tlv = pool_alloc(pool_head_pp_tlv_256);
-
-			if (unlikely(!new_tlv))
-				goto fail;
-
-			new_tlv->type = tlv_packet->type;
-
-			/* Save TLV to make it accessible via sample fetch */
-			memcpy(new_tlv->value, tlv.ptr, data_len);
-			new_tlv->len = data_len;
-
-			LIST_APPEND(&conn->tlv_list, &new_tlv->list);
-		}
-
-
-		/* Verify that the PROXYv2 header ends at a TLV boundary.
-		 * This is can not be true, because the TLV parsing already
-		 * verifies that a TLV does not exceed the total length and
-		 * also that there is space for a TLV header.
-		 */
-		BUG_ON(tlv_offset != total_v2_len);
-
 		/* unsupported protocol, keep local connection address */
 		break;
 	case 0x00: /* LOCAL command */
 		/* keep local connection address for LOCAL */
+
+		tlv_offset = PP2_HEADER_LEN;
 		break;
 	default:
 		goto bad_header; /* not a supported command */
 	}
+
+	/* TLV parsing */
+	while (tlv_offset < total_v2_len) {
+		struct ist tlv;
+		struct tlv *tlv_packet = NULL;
+		struct conn_tlv_list *new_tlv = NULL;
+		size_t data_len = 0;
+
+		/* Verify that we have at least TLV_HEADER_SIZE bytes left */
+		if (tlv_offset + TLV_HEADER_SIZE > total_v2_len)
+			goto bad_header;
+
+		tlv_packet = (struct tlv *) &trash.area[tlv_offset];
+		tlv = ist2((const char *)tlv_packet->value, get_tlv_length(tlv_packet));
+		tlv_offset += istlen(tlv) + TLV_HEADER_SIZE;
+
+		/* Verify that the TLV length does not exceed the total PROXYv2 length */
+		if (tlv_offset > total_v2_len)
+			goto bad_header;
+
+		/* Prepare known TLV types */
+		switch (tlv_packet->type) {
+		case PP2_TYPE_CRC32C: {
+			uint32_t n_crc32c;
+
+			/* Verify that this TLV is exactly 4 bytes long */
+			if (istlen(tlv) != PP2_CRC32C_LEN)
+				goto bad_header;
+
+			n_crc32c = read_n32(istptr(tlv));
+			write_n32(istptr(tlv), 0); // compute with CRC==0
+
+			if (hash_crc32c(trash.area, total_v2_len) != n_crc32c)
+				goto bad_header;
+			break;
+		}
+#ifdef USE_NS
+		case PP2_TYPE_NETNS: {
+			const struct netns_entry *ns;
+
+			ns = netns_store_lookup(istptr(tlv), istlen(tlv));
+			if (ns)
+				conn->proxy_netns = ns;
+			break;
+		}
+#endif
+		case PP2_TYPE_AUTHORITY: {
+			/* For now, keep the length restriction by HAProxy */
+			if (istlen(tlv) > HA_PP2_AUTHORITY_MAX)
+				goto bad_header;
+
+			break;
+		}
+		case PP2_TYPE_UNIQUE_ID: {
+			if (istlen(tlv) > UNIQUEID_LEN)
+				goto bad_header;
+			break;
+		}
+		default:
+			break;
+		}
+
+		/* If we did not find a known TLV type that we can optimize for, we generically allocate it */
+		data_len = get_tlv_length(tlv_packet);
+
+		/* Prevent attackers from allocating too much memory */
+		if (unlikely(data_len > HA_PP2_MAX_ALLOC))
+			goto fail;
+
+		/* Alloc memory based on data_len */
+		if (data_len > HA_PP2_TLV_VALUE_256)
+			new_tlv = malloc(get_tlv_length(tlv_packet) + sizeof(struct conn_tlv_list));
+		else if (data_len <= HA_PP2_TLV_VALUE_128)
+			new_tlv = pool_alloc(pool_head_pp_tlv_128);
+		else
+			new_tlv = pool_alloc(pool_head_pp_tlv_256);
+
+		if (unlikely(!new_tlv))
+			goto fail;
+
+		new_tlv->type = tlv_packet->type;
+
+		/* Save TLV to make it accessible via sample fetch */
+		memcpy(new_tlv->value, tlv.ptr, data_len);
+		new_tlv->len = data_len;
+
+		LIST_APPEND(&conn->tlv_list, &new_tlv->list);
+	}
+
+	/* Verify that the PROXYv2 header ends at a TLV boundary.
+	 * This is can not be true, because the TLV parsing already
+	 * verifies that a TLV does not exceed the total length and
+	 * also that there is space for a TLV header.
+	 */
+	BUG_ON(tlv_offset != total_v2_len);
 
 	trash.data = total_v2_len;
 	goto eat_header;
@@ -1251,11 +1386,14 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	goto fail;
 
  recv_abort:
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_shutr);
 	conn->err_code = CO_ER_PRX_ABORT;
 	conn->flags |= CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
 	goto fail;
 
  fail:
+	if (!(conn->flags & CO_FL_SOCK_RD_SH))
+		conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }
@@ -1298,10 +1436,11 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 		 */
 
 		if (sc && sc_strm(sc)) {
+			struct stream *strm = __sc_strm(sc);
 			ret = make_proxy_line(trash.area, trash.size,
 					      objt_server(conn->target),
 					      sc_conn(sc_opposite(sc)),
-					      __sc_strm(sc));
+					      strm, strm_sess(strm));
 		}
 		else {
 			/* The target server expects a LOCAL line to be sent first. Retrieving
@@ -1312,7 +1451,7 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 
 			ret = make_proxy_line(trash.area, trash.size,
 					      objt_server(conn->target), conn,
-					      NULL);
+					      NULL, conn->owner);
 		}
 
 		if (!ret)
@@ -1348,6 +1487,7 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 
  out_error:
 	/* Write error on the file descriptor */
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_snd_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 
@@ -1550,11 +1690,14 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	goto fail;
 
  recv_abort:
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_shutr);
 	conn->err_code = CO_ER_CIP_ABORT;
 	conn->flags |= CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
 	goto fail;
 
  fail:
+	if (!(conn->flags & CO_FL_SOCK_RD_SH))
+		conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }
@@ -1628,6 +1771,7 @@ int conn_send_socks4_proxy_request(struct connection *conn)
 
  out_error:
 	/* Write error on the file descriptor */
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_snd_err);
 	conn->flags |= CO_FL_ERROR;
 	if (conn->err_code == CO_ER_NONE) {
 		conn->err_code = CO_ER_SOCKS4_SEND;
@@ -1748,6 +1892,7 @@ int conn_recv_socks4_proxy_response(struct connection *conn)
 	return 0;
 
  recv_abort:
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_shutr);
 	if (conn->err_code == CO_ER_NONE) {
 		conn->err_code = CO_ER_SOCKS4_ABORT;
 	}
@@ -1755,6 +1900,8 @@ int conn_recv_socks4_proxy_response(struct connection *conn)
 	goto fail;
 
  fail:
+	if (!(conn->flags & CO_FL_SOCK_RD_SH))
+		conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }
@@ -1787,6 +1934,8 @@ void list_mux_proto(FILE *out)
 			mode = "TCP";
 		else if (item->mode == PROTO_MODE_HTTP)
 			mode = "HTTP";
+		else if (item->mode == PROTO_MODE_SPOP)
+			mode = "SPOP";
 		else
 			mode = "NONE";
 
@@ -1804,7 +1953,7 @@ void list_mux_proto(FILE *out)
 
 		done = 0;
 
-		/* note: the block below could be simplied using macros but for only
+		/* note: the block below could be simplified using macros but for only
 		 * 4 flags it's not worth it.
 		 */
 		if (item->mux->flags & MX_FL_HTX)
@@ -1918,17 +2067,18 @@ static int make_tlv(char *dest, int dest_len, char type, uint16_t length, const 
 }
 
 /* Note: <remote> is explicitly allowed to be NULL */
-static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm)
+static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm, struct session *sess)
 {
 	const char pp2_signature[] = PP2_SIGNATURE;
 	void *tlv_crc32c_p = NULL;
 	int ret = 0;
 	struct proxy_hdr_v2 *hdr = (struct proxy_hdr_v2 *)buf;
 	struct sockaddr_storage null_addr = { .ss_family = 0 };
+	struct srv_pp_tlv_list *srv_tlv = NULL;
 	const struct sockaddr_storage *src = &null_addr;
 	const struct sockaddr_storage *dst = &null_addr;
-	const char *value;
-	int value_len;
+	const char *value = "";
+	int value_len = 0;
 
 	if (buf_len < PP2_HEADER_LEN)
 		return 0;
@@ -1998,6 +2148,37 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 		}
 	}
 
+	if (sess) {
+		struct buffer *replace = NULL;
+
+		list_for_each_entry(srv_tlv, &srv->pp_tlvs, list) {
+			replace = NULL;
+
+			/* Users will always need to provide a value, in case of forwarding, they should use fc_pp_tlv.
+			 * for generic types. Otherwise, we will send an empty TLV.
+			 */
+			if (!lf_expr_isempty(&srv_tlv->fmt)) {
+				replace = alloc_trash_chunk();
+				if (unlikely(!replace))
+					return 0;
+
+				replace->data = sess_build_logline(sess, strm, replace->area, replace->size, &srv_tlv->fmt);
+
+				if (unlikely((buf_len - ret) < sizeof(struct tlv))) {
+					free_trash_chunk(replace);
+					return 0;
+				}
+				ret += make_tlv(&buf[ret], (buf_len - ret), srv_tlv->type, replace->data, replace->area);
+				free_trash_chunk(replace);
+			}
+			else {
+				/* Create empty TLV as no value was specified */
+				ret += make_tlv(&buf[ret], (buf_len - ret), srv_tlv->type, 0, NULL);
+			}
+		}
+	}
+
+	/* Handle predefined TLVs as usual */
 	if (srv->pp_opts & SRV_PP_V2_CRC32C) {
 		uint32_t zero_crc32c = 0;
 
@@ -2124,12 +2305,12 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 }
 
 /* Note: <remote> is explicitly allowed to be NULL */
-int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm)
+int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm, struct session *sess)
 {
 	int ret = 0;
 
 	if (srv && (srv->pp_opts & SRV_PP_V2)) {
-		ret = make_proxy_line_v2(buf, buf_len, srv, remote, strm);
+		ret = make_proxy_line_v2(buf, buf_len, srv, remote, strm, sess);
 	}
 	else {
 		const struct sockaddr_storage *src = NULL;
@@ -2201,6 +2382,40 @@ int conn_append_debug_info(struct buffer *buf, const struct connection *conn, co
 		chunk_appendf(buf, " dst=%s:%d", addr, get_host_port(conn->dst));
 
 	return buf->data - old_len;
+}
+
+/* return the number of glitches experienced on the mux connection. */
+static int
+smp_fetch_fc_glitches(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn = NULL;
+	int ret;
+
+	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
+                conn = (kw[0] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
+        else
+                conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
+
+	/* No connection or a connection with an unsupported mux */
+	if (!conn || (conn->mux && !conn->mux->ctl))
+		return 0;
+
+	/* Mux not installed yet, this may change */
+	if (!conn->mux) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	ret = conn->mux->ctl(conn, MUX_CTL_GET_GLITCHES, NULL);
+	if (ret < 0) {
+		/* not supported by the mux */
+		return 0;
+	}
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ret;
+	return 1;
 }
 
 /* return the major HTTP version as 1 or 2 depending on how the request arrived
@@ -2408,7 +2623,7 @@ int smp_fetch_fc_err(const struct arg *args, struct sample *smp, const char *kw,
 	return 1;
 }
 
-/* fetch a string representation of the error code of a connection */
+/* fetch a string representation of the error code of a connection ({fc,bc}_err_{str,name} */
 int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct connection *conn;
@@ -2428,7 +2643,8 @@ int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char 
 		return 0;
 	}
 
-	err_code_str = conn_err_code_str(conn);
+	/* [7] = "str" or "name" */
+	err_code_str = kw[7] == 's' ? conn_err_code_str(conn) : conn_err_code_name(conn);
 
 	if (!err_code_str)
 		return 0;
@@ -2441,6 +2657,59 @@ int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char 
 	return 1;
 }
 
+
+/* fetch the current number of streams opened for a connection */
+int smp_fetch_fc_nb_streams(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+	unsigned int nb_strm;
+
+	conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) : smp->strm ? sc_conn(smp->strm->scb) : NULL;
+
+	if (!conn)
+		return 0;
+
+	if (!conn->mux || !conn->mux->ctl) {
+		if (!conn->mux)
+			smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	nb_strm = conn->mux->ctl(conn, MUX_CTL_GET_NBSTRM, NULL);
+
+	smp->flags = SMP_F_VOL_TEST;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = nb_strm;
+
+	return 1;
+}
+
+/* fetch the maximum number of streams supported by a connection */
+int smp_fetch_fc_streams_limit(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+	unsigned int strm_limit;
+
+	conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) : smp->strm ? sc_conn(smp->strm->scb) : NULL;
+
+	if (!conn)
+		return 0;
+
+	if (!conn->mux || !conn->mux->ctl) {
+		if (!conn->mux)
+			smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	strm_limit = conn->mux->ctl(conn, MUX_CTL_GET_MAXSTRM, NULL);
+
+	smp->flags = 0;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = strm_limit;
+
+	return 1;
+}
+
 /* Note: must not be declared <const> as its list will be overwritten.
  * Note: fetches that may return multiple types should be declared using the
  * appropriate pseudo-type. If not available it must be declared as the lowest
@@ -2448,15 +2717,23 @@ int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char 
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "bc_err", smp_fetch_fc_err, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
+	{ "bc_err_name", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4SRV },
 	{ "bc_err_str", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4SRV },
+	{ "bc_glitches", smp_fetch_fc_glitches, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 	{ "bc_http_major", smp_fetch_fc_http_major, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
+	{ "bc_nb_streams", smp_fetch_fc_nb_streams, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
+	{ "bc_setting_streams_limit", smp_fetch_fc_streams_limit, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
 	{ "fc_err", smp_fetch_fc_err, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_err_name", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
 	{ "fc_err_str", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
+	{ "fc_glitches", smp_fetch_fc_glitches, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 	{ "fc_http_major", smp_fetch_fc_http_major, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 	{ "fc_rcvd_proxy", smp_fetch_fc_rcvd_proxy, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
+	{ "fc_nb_streams", smp_fetch_fc_nb_streams, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 	{ "fc_pp_authority", smp_fetch_fc_pp_authority, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
 	{ "fc_pp_unique_id", smp_fetch_fc_pp_unique_id, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
-	{ "fc_pp_tlv", smp_fetch_fc_pp_tlv, ARG1(1, STR), smp_check_tlv_type, SMP_T_STR, SMP_USE_L4CLI },
+	{ "fc_pp_tlv", smp_fetch_fc_pp_tlv, ARG1(1, STR), smp_check_tlv_type, SMP_T_STR, SMP_USE_L5CLI },
+	{ "fc_settings_streams_limit", smp_fetch_fc_streams_limit, 0, NULL, SMP_T_SINT, SMP_USE_L5CLI },
 	{ /* END */ },
 }};
 
@@ -2469,9 +2746,38 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
+/* Generate the hash of a connection with params as input
+ * Each non-null field of params is taken into account for the hash calcul.
+ */
+uint64_t conn_hash_prehash(const char *buf, size_t size)
+{
+	return XXH64(buf, size, 0);
+}
+
+/* Computes <data> hash into <hash>. In the same time, <flags>
+ * are updated with <type> for the hash header.
+ */
+static void conn_hash_update(XXH64_state_t *hash,
+                             const void *data, size_t size,
+                             enum conn_hash_params_t *flags,
+                             enum conn_hash_params_t type)
+{
+	XXH64_update(hash, data, size);
+	*flags |= type;
+}
+
+static uint64_t conn_hash_digest(XXH64_state_t *hash,
+                                 enum conn_hash_params_t flags)
+{
+	const uint64_t flags_u64 = (uint64_t)flags;
+	const uint64_t f_hash = XXH64_digest(hash);
+
+	return (flags_u64 << CONN_HASH_PAYLOAD_LEN) | CONN_HASH_GET_PAYLOAD(f_hash);
+}
+
 /* private function to handle sockaddr as input for connection hash */
 static void conn_calculate_hash_sockaddr(const struct sockaddr_storage *ss,
-                                         char *buf, size_t *idx,
+                                         XXH64_state_t *hash,
                                          enum conn_hash_params_t *hash_flags,
                                          enum conn_hash_params_t param_type_addr,
                                          enum conn_hash_params_t param_type_port)
@@ -2483,12 +2789,12 @@ static void conn_calculate_hash_sockaddr(const struct sockaddr_storage *ss,
 	case AF_INET:
 		addr = (struct sockaddr_in *)ss;
 
-		conn_hash_update(buf, idx,
+		conn_hash_update(hash,
 		                 &addr->sin_addr, sizeof(addr->sin_addr),
 		                 hash_flags, param_type_addr);
 
 		if (addr->sin_port) {
-			conn_hash_update(buf, idx,
+			conn_hash_update(hash,
 			                 &addr->sin_port, sizeof(addr->sin_port),
 			                 hash_flags, param_type_port);
 		}
@@ -2498,90 +2804,106 @@ static void conn_calculate_hash_sockaddr(const struct sockaddr_storage *ss,
 	case AF_INET6:
 		addr6 = (struct sockaddr_in6 *)ss;
 
-		conn_hash_update(buf, idx,
+		conn_hash_update(hash,
 		                 &addr6->sin6_addr, sizeof(addr6->sin6_addr),
 		                 hash_flags, param_type_addr);
 
 		if (addr6->sin6_port) {
-			conn_hash_update(buf, idx,
+			conn_hash_update(hash,
 			                 &addr6->sin6_port, sizeof(addr6->sin6_port),
 			                 hash_flags, param_type_port);
 		}
 
 		break;
+
+	case AF_UNIX:
+		conn_hash_update(hash,
+		                 &((struct sockaddr_un *)ss)->sun_path,
+		                 strlen(((struct sockaddr_un *)ss)->sun_path),
+		                 hash_flags, param_type_addr);
+		break;
+
+	case AF_CUST_ABNS:
+		conn_hash_update(hash,
+		                 &((struct sockaddr_un *)ss)->sun_path,
+		                 sizeof(((struct sockaddr_un *)ss)->sun_path),
+		                 hash_flags, param_type_addr);
+		break;
+
+	case AF_CUST_ABNSZ:
+	{
+		const struct sockaddr_un *un = (struct sockaddr_un *)ss;
+		conn_hash_update(hash,
+		                 &un->sun_path,
+		                 1 + strnlen2(un->sun_path + 1, sizeof(un->sun_path) - 1),
+		                 hash_flags, param_type_addr);
+		break;
 	}
-}
 
-/* Generate the hash of a connection with params as input
- * Each non-null field of params is taken into account for the hash calcul.
- */
-uint64_t conn_hash_prehash(char *buf, size_t size)
-{
-	return XXH64(buf, size, 0);
-}
+	case AF_CUST_SOCKPAIR:
+		/* simply hash the fd */
+		conn_hash_update(hash,
+		                 &((struct sockaddr_in *)ss)->sin_addr.s_addr,
+		                 sizeof(int),
+		                 hash_flags, param_type_addr);
+		break;
 
-/* Append <data> into <buf> at <idx> offset in preparation for connection hash
- * calcul. <idx> is incremented beyond data <size>. In the same time, <flags>
- * are updated with <type> for the hash header.
- */
-void conn_hash_update(char *buf, size_t *idx,
-                      const void *data, size_t size,
-                      enum conn_hash_params_t *flags,
-                      enum conn_hash_params_t type)
-{
-	memcpy(&buf[*idx], data, size);
-	*idx += size;
-	*flags |= type;
-}
-
-uint64_t conn_hash_digest(char *buf, size_t bufsize,
-                          enum conn_hash_params_t flags)
-{
-	const uint64_t flags_u64 = (uint64_t)flags;
-	const uint64_t hash = XXH64(buf, bufsize, 0);
-
-	return (flags_u64 << CONN_HASH_PAYLOAD_LEN) | CONN_HASH_GET_PAYLOAD(hash);
+	default:
+		/* We don't know how to specifically handle this address family.
+		 * yet we cannot afford to have 2 sockaddr_storage structs
+		 * colliding with different parameters. So instead of risking
+		 * hash collision (which would result in HTTP reuse issues),
+		 * let's switch to generic sockaddr storage hashing (unoptimal
+		 * as it is slower and may not be able to group similar
+		 * addresses if they're not byte to byte equivalents).
+		 */
+		conn_hash_update(hash, ss, sizeof(*ss), hash_flags, param_type_addr);
+		break;
+	}
 }
 
 uint64_t conn_calculate_hash(const struct conn_hash_params *params)
 {
-	char *buf;
-	size_t idx = 0;
-	uint64_t hash = 0;
 	enum conn_hash_params_t hash_flags = 0;
+	XXH64_state_t hash;
 
-	buf = trash.area;
+	XXH64_reset(&hash, 0);
 
-	conn_hash_update(buf, &idx, &params->target, sizeof(params->target), &hash_flags, 0);
+	conn_hash_update(&hash, &params->target, sizeof(params->target), &hash_flags, 0);
 
-	if (params->sni_prehash) {
-		conn_hash_update(buf, &idx,
-		                 &params->sni_prehash, sizeof(params->sni_prehash),
-		                 &hash_flags, CONN_HASH_PARAMS_TYPE_SNI);
+	if (params->name_prehash) {
+		conn_hash_update(&hash,
+		                 &params->name_prehash, sizeof(params->name_prehash),
+		                 &hash_flags, CONN_HASH_PARAMS_TYPE_NAME);
 	}
 
 	if (params->dst_addr) {
 		conn_calculate_hash_sockaddr(params->dst_addr,
-		                             buf, &idx, &hash_flags,
+		                             &hash, &hash_flags,
 		                             CONN_HASH_PARAMS_TYPE_DST_ADDR,
 		                             CONN_HASH_PARAMS_TYPE_DST_PORT);
 	}
 
 	if (params->src_addr) {
 		conn_calculate_hash_sockaddr(params->src_addr,
-		                             buf, &idx, &hash_flags,
+		                             &hash, &hash_flags,
 		                             CONN_HASH_PARAMS_TYPE_SRC_ADDR,
 		                             CONN_HASH_PARAMS_TYPE_SRC_PORT);
 	}
 
 	if (params->proxy_prehash) {
-		conn_hash_update(buf, &idx,
+		conn_hash_update(&hash,
 		                 &params->proxy_prehash, sizeof(params->proxy_prehash),
 		                 &hash_flags, CONN_HASH_PARAMS_TYPE_PROXY);
 	}
 
-	hash = conn_hash_digest(buf, idx, hash_flags);
-	return hash;
+	if (params->mark_tos_prehash) {
+		conn_hash_update(&hash,
+		                 &params->mark_tos_prehash, sizeof(params->mark_tos_prehash),
+		                 &hash_flags, CONN_HASH_PARAMS_TYPE_MARK_TOS);
+	}
+
+	return conn_hash_digest(&hash, hash_flags);
 }
 
 /* Reverse a <conn> connection instance. This effectively moves the connection
@@ -2620,7 +2942,7 @@ int conn_reverse(struct connection *conn)
 			/* data cannot wrap else prehash usage is incorrect */
 			BUG_ON(b_data(&conn->reverse.name) != b_contig_data(&conn->reverse.name, 0));
 
-			hash_params.sni_prehash =
+			hash_params.name_prehash =
 			  conn_hash_prehash(b_head(&conn->reverse.name),
 			                    b_data(&conn->reverse.name));
 		}
@@ -2636,6 +2958,8 @@ int conn_reverse(struct connection *conn)
 		sess->origin = NULL;
 		session_free(sess);
 		conn_set_owner(conn, NULL, NULL);
+
+		conn->flags |= CO_FL_REVERSED;
 	}
 	else {
 		/* Wake up receiver to proceed to connection accept. */
@@ -2644,8 +2968,11 @@ int conn_reverse(struct connection *conn)
 		conn_backend_deinit(conn);
 
 		conn->target = &l->obj_type;
-		conn->flags |= CO_FL_REVERSED;
-		task_wakeup(l->rx.reverse_connect.task, TASK_WOKEN_ANY);
+		conn->flags |= CO_FL_ACT_REVERSING;
+		task_wakeup(l->rx.rhttp.task, TASK_WOKEN_RES);
+
+		/* Initialize session origin after reversal. Mandatory for several fetches. */
+		sess->origin = &conn->obj_type;
 	}
 
 	/* Invert source and destination addresses if already set. */

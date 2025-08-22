@@ -22,6 +22,7 @@
 #ifndef _HAPROXY_MQTT_T_H
 #define _HAPROXY_MQTT_T_H
 
+#include <inttypes.h>
 #include <import/ist.h>
 
 /* MQTT protocol version
@@ -85,7 +86,7 @@ enum {
 #define MQTT_CONNECT_FL_PASSWORD        0x40
 #define MQTT_CONNECT_FL_USERNAME        0x80
 
-/* MQTT packet properties indentifiers
+/* MQTT packet properties identifiers
  * https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901029
  */
 #define MQTT_PROP_PAYLOAD_FORMAT_INDICATOR           0x01
@@ -117,7 +118,7 @@ enum {
 
 /* MQTT minimal packet size */
 #define MQTT_MIN_PKT_SIZE              2
-#define MQTT_REMAINING_LENGHT_MAX_SIZE 4
+#define MQTT_REMAINING_LENGTH_MAX_SIZE 4
 
 /* list of supported capturable Field Names and configuration file string */
 enum {

@@ -5,6 +5,10 @@ feature ignore_unknown_macro
 
 haproxy h1 -conf {
     global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
         # note below, str60 is purposely not defined so that the default is used
         set-var proc.int12 int(12)
         set-var proc.int5  var(proc.str60,60),div(proc.int12)
@@ -34,7 +38,7 @@ haproxy h1 -conf {
 
 haproxy h1 -cli {
     send "get var proc.int5"
-    expect ~ "^proc.int5: type=sint value=<5>$"
+    expect ~ "^proc.int5: type=sint value=<5>"
 }
 
 client c1 -connect ${h1_fe1_sock} {
@@ -51,7 +55,7 @@ client c1 -connect ${h1_fe1_sock} {
 
 haproxy h1 -cli {
     send "get var proc.int5"
-    expect ~ "^proc.int5: type=sint value=<10>$"
+    expect ~ "^proc.int5: type=sint value=<10>"
 }
 
 client c2 -connect ${h1_fe1_sock} {
@@ -68,7 +72,7 @@ client c2 -connect ${h1_fe1_sock} {
 
 haproxy h1 -cli {
     send "get var proc.int5"
-    expect ~ "^proc.int5: type=sint value=<20>$"
+    expect ~ "^proc.int5: type=sint value=<20>"
 }
 
 haproxy h1 -cli {

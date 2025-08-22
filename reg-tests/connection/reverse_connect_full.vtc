@@ -1,7 +1,7 @@
 varnishtest "Reverse connect full test"
 feature ignore_unknown_macro
 
-#REQUIRE_VERSION=2.9
+feature cmd "$HAPROXY_PROGRAM -cc 'version_atleast(2.9-dev0)'"
 
 server s1 {
     rxreq
@@ -9,6 +9,13 @@ server s1 {
 } -start
 
 haproxy h_edge -conf {
+global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+	expose-experimental-directives
+
 defaults
 	log global
 	timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
@@ -20,15 +27,22 @@ frontend pub
 	bind "fd@${pub}"
 	use_backend be-reverse
 
-backend be-reverse
-	server dev @reverse
-
 frontend priv
 	bind "fd@${priv}" proto h2
 	tcp-request session attach-srv be-reverse/dev
+
+backend be-reverse
+	server dev rhttp@
 } -start
 
 haproxy h_dev -conf {
+global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+	expose-experimental-directives
+
 defaults
 	log global
 	timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
@@ -37,7 +51,7 @@ defaults
 	mode http
 
 frontend fe
-	bind "rev@be-pre-connect/srv" maxconn 1
+	bind "rhttp@be-pre-connect/srv"
 	use_backend be
 
 backend be-pre-connect

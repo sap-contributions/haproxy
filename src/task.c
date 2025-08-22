@@ -27,13 +27,13 @@
 extern struct task *process_stream(struct task *t, void *context, unsigned int state);
 extern void stream_update_timings(struct task *t, uint64_t lat, uint64_t cpu);
 
-DECLARE_POOL(pool_head_task,    "task",    sizeof(struct task));
-DECLARE_POOL(pool_head_tasklet, "tasklet", sizeof(struct tasklet));
+DECLARE_TYPED_POOL(pool_head_task,    "task",    struct task, 0, 64);
+DECLARE_TYPED_POOL(pool_head_tasklet, "tasklet", struct tasklet, 0, 64);
 
 /* This is the memory pool containing all the signal structs. These
  * struct are used to store each required signal between two tasks.
  */
-DECLARE_POOL(pool_head_notification, "notification", sizeof(struct notification));
+DECLARE_TYPED_POOL(pool_head_notification, "notification", struct notification);
 
 /* The lock protecting all wait queues at once. For now we have no better
  * alternative since a task may have to be removed from a queue and placed
@@ -41,6 +41,9 @@ DECLARE_POOL(pool_head_notification, "notification", sizeof(struct notification)
  * sufficient either.
  */
 __decl_aligned_rwlock(wq_lock);
+
+/* used to detect if the scheduler looks stuck (for warnings) */
+static THREAD_LOCAL int sched_stuck;
 
 /* Flags the task <t> for immediate destruction and puts it into its first
  * thread's shared tasklet list if not yet queued/running. This will bypass
@@ -102,7 +105,7 @@ void tasklet_kill(struct tasklet *t)
 	BUG_ON(state & TASK_KILLED);
 
 	while (1) {
-		while (state & (TASK_IN_LIST)) {
+		while (state & (TASK_QUEUED)) {
 			/* Tasklet already in the list ready to be executed. Add
 			 * the killed flag and wait for the process loop to
 			 * detect it.
@@ -114,7 +117,7 @@ void tasklet_kill(struct tasklet *t)
 		/* Mark the tasklet as killed and wake the thread to process it
 		 * as soon as possible.
 		 */
-		if (_HA_ATOMIC_CAS(&t->state, &state, state | TASK_IN_LIST | TASK_KILLED)) {
+		if (_HA_ATOMIC_CAS(&t->state, &state, state | TASK_QUEUED | TASK_KILLED)) {
 			thr = t->tid >= 0 ? t->tid : tid;
 			MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list,
 			               list_to_mt_list(&t->list));
@@ -127,7 +130,7 @@ void tasklet_kill(struct tasklet *t)
 
 /* Do not call this one, please use tasklet_wakeup_on() instead, as this one is
  * the slow path of tasklet_wakeup_on() which performs some preliminary checks
- * and sets TASK_IN_LIST before calling this one. A negative <thr> designates
+ * and sets TASK_QUEUED before calling this one. A negative <thr> designates
  * the current thread.
  */
 void __tasklet_wakeup_on(struct tasklet *tl, int thr)
@@ -166,7 +169,7 @@ void __tasklet_wakeup_on(struct tasklet *tl, int thr)
 
 /* Do not call this one, please use tasklet_wakeup_after_on() instead, as this one is
  * the slow path of tasklet_wakeup_after() which performs some preliminary checks
- * and sets TASK_IN_LIST before calling this one.
+ * and sets TASK_QUEUED before calling this one.
  */
 struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl)
 {
@@ -347,7 +350,7 @@ void wake_expired_tasks()
 		if (tick_is_expired(task->expire, now_ms)) {
 			/* expired task, wake it up */
 			__task_unlink_wq(task);
-			task_wakeup(task, TASK_WOKEN_TIMER);
+			_task_wakeup(task, TASK_WOKEN_TIMER, 0);
 		}
 		else if (task->expire != eb->key) {
 			/* task is not expired but its key doesn't match so let's
@@ -567,17 +570,24 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 		t->calls++;
 
 		th_ctx->sched_wake_date = t->wake_date;
-		if (th_ctx->sched_wake_date) {
-			uint32_t now_ns = now_mono_time();
-			uint32_t lat = now_ns - th_ctx->sched_wake_date;
+		if (th_ctx->sched_wake_date || (t->state & TASK_F_WANTS_TIME)) {
+			/* take the most accurate clock we have, either
+			 * mono_time() or last now_ns (monotonic but only
+			 * incremented once per poll loop).
+			 */
+			th_ctx->sched_call_date = now_mono_time();
+			if (unlikely(!th_ctx->sched_call_date))
+				th_ctx->sched_call_date = now_ns;
+		}
 
+		if (th_ctx->sched_wake_date) {
 			t->wake_date = 0;
-			th_ctx->sched_call_date = now_ns;
 			profile_entry = sched_activity_entry(sched_activity, t->process, t->caller);
 			th_ctx->sched_profile_entry = profile_entry;
-			HA_ATOMIC_ADD(&profile_entry->lat_time, lat);
+			HA_ATOMIC_ADD(&profile_entry->lat_time, (uint32_t)(th_ctx->sched_call_date - th_ctx->sched_wake_date));
 			HA_ATOMIC_INC(&profile_entry->calls);
 		}
+
 		__ha_barrier_store();
 
 		th_ctx->current = t;
@@ -587,65 +597,67 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 		LIST_DEL_INIT(&((struct tasklet *)t)->list);
 		__ha_barrier_store();
 
-		if (t->state & TASK_F_TASKLET) {
-			/* this is a tasklet */
-			state = _HA_ATOMIC_FETCH_AND(&t->state, TASK_PERSISTENT);
-			__ha_barrier_atomic_store();
 
-			if (likely(!(state & TASK_KILLED))) {
-				process(t, ctx, state);
+		/* We must be the exclusive owner of the TASK_RUNNING bit, and
+		 * have to be careful that the task is not being manipulated on
+		 * another thread finding it expired in wake_expired_tasks().
+		 * The TASK_RUNNING bit will be set during these operations,
+		 * they are extremely rare and do not last long so the best to
+		 * do here is to wait.
+		 */
+		state = _HA_ATOMIC_LOAD(&t->state);
+		do {
+			while (unlikely(state & TASK_RUNNING)) {
+				__ha_cpu_relax();
+				state = _HA_ATOMIC_LOAD(&t->state);
 			}
-			else {
-				done++;
-				th_ctx->current = NULL;
-				pool_free(pool_head_tasklet, t);
-				__ha_barrier_store();
-				continue;
-			}
-		} else {
-			/* This is a regular task */
+		} while (!_HA_ATOMIC_CAS(&t->state, &state, (state & TASK_PERSISTENT) | TASK_RUNNING));
 
-			/* We must be the exclusive owner of the TASK_RUNNING bit, and
-			 * have to be careful that the task is not being manipulated on
-			 * another thread finding it expired in wake_expired_tasks().
-			 * The TASK_RUNNING bit will be set during these operations,
-			 * they are extremely rare and do not last long so the best to
-			 * do here is to wait.
-			 */
-			state = _HA_ATOMIC_LOAD(&t->state);
-			do {
-				while (unlikely(state & TASK_RUNNING)) {
-					__ha_cpu_relax();
-					state = _HA_ATOMIC_LOAD(&t->state);
-				}
-			} while (!_HA_ATOMIC_CAS(&t->state, &state, (state & TASK_PERSISTENT) | TASK_RUNNING));
+		__ha_barrier_atomic_store();
 
-			__ha_barrier_atomic_store();
-
+		/* keep the task counter up to date */
+		if (!(state & TASK_F_TASKLET))
 			_HA_ATOMIC_DEC(&ha_thread_ctx[tid].tasks_in_list);
 
-			/* Note for below: if TASK_KILLED arrived before we've read the state, we
-			 * directly free the task. Otherwise it will be seen after processing and
-			 * it's freed on the exit path.
-			 */
-			if (likely(!(state & TASK_KILLED) && process == process_stream))
-				t = process_stream(t, ctx, state);
-			else if (!(state & TASK_KILLED) && process != NULL)
-				t = process(t, ctx, state);
+		/* From this point, we know that the task or tasklet was properly
+		 * dequeued, flagged and accounted for. Let's now check if it was
+		 * killed. If TASK_KILLED arrived before we've read the state, we
+		 * directly free the task/tasklet. Otherwise for tasks it will be
+		 * seen after processing and it's freed on the exit path.
+		 */
+
+		if (unlikely((state & TASK_KILLED) || process == NULL)) {
+			/* Task or tasklet has been killed, let's remove it */
+			if (state & TASK_F_TASKLET)
+				pool_free(pool_head_tasklet, t);
 			else {
 				task_unlink_wq(t);
 				__task_free(t);
-				th_ctx->current = NULL;
-				__ha_barrier_store();
-				/* We don't want max_processed to be decremented if
-				 * we're just freeing a destroyed task, we should only
-				 * do so if we really ran a task.
-				 */
-				continue;
 			}
+			/* We don't want max_processed to be decremented if
+			 * we're just freeing a destroyed task, we should only
+			 * do so if we really ran a task.
+			 */
+			goto next;
+		}
 
-			/* If there is a pending state  we have to wake up the task
-			 * immediately, else we defer it into wait queue
+		/* OK now the task or tasklet is well alive and is going to be run */
+		if (state & TASK_F_TASKLET) {
+			/* this is a tasklet */
+
+			t = process(t, ctx, state);
+			if (t != NULL)
+				_HA_ATOMIC_AND(&t->state, ~TASK_RUNNING);
+		} else {
+			/* This is a regular task */
+
+			if (process == process_stream)
+				t = process_stream(t, ctx, state);
+			else
+				t = process(t, ctx, state);
+
+			/* If there is a pending state, we have to wake up the task
+			 * immediately, else we defer it into wait queue.
 			 */
 			if (t != NULL) {
 				state = _HA_ATOMIC_LOAD(&t->state);
@@ -659,14 +671,15 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 				}
 			}
 		}
-
+		done++;
+	next:
 		th_ctx->current = NULL;
+		sched_stuck = 0; // scheduler is not stuck (don't warn)
 		__ha_barrier_store();
 
 		/* stats are only registered for non-zero wake dates */
 		if (unlikely(th_ctx->sched_wake_date))
 			HA_ATOMIC_ADD(&profile_entry->cpu_time, (uint32_t)(now_mono_time() - th_ctx->sched_call_date));
-		done++;
 	}
 	th_ctx->current_queue = -1;
 
@@ -884,6 +897,20 @@ void process_runnable_tasks()
 		activity[tid].long_rq++;
 }
 
+/* Pings the scheduler to verify that tasks continue running.
+ * Returns 1 if the scheduler made progress since last call,
+ * 0 if it looks stuck.
+ */
+int is_sched_alive(void)
+{
+	if (sched_stuck)
+		return 0;
+
+	/* next time we'll know if any progress was made */
+	sched_stuck = 1;
+	return 1;
+}
+
 /*
  * Delete every tasks before running the master polling loop
  */
@@ -928,7 +955,7 @@ void mworker_cleantasks()
 	}
 }
 
-/* perform minimal intializations */
+/* perform minimal initializations */
 static void init_task()
 {
 	int i, q;
