@@ -781,9 +781,12 @@ void mworker_cleanup_proc()
 
 struct cli_showproc_ctx {
 	uint8_t  debug;
-	uint8_t  phase;       /* 0=header+master, 1=current workers, 2=old workers, 3=done */
-    uint8_t  header_done; /* printed section headers */
-	uint32_t idx;         /* index within workers iteration */
+	uint8_t  phase;         /* 0=header+master, 1=current workers, 2=old workers, 3=done */
+	uint8_t  header_done;   /* printed section headers */
+	uint32_t cur_last_ts;   /* cursor for current workers */
+	uint32_t cur_last_pid;  /* cursor for current workers */
+	uint32_t old_last_ts;   /* cursor for old workers */
+	uint32_t old_last_pid;  /* cursor for old workers */
 };
 
 /* Helper: print the common header line */
@@ -811,11 +814,10 @@ static inline void cli_showproc_append_line(const struct mworker_proc *p, const 
 }
 
 /* Helper: stream workers based on a filter, using index and batching */
-static int cli_showproc_stream(struct appctx *appctx, uint32_t *idx, int debug,
+static int cli_showproc_stream(struct appctx *appctx, uint32_t *last_ts, uint32_t *last_pid, int debug,
 							   int show_leaving, int batch_limit, uint8_t *header_done, const char *section_title)
 {
 	struct mworker_proc *child;
-	int count = 0;
 	int printed = 0;
 
 	list_for_each_entry(child, &proc_list, list) {
@@ -829,7 +831,10 @@ static int cli_showproc_stream(struct appctx *appctx, uint32_t *idx, int debug,
 				continue;
 		}
 
-		if (count++ < *idx)
+		/* resume after (last_ts,last_pid) strictly */
+		if ((uint32_t)child->timestamp < *last_ts)
+			continue;
+		if ((uint32_t)child->timestamp == *last_ts && (uint32_t)child->pid <= *last_pid)
 			continue;
 
 		if (section_title && !*header_done) {
@@ -843,12 +848,14 @@ static int cli_showproc_stream(struct appctx *appctx, uint32_t *idx, int debug,
 		}
 
 		cli_showproc_append_line(child, "worker", debug);
-		(*idx)++;
+		/* advance cursor only after successful put */
 		printed++;
 		if (applet_putchk(appctx, &trash) == -1) {
 			appctx->t->expire = tick_add(now_ms, 10);
 			return 0;
 		}
+		*last_ts = (uint32_t)child->timestamp;
+		*last_pid = (uint32_t)child->pid;
 		chunk_reset(&trash);
 
 		if (batch_limit > 0 && printed >= batch_limit) {
@@ -867,11 +874,14 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
     char *reloadtxt = NULL;
 	int up = 0;
 
-    if (!ctx->phase) {
-        ctx->phase = 0;
-        ctx->idx = 0;
-        ctx->header_done = 0;
-    }
+	if (!ctx->phase) {
+		ctx->phase = 0;
+		ctx->header_done = 0;
+		ctx->cur_last_ts = 0;
+		ctx->cur_last_pid = 0;
+		ctx->old_last_ts = 0;
+		ctx->old_last_pid = 0;
+	}
 
     chunk_reset(&trash);
 
@@ -891,7 +901,7 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
         ha_free(&reloadtxt);
         ha_free(&uptime);
 
-        chunk_appendf(&trash, "# workers\n");
+		chunk_appendf(&trash, "# workers\n");
         if (applet_putchk(appctx, &trash) == -1) {
             appctx->t->expire = tick_add(now_ms, 10);
             return 0;
@@ -902,17 +912,17 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
     /* Phase 1: current workers (non-LEAVING) streamed */
 	if (ctx->phase == 1) {
-		if (!cli_showproc_stream(appctx, &ctx->idx, ctx->debug, 0, 0, &ctx->header_done, NULL))
+		if (!cli_showproc_stream(appctx, &ctx->cur_last_ts, &ctx->cur_last_pid, ctx->debug, 0, 0, &ctx->header_done, NULL))
 			return 0;
 		ctx->phase = 2;
 		chunk_reset(&trash);
-		ctx->idx = 0; /* reset index for old workers iteration */
-		ctx->header_done = 0; /* ensure header for old workers can print */
+		/* separate header for old workers section */
+		ctx->header_done = 0;
 	}
 
     /* Phase 2: old workers (LEAVING) streamed */
 	if (ctx->phase == 2) {
-		if (!cli_showproc_stream(appctx, &ctx->idx, ctx->debug, 1, 64, &ctx->header_done, "# old workers"))
+		if (!cli_showproc_stream(appctx, &ctx->old_last_ts, &ctx->old_last_pid, ctx->debug, 1, 64, &ctx->header_done, "# old workers"))
 			return 0;
 		ctx->phase = 3;
 	}
