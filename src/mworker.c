@@ -26,10 +26,9 @@
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
-#include <haproxy/list.h>
 #include <haproxy/log.h>
-#include <haproxy/listener.h>
 #include <haproxy/list.h>
+#include <haproxy/listener.h>
 #include <haproxy/mworker.h>
 #include <haproxy/peers.h>
 #include <haproxy/proto_sockpair.h>
@@ -223,7 +222,7 @@ int mworker_env_to_proc_list()
 				child->version = strdup(subtoken+8);
 			}
 		}
-		if (child->pid) {
+		if (child->pid > 0) {
 			LIST_APPEND(&proc_list, &child->list);
 		} else {
 			mworker_free_child(child);
@@ -811,12 +810,30 @@ struct cli_showproc_ctx {
 	int next_uptime; /* uptime must be greater than this value */
 };
 
+/* Append a single worker row to trash (shared between current/old sections) */
+static void cli_append_worker_row(struct cli_showproc_ctx *ctx, struct mworker_proc *child, time_t tv_sec)
+{
+	char *uptime = NULL;
+	int up = tv_sec - child->timestamp;
+
+	if (up < 0) /* must never be negative because of clock drift */
+		up = 0;
+
+	memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
+	chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
+	if (ctx->debug)
+		chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
+	chunk_appendf(&trash, "\n");
+	ha_free(&uptime);
+}
+
 /*  Displays workers and processes  */
 static int cli_io_handler_show_proc(struct appctx *appctx)
 {
 	struct mworker_proc *child;
 	int old = 0;
 	int up = date.tv_sec - proc_self->timestamp;
+	int prev_ts = -1;
 	struct cli_showproc_ctx *ctx = appctx->svcctx;
 	char *uptime = NULL;
 	char *reloadtxt = NULL;
@@ -847,14 +864,9 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	if (ctx->next_uptime == 0)
 		chunk_appendf(&trash, "# workers\n");
 	list_for_each_entry(child, &proc_list, list) {
-
 		/* don't display current worker if we only need the next ones */
 		if (ctx->next_uptime != 0)
 			continue;
-
-		up = date.tv_sec - child->timestamp;
-		if (up < 0) /* must never be negative because of clock drift */
-			up = 0;
 
 		if (!(child->options & PROC_O_TYPE_WORKER))
 			continue;
@@ -863,26 +875,29 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 			old++;
 			continue;
 		}
-		memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-		chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
-		if (ctx->debug)
-			chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
-		chunk_appendf(&trash, "\n");
-		ha_free(&uptime);
+		if (prev_ts != -1 && child->timestamp != prev_ts) {
+			if (applet_putchk(appctx, &trash) == -1)
+				return 0;
+			chunk_reset(&trash);
+		}
+		prev_ts = child->timestamp;
+
+		cli_append_worker_row(ctx, child, date.tv_sec);
 	}
 
 	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
 
+	/* ensure a clean buffer before starting the old-workers section */
+	chunk_reset(&trash);
+
 	/* displays old processes */
 	if (old || ctx->next_uptime) { /* there's more */
 		if (ctx->next_uptime == 0)
 			chunk_appendf(&trash, "# old workers\n");
+		/* reset timestamp grouping for old workers */
+		prev_ts = -1;
 		list_for_each_entry(child, &proc_list, list) {
-			up = date.tv_sec - child->timestamp;
-			if (up <= 0) /* must never be negative because of clock drift */
-				up = 0;
-
 			if (child->timestamp < ctx->next_uptime)
 				continue;
 
@@ -890,17 +905,20 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 				continue;
 
 			if (child->options & PROC_O_LEAVING) {
-				memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-				chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
-				if (ctx->debug)
-					chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
-				chunk_appendf(&trash, "\n");
-				ha_free(&uptime);
+				if (prev_ts != -1 && child->timestamp != prev_ts) {
+					ctx->next_uptime = prev_ts;
+					if (applet_putchk(appctx, &trash) == -1)
+						return 0;
+					chunk_reset(&trash);
+				}
+				prev_ts = child->timestamp;
+
+				cli_append_worker_row(ctx, child, date.tv_sec);
 			}
-
+		}
+		if (prev_ts != -1) {
 			/* start from there if there's not enough place */
-			ctx->next_uptime = child->timestamp;
-
+			ctx->next_uptime = prev_ts;
 			if (applet_putchk(appctx, &trash) == -1)
 				return 0;
 		}
@@ -909,6 +927,7 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	/* dump complete */
 	return 1;
 }
+
 /* reload the master process */
 static int cli_parse_show_proc(char **args, char *payload, struct appctx *appctx, void *private)
 {
