@@ -187,7 +187,9 @@ enum PR_SRV_STATE_FILE {
 #define PR_O3_HASHAFNTY_MAXQUEUE 0x00000200 /* preserve hash affinity until maxqueue is reached */
 #define PR_O3_HASHAFNTY_MASK     0x00000300 /* mask for hash-preserve-affinity */
 
-/* unused: 0x00000400 to  0x80000000 */
+#define PR_O3_SRV_RENAME         0x00000400 /* allow runtime server renaming */
+
+/* unused: 0x00000800 to  0x80000000 */
 /* end of proxy->options3 */
 
 /* Cookie settings for pr->ck_opts */
