@@ -2663,6 +2663,22 @@ set server <backend>/<server> ssl [ on | off ]  (deprecated)
   This command is deprecated, create a new server dynamically with or without
   SSL instead, using the "add server" command.
 
+set server <backend>/<server> name <newname>
+  Change the name of a server at runtime (if 'option server-rename'
+  is enabled in the backend).
+
+  The new name must be unique among all servers in the backend. The
+  change is effective immediately for all runtime operations, stats,
+  and logs, but is not persisted to the configuration file and will
+  be lost on reload. Some features that rely on static server names
+  (such as stick-tables or external monitoring) may not recognize
+  the new name until restart.
+
+  Example:
+      set server myapp/s1 name blue
+
+  See also: 'option server-rename' in doc/configuration.txt.
+
 set severity-output [ none | number | string ]
   Change the severity output format of the stats socket connected to for the
   duration of the current session.
