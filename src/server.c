@@ -5408,7 +5408,6 @@ const char *srv_update_fqdn(struct server *server, const char *fqdn, const char 
  * Preconditions enforced:
  *   - backend must have "option server-rename" set
  *   - server must be administratively in maintenance
- *   - server must have zero active sessions
  *   - new name must not conflict with an existing server in the backend
  *   - new name must be syntactically valid (no spaces, '/', '#' prefix)
  *   - backend must not have sticking rules referencing a peer-synced table
@@ -5446,10 +5445,6 @@ static const char *srv_update_server_name(struct server *srv, const char *new_na
 	/* server must be administratively down (in maintenance) */
 	if (!(srv->cur_admin & SRV_ADMF_MAINT))
 		return "Server must be in maintenance mode to be renamed (set server <b>/<s> state maint).\n";
-
-	/* server must have no active sessions */
-	if (srv->cur_sess)
-		return "Server still has active sessions, cannot rename.\n";
 
 	/* reject if any sticking rule references a peer-synced table */
 	list_for_each_entry(rule, &be->sticking_rules, list) {

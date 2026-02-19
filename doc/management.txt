@@ -2674,6 +2674,20 @@ set server <backend>/<server> name <newname>
   (such as stick-tables or external monitoring) may not recognize
   the new name until restart.
 
+  There is no strict requirement that no sessions are active
+  before renaming. However, if there are active sessions, log entries
+  for those sessions may use either the old or new name, depending on
+  when the rename occurs relative to logging. This may result in split
+  or inconsistent logs for in-flight requests. If strict log consistency
+  is required, it is the user's responsibility to ensure all sessions
+  have finished before renaming (e.g., by draining or maintenance mode
+  and waiting for all connections to close).
+
+  For most use cases, a clear naming scheme (such as srv1 → srv1-old,
+  srv1-new, or srv1*) allows correlating log entries before and after
+  the rename, even if some overlap occurs. Users should choose a naming
+  convention that fits their operational and troubleshooting needs.
+
   Example:
       set server myapp/s1 name blue
 
