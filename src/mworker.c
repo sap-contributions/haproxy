@@ -570,6 +570,8 @@ restart_wait:
 
 	childfound = 0;
 
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK); // this thread is still running
+
 	exitpid = waitpid(-1, &status, WNOHANG);
 	if (exitpid > 0) {
 		struct mworker_proc *child, *it;
