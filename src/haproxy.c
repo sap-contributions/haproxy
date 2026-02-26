@@ -1745,6 +1745,7 @@ static void init_args(int argc, char **argv)
 			}
 			else if (*flag == 's' && (flag[1] == 'f' || flag[1] == 't')) {
 				/* list of pids to finish ('f') or terminate ('t') */
+				int oldpids_before = nb_oldpids;
 
 				if (flag[1] == 'f')
 					oldpids_sig = SIGUSR1; /* finish then exit */
@@ -1776,6 +1777,49 @@ static void init_args(int argc, char **argv)
 					if (oldpids[nb_oldpids] <= 0)
 						usage(progname);
 					nb_oldpids++;
+				}
+				/* if whether we passed 0 pids, read from HAPROXY_MWORKER_OLDPIDS */
+				if (nb_oldpids == oldpids_before) {
+					char *env_oldpids = getenv("HAPROXY_MWORKER_OLDPIDS");
+					char *list = NULL;
+					char *tok = NULL;
+					char *saveptr = NULL;
+
+					if (env_oldpids && *env_oldpids) {
+						list = strdup(env_oldpids);
+						if (!list) {
+							ha_alert("Cannot allocate old pid list from environment.\n");
+							exit(1);
+						}
+						for (tok = strtok_r(list, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
+							char *endptr = NULL;
+							oldpids = realloc(oldpids, (nb_oldpids + 1) * sizeof(int));
+							if (!oldpids) {
+								ha_alert("Cannot allocate old pid : out of memory.\n");
+								exit(1);
+							}
+							errno = 0;
+							oldpids[nb_oldpids] = strtol(tok, &endptr, 10);
+							if (errno) {
+								ha_alert("-%2s option: failed to parse {%s}: %s\n",
+									 flag,
+									 tok, strerror(errno));
+								exit(1);
+							} else if (endptr && strlen(endptr)) {
+								while (isspace((unsigned char)*endptr)) endptr++;
+								if (*endptr != 0) {
+									ha_alert("-%2s option: some bytes unconsumed in PID list {%s}\n",
+										 flag, endptr);
+									exit(1);
+								}
+							}
+							if (oldpids[nb_oldpids] <= 0)
+								usage(progname);
+							nb_oldpids++;
+						}
+						free(list);
+					}
+					unsetenv("HAPROXY_MWORKER_OLDPIDS");
 				}
 			}
 #ifdef DEBUG_UNIT

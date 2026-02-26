@@ -375,6 +375,7 @@ static void mworker_reexec(int hardreload)
 	int next_argc = 0;
 	int i = 0;
 	char *msg = NULL;
+	char *oldpids_env = NULL;
 	struct rlimit limit;
 	struct mworker_proc *current_child = NULL;
 	int x_off = 0; /* disable -x by putting -x /dev/null */
@@ -430,9 +431,8 @@ static void mworker_reexec(int hardreload)
 	while (old_argv[old_argc])
 		old_argc++;
 
-	/* 1 for haproxy -sf, 2 for -x /socket */
-	next_argv = calloc(old_argc + 1 + 2 + mworker_child_nb() + 1,
-			   sizeof(*next_argv));
+	/* +1 for NULL, +2 for -x /socket, +2 for -sf/-st (no PID args, sent via env) */
+	next_argv = calloc(old_argc + 1 + 2 + 2, sizeof(*next_argv));
 	if (next_argv == NULL)
 		goto alloc_error;
 
@@ -445,7 +445,7 @@ static void mworker_reexec(int hardreload)
 
 	/* insert the new options just after argv[0] in case we have a -- */
 
-	/* add -sf <PID>*  to argv */
+	/* add -sf/-st to argv (PIDs passed via env) */
 	if (mworker_child_nb() > 0) {
 		struct mworker_proc *child;
 
@@ -460,9 +460,11 @@ static void mworker_reexec(int hardreload)
 
 			if (!(child->options & (PROC_O_TYPE_WORKER)) || child->pid <= -1)
 				continue;
-			if ((next_argv[next_argc++] = memprintf(&msg, "%d", child->pid)) == NULL)
+			if (memprintf(&oldpids_env, "%s%s%d",
+			              oldpids_env ? oldpids_env : "",
+			              oldpids_env ? " " : "",
+			              child->pid) == NULL)
 				goto alloc_error;
-			msg = NULL;
 		}
 	}
 	if (!x_off && current_child) {
@@ -490,13 +492,17 @@ static void mworker_reexec(int hardreload)
 	startup_logs_free(startup_logs);
 
 	signal(SIGPROF, SIG_IGN);
+	if (oldpids_env)
+		setenv("HAPROXY_MWORKER_OLDPIDS", oldpids_env, 1);
 	execvp(next_argv[0], next_argv);
 	ha_warning("Failed to reexecute the master process [%d]: %s\n", pid, strerror(errno));
 	ha_free(&next_argv);
+	ha_free(&oldpids_env);
 	return;
 
 alloc_error:
 	ha_free(&next_argv);
+	ha_free(&oldpids_env);
 	ha_warning("Failed to reexecute the master process [%d]: Cannot allocate memory\n", pid);
 	return;
 }
