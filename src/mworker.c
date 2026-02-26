@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -115,6 +116,8 @@ void mworker_proc_list_to_env()
 {
 	char *msg = NULL;
 	struct mworker_proc *child;
+	int fd;
+	char tmpl[] = "/tmp/haproxy-procs";
 
 	list_for_each_entry(child, &proc_list, list) {
 		char type = '?';
@@ -127,8 +130,22 @@ void mworker_proc_list_to_env()
 		if (child->pid > -1)
 			memprintf(&msg, "%s|type=%c;fd=%d;cfd=%d;pid=%d;reloads=%d;failedreloads=%d;timestamp=%d;id=%s;version=%s", msg ? msg : "", type, child->ipc_fd[0], child->ipc_fd[1], child->pid, child->reloads, child->failedreloads, child->timestamp, child->id ? child->id : "", child->version);
 	}
-	if (msg)
-		setenv("HAPROXY_PROCESSES", msg, 1);
+	if (msg) {
+		fd = mkstemp(tmpl);
+		if (fd >= 0) {
+			if (write(fd, msg, strlen(msg)) == (ssize_t)strlen(msg)) {
+				setenv("HAPROXY_PROCESSES_FILE", tmpl, 1);
+				unsetenv("HAPROXY_PROCESSES");
+			} else {
+				setenv("HAPROXY_PROCESSES", msg, 1);
+				unlink(tmpl);
+			}
+			close(fd);
+		} else {
+			setenv("HAPROXY_PROCESSES", msg, 1);
+		}
+		free(msg);
+	}
 }
 
 struct mworker_proc *mworker_proc_new()
@@ -159,6 +176,34 @@ int mworker_env_to_proc_list()
 	char *env, *msg, *omsg = NULL, *token = NULL, *s1;
 	struct mworker_proc *child;
 	int err = 0;
+	int fd;
+	struct stat st;
+	ssize_t rd;
+
+	env = getenv("HAPROXY_PROCESSES_FILE");
+	if (env) {
+		fd = open(env, O_RDONLY);
+		if (fd < 0)
+			goto no_env;
+		if (fstat(fd, &st) < 0 || st.st_size < 0) {
+			close(fd);
+			goto no_env;
+		}
+		omsg = msg = calloc(1, st.st_size + 1);
+		if (!msg) {
+			close(fd);
+			ha_alert("Out of memory while trying to allocate a worker process structure.");
+			err = -1;
+			goto out;
+		}
+		rd = read(fd, msg, st.st_size);
+		close(fd);
+		unlink(env);
+		unsetenv("HAPROXY_PROCESSES_FILE");
+		if (rd <= 0)
+			goto no_env;
+		goto parse_env;
+	}
 
 	env = getenv("HAPROXY_PROCESSES");
 	if (!env)
@@ -170,6 +215,8 @@ int mworker_env_to_proc_list()
 		err = -1;
 		goto out;
 	}
+
+parse_env:
 
 	while ((token = strtok_r(msg, "|", &s1))) {
 		char *subtoken = NULL;
