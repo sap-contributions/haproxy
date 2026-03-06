@@ -2292,6 +2292,9 @@ static void step_init_2(int argc, char** argv)
 	for (px = proxies_list; px; px = px->next)
 		srv_compute_all_admin_states(px);
 
+	/* Enforce configured init-state before traffic starts. */
+	srv_apply_init_state();
+
 	/* Apply servers' configured address */
 	err_code |= srv_init_addr();
 	if (err_code & (ERR_ABORT|ERR_FATAL)) {

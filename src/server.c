@@ -174,6 +174,19 @@ int srv_getinter(const struct check *check)
 	return (check->fastinter)?(check->fastinter):(check->inter);
 }
 
+/* Set the check health according to the configured init-state. */
+static inline void srv_set_check_health_from_init_state(struct server *srv)
+{
+	if (srv->init_state == SRV_INIT_STATE_FULLY_UP)
+		srv->check.health = srv->check.rise + srv->check.fall - 1;
+	else if (srv->init_state == SRV_INIT_STATE_DOWN)
+		srv->check.health = srv->check.rise - 1;
+	else if (srv->init_state == SRV_INIT_STATE_FULLY_DOWN)
+		srv->check.health = 0;
+	else
+		srv->check.health = srv->check.rise;
+}
+
 /* Update server's addr:svc_port tuple in INET context
  *
  * Must be called under thread isolation to ensure consistent readings across
@@ -2369,6 +2382,40 @@ void srv_compute_all_admin_states(struct proxy *px)
 		if (srv->track)
 			continue;
 		srv_propagate_admin_state(srv);
+	}
+}
+
+/* Apply the configured init-state for startup-sensitive servers after
+ * loading any persisted states and inherited administrative states.
+ */
+void srv_apply_init_state(void)
+{
+	struct proxy *px;
+
+	for (px = proxies_list; px; px = px->next) {
+		struct server *srv;
+
+		if (!(px->cap & PR_CAP_BE) || (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
+			continue;
+
+		for (srv = px->srv; srv; srv = srv->next) {
+			if (!(srv->check.state & CHK_ST_ENABLED))
+				continue;
+
+			if (srv->next_admin & SRV_ADMF_MAINT)
+				continue;
+
+			srv_set_check_health_from_init_state(srv);
+			if ((!srv->track || srv->track->next_state != SRV_ST_STOPPED) &&
+			    (!(srv->agent.state & CHK_ST_ENABLED) || (srv->agent.health >= srv->agent.rise)) &&
+			    (srv->check.health >= srv->check.rise))
+				srv->next_state = SRV_ST_RUNNING;
+			else
+				srv->next_state = SRV_ST_STOPPED;
+
+			server_recalc_eweight(srv, 0);
+			srv_lb_commit_status(srv);
+		}
 	}
 }
 
@@ -6923,17 +6970,7 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 		 */
 		if (s->check.state & CHK_ST_ENABLED) {
 			s->check.state &= ~CHK_ST_PAUSED;
-			if(s->init_state == SRV_INIT_STATE_FULLY_UP) {
-				s->check.health = s->check.rise + s->check.fall - 1; /* initially UP, when all checks fail to bring server DOWN */
-			}
-			else if(s->init_state == SRV_INIT_STATE_DOWN) {
-				s->check.health = s->check.rise - 1; /* initially DOWN, when one check is successful bring server UP */
-			}
-			else if(s->init_state == SRV_INIT_STATE_FULLY_DOWN) {
-				s->check.health = 0; /* initially DOWN, when all checks are successful bring server UP */
-			} else {
-				s->check.health = s->check.rise; /* initially UP, when one check fails check brings server DOWN */
-			}
+			srv_set_check_health_from_init_state(s);
 		}
 
 		if ((!s->track || s->track->next_state != SRV_ST_STOPPED) &&

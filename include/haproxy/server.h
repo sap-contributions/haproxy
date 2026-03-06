@@ -73,6 +73,7 @@ struct server *server_find_best_match(struct proxy *bk, char *name, int id, int 
 uint server_get_next_id(const struct proxy *px, uint from);
 void apply_server_state(void);
 void srv_compute_all_admin_states(struct proxy *px);
+void srv_apply_init_state(void);
 int srv_set_addr_via_libc(struct server *srv, int *err_code);
 int srv_init_addr(void);
 struct server *cli_find_server(struct appctx *appctx, char *arg);
