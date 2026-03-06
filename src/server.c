@@ -2372,6 +2372,57 @@ void srv_compute_all_admin_states(struct proxy *px)
 	}
 }
 
+/* Apply the init-state setting for all servers in proxy <px>.
+ * This sets each server's initial operational state and health check
+ * counters based on its configured init_state. Servers in maintenance
+ * are skipped since their init_state will be applied when they leave
+ * maintenance via _srv_update_status_adm().
+ *
+ * Must be called after post-server checks (so that CHK_ST_ENABLED is set)
+ * and before apply_server_state() (so that state files can override).
+ */
+void srv_apply_all_init_states(struct proxy *px)
+{
+	struct server *srv;
+
+	for (srv = px->srv; srv; srv = srv->next) {
+		/* Skip servers already in maintenance - their init_state
+		 * will be applied when they leave maintenance.
+		 */
+		if (srv->next_admin & SRV_ADMF_MAINT)
+			continue;
+
+		if (srv->check.state & CHK_ST_ENABLED) {
+			switch (srv->init_state) {
+			case SRV_INIT_STATE_FULLY_UP:
+				srv->check.health = srv->check.rise + srv->check.fall - 1;
+				break;
+			case SRV_INIT_STATE_DOWN:
+				srv->check.health = srv->check.rise - 1;
+				break;
+			case SRV_INIT_STATE_FULLY_DOWN:
+				srv->check.health = 0;
+				break;
+			default: /* SRV_INIT_STATE_UP */
+				srv->check.health = srv->check.rise;
+				break;
+			}
+		}
+
+		/* Set operational state: if checks are enabled, use health
+		 * vs rise to determine state; otherwise use init_state directly.
+		 */
+		if (srv->check.state & CHK_ST_ENABLED) {
+			if (srv->check.health < srv->check.rise)
+				srv->next_state = SRV_ST_STOPPED;
+		} else {
+			if (srv->init_state == SRV_INIT_STATE_DOWN ||
+			    srv->init_state == SRV_INIT_STATE_FULLY_DOWN)
+				srv->next_state = SRV_ST_STOPPED;
+		}
+	}
+}
+
 /* Note: must not be declared <const> as its list will be overwritten.
  *
  ***   P L E A S E   R E A D   B E L O W   B E F O R E   T O U C H I N G  !!! ***

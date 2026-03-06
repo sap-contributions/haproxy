@@ -2283,6 +2283,12 @@ static void step_init_2(int argc, char** argv)
 	thread_detect_binding_discrepancies();
 	thread_detect_more_than_cpus();
 
+	/* Apply init-state settings before loading state files,
+	 * so that state files can override init-state if present.
+	 */
+	for (px = proxies_list; px; px = px->next)
+		srv_apply_all_init_states(px);
+
 	/* Apply server states */
 	apply_server_state();
 
