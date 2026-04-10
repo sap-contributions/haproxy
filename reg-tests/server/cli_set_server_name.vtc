@@ -1,0 +1,161 @@
+varnishtest "Set server name via CLI"
+
+feature ignore_unknown_macro
+
+#REGTEST_TYPE=devel
+
+# Do nothing. Is there only to create s1_* macros
+server s1 {
+	rxreq
+	txresp
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${feS}"
+        default_backend test
+
+    backend test
+        option server-rename
+        balance random
+        server s1 ${s1_addr}:${s1_port}
+        server s2 ${s1_addr}:${s1_port}
+
+    backend norename
+        balance random
+        server s1 ${s1_addr}:${s1_port}
+} -start
+
+haproxy h1 -cli {
+    # ---- error cases ----
+
+    # missing new name argument
+    send "set server test/s1 name"
+    expect ~ "set server <b>/<s> name requires a new name."
+
+    # backend without 'option server-rename'
+    send "set server norename/s1 name newname"
+    expect ~ "Backend does not allow server renaming"
+
+    # server not in maintenance mode
+    send "set server test/s1 name newname"
+    expect ~ "Server must be in maintenance mode"
+
+    # put s1 in maintenance for subsequent tests
+    send "disable server test/s1"
+    expect ~ ".*"
+
+    # name containing '/' is rejected
+    send "set server test/s1 name bad/name"
+    expect ~ "Server name must not contain spaces, control characters, or '/'."
+
+    # duplicate name — s2 already exists
+    send "set server test/s1 name s2"
+    expect ~ "A server with the same name already exists"
+
+    # renaming to the same name is a no-op (success)
+    send "set server test/s1 name s1"
+    expect ~ "Server name updated."
+
+    # ---- success case ----
+
+    # rename s1 -> blue
+    send "set server test/s1 name blue"
+    expect ~ "Server name updated."
+
+    # verify the new name appears in show servers state
+    send "show servers state test"
+    expect ~ "test 1 blue"
+
+    # the old name should no longer resolve
+    send "set server test/s1 state ready"
+    expect ~ "No such server."
+
+    # new name is usable via enable
+    send "enable server test/blue"
+    expect ~ ".*"
+
+    # ---- rename back ----
+
+    # must go through maintenance again
+    send "disable server test/blue"
+    expect ~ ".*"
+
+    send "set server test/blue name s1"
+    expect ~ "Server name updated."
+
+    send "show servers state test"
+    expect ~ "test 1 s1"
+
+    # bring back up
+    send "enable server test/s1"
+    expect ~ ".*"
+}
+
+# verify traffic still works after rename round-trip
+client c1 -connect ${h1_feS_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run
+
+# ---- test global server-rename ----
+
+server s2 {
+    rxreq
+    txresp
+} -start
+
+haproxy h2 -conf {
+    global
+        server-rename
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${feS}"
+        default_backend test
+
+    backend test
+        balance random
+        server s1 ${s2_addr}:${s2_port}
+} -start
+
+haproxy h2 -cli {
+    # global server-rename allows renaming without per-backend option
+    send "disable server test/s1"
+    expect ~ ".*"
+
+    send "set server test/s1 name green"
+    expect ~ "Server name updated."
+
+    send "show servers state test"
+    expect ~ "test 1 green"
+
+    send "enable server test/green"
+    expect ~ ".*"
+}
+
+client c2 -connect ${h2_feS_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run
