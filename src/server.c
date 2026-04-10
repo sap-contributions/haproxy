@@ -30,11 +30,13 @@
 #include <haproxy/counters.h>
 #include <haproxy/dict-t.h>
 #include <haproxy/errors.h>
+#include <haproxy/event_hdl.h>
 #include <haproxy/global.h>
 #include <haproxy/guid.h>
 #include <haproxy/log.h>
 #include <haproxy/mailers.h>
 #include <haproxy/namespace.h>
+#include <haproxy/peers-t.h>
 #include <haproxy/port_range.h>
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
@@ -45,9 +47,10 @@
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
-#include <haproxy/stats.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/stats.h>
 #include <haproxy/stconn.h>
+#include <haproxy/stick_table-t.h>
 #include <haproxy/stream.h>
 #include <haproxy/stress.h>
 #include <haproxy/task.h>
@@ -55,9 +58,6 @@
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
-#include <haproxy/event_hdl.h>
-#include <haproxy/stick_table-t.h>
-#include <haproxy/peers-t.h>
 
 static void srv_update_status(struct server *s, int type, int cause);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
@@ -5427,6 +5427,10 @@ static const char *srv_update_server_name(struct server *srv, const char *new_na
 	/* validate the new name is not empty */
 	if (!*new_name)
 		return "Require a new server name.\n";
+
+	/* reject names that are too long for the event data structure */
+	if (strlen(new_name) >= sizeof(((struct event_hdl_cb_data_server_name *)0)->safe.new_name))
+		return "Server name too long.\n";
 
 	/* reject names starting with '#' (numeric ID syntax in server_find) */
 	if (*new_name == '#')
