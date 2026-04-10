@@ -2665,7 +2665,7 @@ set server <backend>/<server> ssl [ on | off ]  (deprecated)
 
 set server <backend>/<server> name <newname>
   Change the name of a server at runtime (if 'option server-rename'
-  is enabled in the backend).
+  is enabled in the backend or 'server-rename' is set in the global section).
 
   The new name must be unique among all servers in the backend. The
   change is effective immediately for all runtime operations, stats,

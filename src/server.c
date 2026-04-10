@@ -5438,9 +5438,9 @@ static const char *srv_update_server_name(struct server *srv, const char *new_na
 			return "Server name must not contain spaces, control characters, or '/'.\n";
 	}
 
-	/* per-backend opt-in required */
-	if (!(be->options3 & PR_O3_SRV_RENAME))
-		return "Backend does not allow server renaming (add 'option server-rename').\n";
+	/* per-backend or global opt-in required */
+	if (!(be->options3 & PR_O3_SRV_RENAME) && !(global.tune.options & GTUNE_SRV_RENAME))
+		return "Backend does not allow server renaming (add 'option server-rename' or global 'server-rename').\n";
 
 	/* server must be administratively down (in maintenance) */
 	if (!(srv->cur_admin & SRV_ADMF_MAINT))
