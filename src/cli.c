@@ -3484,8 +3484,15 @@ int pcli_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	 * current one. Just wait. At this stage, errors should be handled by
 	 * the response analyzer.
 	 */
-	if (s->res.analysers & AN_RES_WAIT_CLI)
+	if (s->res.analysers & AN_RES_WAIT_CLI) {
+		/* If the client disconnected while we're waiting for a backend
+		 * response, abort the backend. This changes scb flags which
+		 * triggers pcli_wait_for_response() to run its cleanup path.
+		 */
+		if (s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))
+			sc_abort(s->scb);
 		return 0;
+	}
 
 	pcli->flags &= ~PCLI_F_BIDIR; // only for one connection
 	if ((pcli->flags & ACCESS_LVL_MASK) == ACCESS_LVL_NONE)
@@ -3617,6 +3624,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	struct proxy *be = s->be;
 
 	if ((s->scb->flags & SC_FL_ERROR) || (rep->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) ||
+	    (s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) ||
 	    ((s->scf->flags & SC_FL_SHUT_DONE) && (rep->to_forward || co_data(rep)))) {
 		pcli_reply_and_close(s, "Can't connect to the target CLI!\n");
 		s->req.analysers &= ~AN_REQ_WAIT_CLI;

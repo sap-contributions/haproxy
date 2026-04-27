@@ -1,0 +1,73 @@
+varnishtest "Bug fix: master CLI connection slots freed on client disconnect"
+
+# Regression test for a master CLI socket connection leak in master-worker mode.
+#
+# mworker_proxy has a fixed maxconn of 10.  When clients connect to the master
+# socket, send a command that is forwarded to a frozen (SIGSTOP-ed) worker, and
+# then close the connection due to a client-side receive timeout, haproxy must
+# free each slot as the client disconnects.
+#
+# Without the fix: slots remain occupied after the client disconnects, so the
+# master CLI becomes unreachable once all 10 slots are filled.
+# With the fix: slots are freed on client disconnect and the master CLI keeps
+# accepting new connections.
+
+#REGTEST_TYPE=bug
+
+feature cmd "command -v socat"
+feature ignore_unknown_macro
+
+server s1 {
+} -start
+
+haproxy h1 -W -S -conf {
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend be
+
+    backend be
+        server s1 ${s1_addr}:${s1_port}
+} -start
+
+# Retrieve the worker PID via "show proc" and freeze it with SIGSTOP so that
+# any @1-prefixed command forwarded to it hangs indefinitely.
+shell {
+    WORKER_PID=$(printf "show proc\nquit\n" \
+                 | socat TCP:${h1_mcli_addr}:${h1_mcli_port} - \
+                 | awk '$2 == "worker" {print $1; exit}')
+    echo "${WORKER_PID}" > "${tmpdir}/worker.pid"
+    kill -STOP "${WORKER_PID}"
+}
+
+# Fill all 10 master CLI slots (mworker_proxy->maxconn is hardcoded to 10).
+# Each socat process sends "@1 show sess all", which is routed to the frozen
+# worker.  After 2 s of silence socat gives up and closes the connection,
+# simulating a client-side receive timeout.  "wait" ensures every background
+# process has exited (i.e. all 10 client-side connections are closed) before
+# proceeding.
+shell {
+    for i in $(seq 1 10); do
+        (printf "@1 show sess all\n" \
+         | socat -t2 TCP:${h1_mcli_addr}:${h1_mcli_port} - 2>/dev/null) &
+    done
+    wait
+}
+
+# This is the key assertion: after all 10 clients have disconnected, a new
+# connection to the master CLI must succeed.  With the bug all 10 slots are
+# still marked occupied and this connect is refused or times out.
+haproxy h1 -mcli {
+    send "show version"
+    expect ~ "3."
+}
+
+shell {
+    kill -CONT "$(cat "${tmpdir}/worker.pid")"
+} -wait
+
