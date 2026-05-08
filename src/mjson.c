@@ -24,7 +24,7 @@
 
 #include <import/mjson.h>
 
-static double mystrtod(const char *str, char **end);
+static double mystrtod(const char *str, int len, char **end);
 
 static int mjson_esc(int c, int esc) {
   const char *p, *esc1 = "\b\f\n\r\t\\\"", *esc2 = "bfnrt\\\"";
@@ -101,7 +101,7 @@ int mjson(const char *s, int len, mjson_cb_t cb, void *ud) {
           tok = MJSON_TOK_FALSE;
         } else if (c == '-' || ((c >= '0' && c <= '9'))) {
           char *end = NULL;
-          mystrtod(&s[i], &end);
+          mystrtod(&s[i], len - i, &end);
           if (end != NULL) i += (int) (end - &s[i] - 1);
           tok = MJSON_TOK_NUMBER;
         } else if (c == '"') {
@@ -212,7 +212,7 @@ static int mjson_get_cb(int tok, const char *s, int off, int len, void *ud) {
   } else if (tok == '[') {
     if (data->d1 == data->d2 && data->path[data->pos] == '[') {
       data->i1 = 0;
-      data->i2 = (int) mystrtod(&data->path[data->pos + 1], NULL);
+      data->i2 = (int) mystrtod(&data->path[data->pos + 1], strlen(&data->path[data->pos + 1]),  NULL);
       if (data->i1 == data->i2) {
         data->d2++;
         data->pos += 3;
@@ -272,7 +272,7 @@ int mjson_get_number(const char *s, int len, const char *path, double *v) {
   const char *p;
   int tok, n;
   if ((tok = mjson_find(s, len, path, &p, &n)) == MJSON_TOK_NUMBER) {
-    if (v != NULL) *v = mystrtod(p, NULL);
+    if (v != NULL) *v = mystrtod(p, n, NULL);
   }
   return tok == MJSON_TOK_NUMBER ? 1 : 0;
 }
@@ -338,62 +338,130 @@ int mjson_get_hex(const char *s, int len, const char *x, char *to, int n) {
   return j;
 }
 
+struct nextdata {
+  int off, len, depth, t, vo, arrayindex;
+  int *koff, *klen, *voff, *vlen, *vtype;
+};
+
+static int next_cb(int tok, const char *s, int off, int len, void *ud) {
+  struct nextdata *d = (struct nextdata *) ud;
+  switch (tok) {
+    case '{':
+    case '[':
+      if (d->depth == 0 && tok == '[') d->arrayindex = 0;
+      if (d->depth == 1 && off > d->off) {
+        d->vo = off;
+        d->t = tok == '{' ? MJSON_TOK_OBJECT : MJSON_TOK_ARRAY;
+        if (d->voff) *d->voff = off;
+        if (d->vtype) *d->vtype = d->t;
+      }
+      d->depth++;
+      break;
+    case '}':
+    case ']':
+      d->depth--;
+      if (d->depth == 1 && d->vo) {
+        d->len = off + len;
+        if (d->vlen) *d->vlen = d->len - d->vo;
+        if (d->arrayindex >= 0) {
+          if (d->koff) *d->koff = d->arrayindex;  // koff holds array index
+          if (d->klen) *d->klen = 0;              // klen holds 0
+        }
+        return 1;
+      }
+      if (d->depth == 1 && d->arrayindex >= 0) d->arrayindex++;
+      break;
+    case ',':
+    case ':':
+      break;
+    case MJSON_TOK_KEY:
+      if (d->depth == 1 && d->off < off) {
+        if (d->koff) *d->koff = off;  // And report back to the user
+        if (d->klen) *d->klen = len;  // If we have to
+      }
+      break;
+    default:
+      if (d->depth != 1) break;
+      // If we're iterating over the array
+      if (off > d->off) {
+        d->len = off + len;
+        if (d->vlen) *d->vlen = len;    // value length
+        if (d->voff) *d->voff = off;    // value offset
+        if (d->vtype) *d->vtype = tok;  // value type
+        if (d->arrayindex >= 0) {
+          if (d->koff) *d->koff = d->arrayindex;  // koff holds array index
+          if (d->klen) *d->klen = 0;              // klen holds 0
+        }
+        return 1;
+      }
+      if (d->arrayindex >= 0) d->arrayindex++;
+      break;
+  }
+  (void) s;
+  return 0;
+}
+
+int mjson_next(const char *s, int n, int off, int *koff, int *klen, int *voff,
+               int *vlen, int *vtype) {
+  struct nextdata d = {off, 0, 0, 0, 0, -1, koff, klen, voff, vlen, vtype};
+  mjson(s, n, next_cb, &d);
+  return d.len;
+}
 static int is_digit(int c) {
   return c >= '0' && c <= '9';
 }
 
 /* NOTE: strtod() implementation by Yasuhiro Matsumoto. */
-static double mystrtod(const char *str, char **end) {
+static double mystrtod(const char *str, int len, char **end) {
   double d = 0.0;
   int sign = 1, __attribute__((unused)) n = 0;
   const char *p = str, *a = str;
+  const char *end_p = str + len;
 
   /* decimal part */
-  if (*p == '-') {
+  if (p < end_p && *p == '-') {
     sign = -1;
     ++p;
-  } else if (*p == '+') {
+  } else if (p < end_p && *p == '+') {
     ++p;
   }
-  if (is_digit(*p)) {
+  if (p < end_p && is_digit(*p)) {
     d = (double) (*p++ - '0');
-    while (*p && is_digit(*p)) {
+    while (p < end_p && is_digit(*p)) {
       d = d * 10.0 + (double) (*p - '0');
       ++p;
       ++n;
     }
     a = p;
-  } else if (*p != '.') {
+  } else if (p >= end_p || *p != '.') {
     goto done;
   }
   d *= sign;
 
   /* fraction part */
-  if (*p == '.') {
+  if (p < end_p && *p == '.') {
     double f = 0.0;
     double base = 0.1;
     ++p;
 
-    if (is_digit(*p)) {
-      while (*p && is_digit(*p)) {
-        f += base * (*p - '0');
-        base /= 10.0;
-        ++p;
-        ++n;
-      }
+    while (p < end_p && is_digit(*p)) {
+      f += base * (*p - '0');
+      base /= 10.0;
+      ++p;
+      ++n;
     }
     d += f * sign;
     a = p;
   }
 
   /* exponential part */
-  if ((*p == 'E') || (*p == 'e')) {
+  if (p < end_p && ((*p == 'E') || (*p == 'e'))) {
     double exp, f;
     int i, e = 0, neg = 0;
     p++;
-    if (*p == '-') p++, neg++;
-    if (*p == '+') p++;
-    while (is_digit(*p)) e = e * 10 + *p++ - '0';
+    if (p < end_p && *p == '-') p++, neg++;
+    if (p < end_p && *p == '+') p++;
+    while (p < end_p && is_digit(*p)) e = e * 10 + *p++ - '0';
     i = e;
     if (neg) e = -e;
 #if 0

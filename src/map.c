@@ -22,7 +22,6 @@
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 
@@ -73,7 +72,7 @@ int map_parse_int(const char *text, struct sample_data *data)
 	return 1;
 }
 
-/* This crete and initialize map descriptor.
+/* This creates and initializes map descriptor.
  * Return NULL if out of memory error
  */
 static struct map_descriptor *map_create_descriptor(struct sample_conv *conv)
@@ -98,18 +97,18 @@ static struct map_descriptor *map_create_descriptor(struct sample_conv *conv)
 int sample_load_map(struct arg *arg, struct sample_conv *conv,
                     const char *file, int line, char **err)
 {
-	struct map_descriptor *desc;
+	struct map_descriptor *desc = NULL;
 
 	if (!(global.mode & MODE_STARTING)) {
 		memprintf(err, "map: cannot load map at runtime");
-		return 0;
+		goto fail;
 	}
 
 	/* create new map descriptor */
 	desc = map_create_descriptor(conv);
 	if (!desc) {
 		memprintf(err, "out of memory");
-		return 0;
+		goto fail;
 	}
 
 	/* Initialize pattern */
@@ -133,14 +132,13 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 	default:
 		memprintf(err, "map: internal haproxy error: no default parse case for the input type <%d>.",
 		          conv->out_type);
-		free(desc);
-		return 0;
+		goto fail;
 	}
 
 	/* Load map. */
 	if (!pattern_read_from_file(&desc->pat, PAT_REF_MAP, arg[0].data.str.area, PAT_MF_NO_DNS,
 	                            1, err, file, line))
-		return 0;
+		goto fail;
 
 	/* the maps of type IP support a string as default value. This
 	 * string can be an ipv4 or an ipv6, we must convert it.
@@ -150,7 +148,7 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 		if (!map_parse_ip(arg[1].data.str.area, &data)) {
 			memprintf(err, "map: cannot parse default ip <%s>.",
 				  arg[1].data.str.area);
-			return 0;
+			goto fail;
 		}
 		chunk_destroy(&arg[1].data.str);
 		if (data.type == SMP_T_IPV4) {
@@ -168,6 +166,9 @@ int sample_load_map(struct arg *arg, struct sample_conv *conv,
 	arg[0].data.map = desc;
 
 	return 1;
+ fail:
+	free(desc);
+	return 0;
 }
 
 /* try to match input sample against map entries, returns matched entry's key
@@ -622,6 +623,9 @@ static int cli_parse_get_map(char **args, char *payload, struct appctx *appctx, 
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		/* Set flags. */
 		if (args[1][0] == 'm')
@@ -665,6 +669,9 @@ static int cli_parse_prepare_map(char **args, char *payload, struct appctx *appc
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
 		uint next_gen;
@@ -706,6 +713,9 @@ static void cli_release_show_map(struct appctx *appctx)
 static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
 
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
@@ -760,6 +770,9 @@ static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx,
 static int cli_parse_set_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
 
 	if (strcmp(args[1], "map") == 0) {
 		char *err;
@@ -832,6 +845,9 @@ static int cli_parse_set_map(char **args, char *payload, struct appctx *appctx, 
 static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
 
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
@@ -963,6 +979,9 @@ static int cli_parse_del_map(char **args, char *payload, struct appctx *appctx, 
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (args[1][0] == 'm')
 		ctx->display_flags = PAT_REF_MAP;
 	else
@@ -1058,6 +1077,9 @@ static int cli_parse_clear_map(char **args, char *payload, struct appctx *appctx
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		const char *gen = NULL;
 
@@ -1113,6 +1135,9 @@ static int cli_parse_clear_map(char **args, char *payload, struct appctx *appctx
 static int cli_parse_commit_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
 
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		const char *gen = NULL;
@@ -1181,15 +1206,15 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "del",   "acl", NULL }, "del acl <acl> [<key>|#<ref>]            : delete acl entries matching <key>",                      cli_parse_del_map, NULL },
 	{ { "get",   "acl", NULL }, "get acl <acl> <value>                   : report the patterns matching a sample for an ACL",       cli_parse_get_map, cli_io_handler_map_lookup, cli_release_mlook },
 	{ { "prepare","acl",NULL }, "prepare acl <acl>                       : prepare a new version for atomic ACL replacement",       cli_parse_prepare_map, NULL },
-	{ { "show",  "acl", NULL }, "show acl [@<ver>] <acl>]                : report available acls or dump an acl's contents",        cli_parse_show_map, NULL },
+	{ { "show",  "acl", NULL }, "show acl [@<ver>] <acl>                 : report available acls or dump an acl's contents",        cli_parse_show_map, NULL },
 	{ { "add",   "map", NULL }, "add map [@<ver>] <map> <key> <val>      : add a map entry (payload supported instead of key/val)", cli_parse_add_map, NULL },
 	{ { "clear", "map", NULL }, "clear map [@<ver>] <map>                : clear the contents of this map",                         cli_parse_clear_map, cli_io_handler_clear_map, NULL },
 	{ { "commit","map", NULL }, "commit map @<ver> <map>                 : commit the map at this version",                         cli_parse_commit_map, cli_io_handler_clear_map, NULL },
 	{ { "del",   "map", NULL }, "del map <map> [<key>|#<ref>]            : delete map entries matching <key>",                      cli_parse_del_map, NULL },
-	{ { "get",   "map", NULL }, "get map <acl> <value>                   : report the keys and values matching a sample for a map", cli_parse_get_map, cli_io_handler_map_lookup, cli_release_mlook },
-	{ { "prepare","map",NULL }, "prepare map <acl>                       : prepare a new version for atomic map replacement",       cli_parse_prepare_map, NULL },
+	{ { "get",   "map", NULL }, "get map <map> <value>                   : report the keys and values matching a sample for a map", cli_parse_get_map, cli_io_handler_map_lookup, cli_release_mlook },
+	{ { "prepare","map",NULL }, "prepare map <map>                       : prepare a new version for atomic map replacement",       cli_parse_prepare_map, NULL },
 	{ { "set",   "map", NULL }, "set map <map> [<key>|#<ref>] <value>    : modify a map entry",                                     cli_parse_set_map, NULL },
-	{ { "show",  "map", NULL }, "show map [@ver] [map]                   : report available maps or dump a map's contents",         cli_parse_show_map, NULL },
+	{ { "show",  "map", NULL }, "show map [@<ver>] [map]                 : report available maps or dump a map's contents",         cli_parse_show_map, NULL },
 	{ { NULL }, NULL, NULL, NULL }
 }};
 

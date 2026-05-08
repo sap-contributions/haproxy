@@ -101,6 +101,7 @@ struct h2c {
 	struct wait_event wait_event;  /* To be used if we're waiting for I/Os */
 
 	struct list *next_tasklet; /* which applet to wake up next (NULL by default) */
+	uint32_t streams_hard_limit; /* maximum number of concurrent streams supported locally */
 };
 
 
@@ -126,7 +127,7 @@ struct h2s {
 	uint rx_count;         /* total number of allocated rxbufs */
 	/* 4 bytes hole here */
 	struct wait_event *subs;  /* recv wait_event the stream connector associated is waiting on (via h2_subscribe) */
-	struct list list; /* To be used when adding in h2c->send_list or h2c->fctl_lsit */
+	struct list list; /* To be used when adding in h2c->send_list or h2c->fctl_list */
 	struct tasklet *shut_tl;  /* deferred shutdown tasklet, to retry to send an RST after we failed to,
 				   * in case there's no other subscription to do it */
 
@@ -371,53 +372,59 @@ static struct h2_counters {
 	long long total_streams; /* total number of streams */
 } h2_counters;
 
-static int h2_fill_stats(void *data, struct field *stats, unsigned int *selected_field)
+static int h2_fill_stats(struct stats_module *mod, struct extra_counters *ctr,
+                         struct field *stats, unsigned int *selected_field)
 {
-	struct h2_counters *counters = data;
 	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
 
 	for (; current_field < H2_STATS_COUNT; current_field++) {
 		struct field metric = { 0 };
+		struct h2_counters *counters;
+
+		if (!ctr)
+			goto store_metric;
+
+		counters = EXTRA_COUNTERS_BASE(ctr, mod);
 
 		switch (current_field) {
 		case H2_ST_HEADERS_RCVD:
-			metric = mkf_u64(FN_COUNTER, counters->headers_rcvd);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->headers_rcvd));
 			break;
 		case H2_ST_DATA_RCVD:
-			metric = mkf_u64(FN_COUNTER, counters->data_rcvd);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->data_rcvd));
 			break;
 		case H2_ST_SETTINGS_RCVD:
-			metric = mkf_u64(FN_COUNTER, counters->settings_rcvd);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->settings_rcvd));
 			break;
 		case H2_ST_RST_STREAM_RCVD:
-			metric = mkf_u64(FN_COUNTER, counters->rst_stream_rcvd);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->rst_stream_rcvd));
 			break;
 		case H2_ST_GOAWAY_RCVD:
-			metric = mkf_u64(FN_COUNTER, counters->goaway_rcvd);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->goaway_rcvd));
 			break;
 		case H2_ST_CONN_PROTO_ERR:
-			metric = mkf_u64(FN_COUNTER, counters->conn_proto_err);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->conn_proto_err));
 			break;
 		case H2_ST_STRM_PROTO_ERR:
-			metric = mkf_u64(FN_COUNTER, counters->strm_proto_err);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->strm_proto_err));
 			break;
 		case H2_ST_RST_STREAM_RESP:
-			metric = mkf_u64(FN_COUNTER, counters->rst_stream_resp);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->rst_stream_resp));
 			break;
 		case H2_ST_GOAWAY_RESP:
-			metric = mkf_u64(FN_COUNTER, counters->goaway_resp);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->goaway_resp));
 			break;
 		case H2_ST_OPEN_CONN:
-			metric = mkf_u64(FN_GAUGE,   counters->open_conns);
+			metric = mkf_u64(FN_GAUGE,   EXTRA_COUNTERS_AGGR(ctr, counters->open_conns));
 			break;
 		case H2_ST_OPEN_STREAM:
-			metric = mkf_u64(FN_GAUGE,   counters->open_streams);
+			metric = mkf_u64(FN_GAUGE,   EXTRA_COUNTERS_AGGR(ctr, counters->open_streams));
 			break;
 		case H2_ST_TOTAL_CONN:
-			metric = mkf_u64(FN_COUNTER, counters->total_conns);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->total_conns));
 			break;
 		case H2_ST_TOTAL_STREAM:
-			metric = mkf_u64(FN_COUNTER, counters->total_streams);
+			metric = mkf_u64(FN_COUNTER, EXTRA_COUNTERS_AGGR(ctr, counters->total_streams));
 			break;
 		default:
 			/* not used for frontends. If a specific metric
@@ -427,6 +434,7 @@ static int h2_fill_stats(void *data, struct field *stats, unsigned int *selected
 				return 0;
 			continue;
 		}
+	store_metric:
 		stats[current_field] = metric;
 		if (selected_field != NULL)
 			break;
@@ -466,6 +474,12 @@ struct pool_head *pool_head_h2_rx_bufs __read_mostly = NULL;
 /* maximum amount of data we're OK with re-aligning for buffer optimizations */
 #define MAX_DATA_REALIGN 1024
 
+enum {
+	H2_ERR_LOG_ERR_NONE,
+	H2_ERR_LOG_ERR_CONN,
+	H2_ERR_LOG_ERR_STRM,
+};
+
 /* a few settings from the global section */
 static int h2_settings_header_table_size      =  4096; /* initial value */
 static int h2_settings_initial_window_size    =     0; /* default initial value: bufsize */
@@ -475,10 +489,16 @@ static int h2_be_glitches_threshold           =     0; /* backend's max glitches
 static int h2_fe_glitches_threshold           =     0; /* frontend's max glitches: unlimited */
 static uint h2_be_rxbuf                       =     0; /* backend's default total rxbuf (bytes) */
 static uint h2_fe_rxbuf                       =     0; /* frontend's default total rxbuf (bytes) */
+static unsigned int h2_be_max_frames_at_once  =     0; /* backend value: 0=no limit */
+static unsigned int h2_fe_max_frames_at_once  =     0; /* frontend value: 0=no limit */
+static unsigned int h2_fe_max_rst_at_once     =     0; /* frontend value: 0=no limit */
 static unsigned int h2_settings_max_concurrent_streams    = 100; /* default value */
 static unsigned int h2_be_settings_max_concurrent_streams =   0; /* backend value */
 static unsigned int h2_fe_settings_max_concurrent_streams =   0; /* frontend value */
+static unsigned int h2_fe_min_concurrent_streams = 1;  /* minimum concurrent streams when using rq-load */
+static unsigned int h2_fe_max_rq_load         = ~0;    /* max rq for FE dynamic MCS sizing. 0=def rq */
 static int h2_settings_max_frame_size         = 0;     /* unset */
+static int h2_settings_log_errors             = H2_ERR_LOG_ERR_STRM;
 
 /* other non-protocol settings */
 static unsigned int h2_fe_max_total_streams =   0;      /* frontend value */
@@ -489,7 +509,7 @@ static const struct sedesc closed_ep = {
 	.flags     = SE_FL_DETACHED,
 };
 
-/* a dmumy closed stream */
+/* a dummy closed stream */
 static const struct h2s *h2_closed_stream = &(const struct h2s){
 	.sd        = (struct sedesc *)&closed_ep,
 	.h2c       = NULL,
@@ -499,7 +519,7 @@ static const struct h2s *h2_closed_stream = &(const struct h2s){
 	.id        = 0,
 };
 
-/* a dmumy closed stream returning a PROTOCOL_ERROR error */
+/* a dummy closed stream returning a PROTOCOL_ERROR error */
 static const struct h2s *h2_error_stream = &(const struct h2s){
 	.sd        = (struct sedesc *)&closed_ep,
 	.h2c       = NULL,
@@ -509,7 +529,7 @@ static const struct h2s *h2_error_stream = &(const struct h2s){
 	.id        = 0,
 };
 
-/* a dmumy closed stream returning a REFUSED_STREAM error */
+/* a dummy closed stream returning a REFUSED_STREAM error */
 static const struct h2s *h2_refused_stream = &(const struct h2s){
 	.sd        = (struct sedesc *)&closed_ep,
 	.h2c       = NULL,
@@ -545,8 +565,6 @@ static void h2s_alert(struct h2s *h2s);
 static inline void h2_remove_from_list(struct h2s *h2s);
 static int h2_dump_h2c_info(struct buffer *msg, struct h2c *h2c, const char *pfx);
 static int h2_dump_h2s_info(struct buffer *msg, const struct h2s *h2s, const char *pfx);
-static inline struct buffer *h2s_rxbuf_head(const struct h2s *h2s);
-static inline struct buffer *h2s_rxbuf_tail(const struct h2s *h2s);
 static inline struct buffer *h2s_rxbuf_head(const struct h2s *h2s);
 static inline struct buffer *h2s_rxbuf_tail(const struct h2s *h2s);
 
@@ -730,7 +748,8 @@ static inline int h2c_may_expire(const struct h2c *h2c)
 
 /* returns the number of max concurrent streams permitted on a connection,
  * depending on its side (frontend or backend), falling back to the default
- * h2_settings_max_concurrent_streams. It may even be zero.
+ * h2_settings_max_concurrent_streams. It may even be zero. It only relies
+ * on configuration settings.
  */
 static inline int h2c_max_concurrent_streams(const struct h2c *h2c)
 {
@@ -741,6 +760,22 @@ static inline int h2c_max_concurrent_streams(const struct h2c *h2c)
 		h2_fe_settings_max_concurrent_streams;
 
 	ret = ret ? ret : h2_settings_max_concurrent_streams;
+
+	/* if h2_fe_max_rq_load is set, adjust the max concurrent streams
+	 * according to it and the current load.
+	 */
+	if (!(h2c->flags & H2_CF_IS_BACK) && h2_fe_max_rq_load != ~0) {
+		uint limit = h2_fe_max_rq_load ? h2_fe_max_rq_load : global.tune.runqueue_depth;
+		uint load = MAX(swrate_avg(th_ctx->rq_tot_peak, RQ_LOAD_SAMPLES), th_ctx->rq_total);
+
+		/* divide limits by the square of the ratio of current load to
+		 * the limit so as to react fast.
+		 */
+		if (load > limit)
+			ret = (uint64_t)ret * limit / load * limit / load;
+		if (ret < h2_fe_min_concurrent_streams)
+			ret = h2_fe_min_concurrent_streams;
+	}
 	return ret;
 }
 
@@ -840,6 +875,18 @@ static inline int h2s_may_append_to_rxbuf(const struct h2s *h2s)
 
 	htx = htxbuf(rxbuf);
 	return !!htx_free_data_space(htx);
+}
+
+void h2_sess_log_conn(struct session *sess)
+{
+	if (h2_settings_log_errors >= H2_ERR_LOG_ERR_CONN)
+		sess_log(sess);
+}
+
+void h2_sess_log_strm(struct session *sess)
+{
+	if (h2_settings_log_errors >= H2_ERR_LOG_ERR_STRM)
+		sess_log(sess);
 }
 
 /* update h2c timeout if needed */
@@ -1014,7 +1061,6 @@ h2c_is_dead(const struct h2c *h2c)
 	    ((h2c->flags & H2_CF_ERROR) ||          /* errors close immediately */
 	     (h2c->flags & H2_CF_ERR_PENDING && h2c->st0 < H2_CS_FRAME_H) || /* early error during connect */
 	     (h2c->st0 >= H2_CS_ERROR && !h2c->task) || /* a timeout stroke earlier */
-	     (!(h2c->conn->owner) && !conn_is_reverse(h2c->conn)) || /* Nobody's left to take care of the connection, drop it now */
 	     (!br_data(h2c->mbuf) &&  /* mux buffer empty, also process clean events below */
 	      ((h2c->flags & H2_CF_RCVD_SHUT) ||
 	       h2c_reached_last_stream(h2c)))))
@@ -1027,7 +1073,7 @@ h2c_is_dead(const struct h2c *h2c)
 /* functions below are for dynamic buffer management */
 /*****************************************************/
 
-/* indicates whether or not the we may call the h2_recv() function to attempt
+/* indicates whether or not we may call the h2_recv() function to attempt
  * to receive data into the buffer and/or demux pending data. The condition is
  * a bit complex due to some API limits for now. The rules are the following :
  *   - if an error or a shutdown was detected on the connection, we must not
@@ -1088,7 +1134,7 @@ static inline void h2c_restart_reading(const struct h2c *h2c, int consider_buffe
 /* returns true if the front connection has too many stream connectors attached */
 static inline int h2_frt_has_too_many_sc(const struct h2c *h2c)
 {
-	return h2c->nb_sc > h2c_max_concurrent_streams(h2c) ||
+	return h2c->nb_sc > h2c->streams_hard_limit ||
 	       unlikely(conn_reverse_in_preconnect(h2c->conn));
 }
 
@@ -1399,7 +1445,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 	/* Initialise the context. */
 	h2c->st0 = H2_CS_PREFACE;
 	h2c->conn = conn;
-	h2c->streams_limit = h2c_max_concurrent_streams(h2c);
+	h2c->streams_limit = h2c->streams_hard_limit = h2c_max_concurrent_streams(h2c);
 	nb_rxbufs = (h2c->flags & H2_CF_IS_BACK) ? h2_be_rxbuf : h2_fe_rxbuf;
 	nb_rxbufs = (nb_rxbufs + global.tune.bufsize - 9 - 1) / (global.tune.bufsize - 9);
 	nb_rxbufs = MAX(nb_rxbufs, h2c->streams_limit);
@@ -1471,6 +1517,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
   fail:
 	task_destroy(t);
 	tasklet_free(h2c->wait_event.tasklet);
+	pool_free(pool_head_h2_rx_bufs, h2c->shared_rx_bufs);
 	pool_free(pool_head_h2c, h2c);
   fail_no_h2c:
 	if (!conn_is_back(conn))
@@ -1642,9 +1689,10 @@ static void __maybe_unused h2s_notify_recv(struct h2s *h2s)
 		TRACE_POINT(H2_EV_STRM_WAKE, h2s->h2c->conn, h2s);
 		if (h2s->h2c->next_tasklet ||
 		    (th_ctx->current && th_ctx->current->process == h2_io_cb))
-			h2s->h2c->next_tasklet = tasklet_wakeup_after(h2s->h2c->next_tasklet, h2s->subs->tasklet);
+			h2s->h2c->next_tasklet = tasklet_wakeup_after(h2s->h2c->next_tasklet, h2s->subs->tasklet,
+								      TASK_WOKEN_IO);
 		else
-			tasklet_wakeup(h2s->subs->tasklet);
+			tasklet_wakeup(h2s->subs->tasklet, TASK_WOKEN_IO);
 		h2s->subs->events &= ~SUB_RETRY_RECV;
 		if (!h2s->subs->events)
 			h2s->subs = NULL;
@@ -1657,7 +1705,7 @@ static void __maybe_unused h2s_notify_send(struct h2s *h2s)
 	if (h2s->subs && h2s->subs->events & SUB_RETRY_SEND) {
 		TRACE_POINT(H2_EV_STRM_WAKE, h2s->h2c->conn, h2s);
 		h2s->flags |= H2_SF_NOTIFIED;
-		tasklet_wakeup(h2s->subs->tasklet);
+		tasklet_wakeup(h2s->subs->tasklet, TASK_WOKEN_IO);
 		h2s->subs->events &= ~SUB_RETRY_SEND;
 		if (!h2s->subs->events)
 			h2s->subs = NULL;
@@ -1668,26 +1716,27 @@ static void __maybe_unused h2s_notify_send(struct h2s *h2s)
 	}
 }
 
-/* alerts the data layer, trying to wake it up by all means, following
- * this sequence :
- *   - if the h2s' data layer is subscribed to recv, then it's woken up for recv
- *   - if its subscribed to send, then it's woken up for send
- *   - if it was subscribed to neither, its ->wake() callback is called
- * It is safe to call this function with a closed stream which doesn't have a
- * stream connector anymore.
+/* alerts the data layer by waking it up. TASK_WOKEN_MSG state is used by
+ * default and if the data layer is also subscribed to recv or send,
+ * TASK_WOKEN_IO is added. But first of all, we check if the shut tasklet must
+ * be woken up or not instead.
  */
 static void __maybe_unused h2s_alert(struct h2s *h2s)
 {
 	TRACE_ENTER(H2_EV_H2S_WAKE, h2s->h2c->conn, h2s);
+	if (!h2s->subs && (h2s->flags & (H2_SF_WANT_SHUTR | H2_SF_WANT_SHUTW)))
+		tasklet_wakeup(h2s->shut_tl);
+	else if (h2s_sc(h2s)) {
+		unsigned int state = TASK_WOKEN_MSG;
 
-	if (h2s->subs ||
-	    (h2s->flags & (H2_SF_WANT_SHUTR | H2_SF_WANT_SHUTW))) {
-		h2s_notify_recv(h2s);
-		h2s_notify_send(h2s);
-	}
-	else if (h2s_sc(h2s) && h2s_sc(h2s)->app_ops->wake != NULL) {
-		TRACE_POINT(H2_EV_STRM_WAKE, h2s->h2c->conn, h2s);
-		h2s_sc(h2s)->app_ops->wake(h2s_sc(h2s));
+		if (h2s->subs) {
+			if (h2s->subs->events & SUB_RETRY_SEND)
+				h2s->flags |= H2_SF_NOTIFIED;
+			h2s->subs->events = 0;
+			h2s->subs = NULL;
+			state |= TASK_WOKEN_IO;
+		}
+		tasklet_wakeup(h2s_sc(h2s)->wait_event.tasklet, state);
 	}
 
 	TRACE_LEAVE(H2_EV_H2S_WAKE, h2s->h2c->conn, h2s);
@@ -1715,9 +1764,9 @@ static inline int _h2c_report_glitch(struct h2c *h2c, int increment)
 		 * to force clients to periodically reconnect.
 		 */
 		if (h2c->last_sid <= 0 ||
-		    h2c->last_sid > h2c->max_id + 2 * h2c_max_concurrent_streams(h2c)) {
+		    h2c->last_sid > h2c->max_id + 2 * h2c->streams_hard_limit) {
 			/* not set yet or was too high */
-			h2c->last_sid = h2c->max_id + 2 * h2c_max_concurrent_streams(h2c);
+			h2c->last_sid = h2c->max_id + 2 * h2c->streams_hard_limit;
 			h2c_send_goaway_error(h2c, NULL);
 		}
 
@@ -2079,7 +2128,7 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	/* Cannot handle stream if active reversed connection is not yet accepted. */
 	BUG_ON(conn_reverse_in_preconnect(h2c->conn));
 
-	if (h2c->nb_streams >= h2c_max_concurrent_streams(h2c)) {
+	if (h2c->nb_streams >= h2c->streams_hard_limit) {
 		h2c_report_glitch(h2c, 1, "HEADERS frame causing MAX_CONCURRENT_STREAMS to be exceeded");
 		TRACE_ERROR("HEADERS frame causing MAX_CONCURRENT_STREAMS to be exceeded", H2_EV_H2S_NEW|H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
 		session_inc_http_req_ctr(sess);
@@ -2148,7 +2197,7 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
  out_alloc:
 	TRACE_ERROR("Failed to allocate a new stream", H2_EV_H2S_NEW|H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
  out:
-	sess_log(sess);
+	h2_sess_log_strm(sess);
 	TRACE_LEAVE(H2_EV_H2S_NEW|H2_EV_H2S_ERR|H2_EV_H2S_END, h2c->conn);
 	return NULL;
 }
@@ -2259,7 +2308,7 @@ static int h2c_send_settings(struct h2c *h2c)
 		chunk_memcat(&buf, str, 6);
 	}
 
-	mcs = h2c_max_concurrent_streams(h2c);
+	mcs = h2c->streams_hard_limit;
 	if (mcs != 0) {
 		char str[6] = "\x00\x03"; /* max_concurrent_streams */
 
@@ -2880,8 +2929,8 @@ static int h2c_handle_settings(struct h2c *h2c)
 		case H2_SETTINGS_MAX_CONCURRENT_STREAMS:
 			if (h2c->flags & H2_CF_IS_BACK) {
 				/* the limit is only for the backend; for the frontend it is our limit */
-				if ((unsigned int)arg > h2c_max_concurrent_streams(h2c))
-					arg = h2c_max_concurrent_streams(h2c);
+				if ((unsigned int)arg > h2c->streams_hard_limit)
+					arg = h2c->streams_hard_limit;
 				h2c->streams_limit = arg;
 			}
 			break;
@@ -2900,7 +2949,7 @@ static int h2c_handle_settings(struct h2c *h2c)
 	return 1;
  fail:
 	if (!(h2c->flags & H2_CF_IS_BACK))
-		sess_log(h2c->conn->owner);
+		h2_sess_log_conn(h2c->conn->owner);
 	h2c_error(h2c, error);
  out0:
 	TRACE_DEVEL("leaving with missing data or error", H2_EV_RX_FRAME|H2_EV_RX_SETTINGS, h2c->conn);
@@ -3261,7 +3310,7 @@ static int h2c_handle_window_update(struct h2c *h2c, struct h2s *h2s)
 		goto out0;
 	}
 
-	inc = h2_get_n32(&h2c->dbuf, 0);
+	inc = h2_get_n32(&h2c->dbuf, 0) & 0x7FFFFFFF;
 
 	if (h2c->dsi != 0) {
 		/* stream window update */
@@ -3356,7 +3405,7 @@ static int h2c_handle_goaway(struct h2c *h2c)
 		return 0;
 	}
 
-	last = h2_get_n32(&h2c->dbuf, 0);
+	last = h2_get_n32(&h2c->dbuf, 0) & 0x7FFFFFFF; // mask R bit
 	h2c->errcode = h2_get_n32(&h2c->dbuf, 4);
 	if (h2c->last_sid < 0)
 		h2c->last_sid = last;
@@ -3382,7 +3431,11 @@ static int h2c_handle_priority(struct h2c *h2c)
 		return 0;
 	}
 
-	if (h2_get_n32(&h2c->dbuf, 0) == h2c->dsi) {
+	/*
+	 * Bit 31 is the "exclusive" bit, it is not part of the stream ID,
+	 * so ignore it when checking if the stream ID is ours.
+	 */
+	if ((h2_get_n32(&h2c->dbuf, 0) & 0x7fffffff) == h2c->dsi) {
 		/* 7540#5.3 : can't depend on itself */
 		h2c_report_glitch(h2c, 1, "PRIORITY depends on itself");
 		TRACE_ERROR("PRIORITY depends on itself", H2_EV_RX_FRAME|H2_EV_RX_WU, h2c->conn);
@@ -3402,6 +3455,7 @@ static int h2c_handle_priority(struct h2c *h2c)
 static int h2c_handle_rst_stream(struct h2c *h2c, struct h2s *h2s)
 {
 	int rst_code;
+	int ret = 1;
 
 	TRACE_ENTER(H2_EV_RX_FRAME|H2_EV_RX_RST|H2_EV_RX_EOI, h2c->conn, h2s);
 
@@ -3430,6 +3484,16 @@ static int h2c_handle_rst_stream(struct h2c *h2c, struct h2s *h2s)
 
 	if (h2s_sc(h2s)) {
 		se_fl_set_error(h2s->sd);
+
+		if (unlikely(!se_fl_test(h2s->sd, SE_FL_APP_STARTED))) {
+			/* the application layer has not yet started to read! */
+			TRACE_STATE("received early RST_STREAM", H2_EV_RX_FRAME|H2_EV_RX_RST, h2c->conn);
+			if (h2c_report_glitch(h2c, 1, "received early RST_STREAM, attack suspected")) {
+				TRACE_DEVEL("too many glitches, leaving on error", H2_EV_RX_FRAME|H2_EV_RX_RST, h2c->conn, h2s);
+				ret = 0; // report the error
+			}
+		}
+
 		se_report_term_evt(h2s->sd, se_tevt_type_rst_rcvd);
 		if (!h2s->sd->abort_info.info) {
 			h2s->sd->abort_info.info = (SE_ABRT_SRC_MUX_H2 << SE_ABRT_SRC_SHIFT);
@@ -3440,7 +3504,7 @@ static int h2c_handle_rst_stream(struct h2c *h2c, struct h2s *h2s)
 
 	h2s->flags |= H2_SF_RST_RCVD;
 	TRACE_LEAVE(H2_EV_RX_FRAME|H2_EV_RX_RST|H2_EV_RX_EOI, h2c->conn, h2s);
-	return 1;
+	return ret;
 }
 
 /* processes a HEADERS frame. Returns h2s on success or NULL on missing data.
@@ -3479,11 +3543,11 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 				goto out;
 			}
 
-			error = h2c_dec_hdrs(h2c, h2s_rxbuf_tail(h2s), &h2s->flags, &body_len, NULL);
+			error = h2c_dec_hdrs(h2c, h2s_rxbuf_tail(h2s), &h2s->flags, &h2s->body_len, NULL);
 			/* unrecoverable error ? */
 			if (h2c->st0 >= H2_CS_ERROR) {
 				TRACE_USER("Unrecoverable error decoding H2 trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, h2s_rxbuf_tail(h2s));
-				sess_log(h2c->conn->owner);
+				h2_sess_log_conn(h2c->conn->owner);
 				goto out;
 			}
 
@@ -3497,11 +3561,13 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 			}
 
 			if (error < 0) {
-				/* Failed to decode this frame (e.g. too large request)
+				/* Failed to decode this frame (e.g. too large trailers)
 				 * but the HPACK decompressor is still synchronized.
 				 */
-				sess_log(h2c->conn->owner);
-				h2s_error(h2s, H2_ERR_INTERNAL_ERROR);
+				session_inc_http_err_ctr(h2c->conn->owner);
+				HA_ATOMIC_INC(&h2c->px_counters->strm_proto_err);
+				h2_sess_log_strm(h2c->conn->owner);
+				h2s_error(h2s, H2_ERR_PROTOCOL_ERROR);
 				TRACE_USER("Stream error decoding H2 trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, h2s_rxbuf_tail(h2s));
 				h2c->st0 = H2_CS_FRAME_E;
 				goto out;
@@ -3512,8 +3578,9 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		 * the data and send another RST.
 		 */
 		error = h2c_dec_hdrs(h2c, &rxbuf, &flags, &body_len, NULL);
-		sess_log(h2c->conn->owner);
+		h2_sess_log_strm(h2c->conn->owner);
 		h2s = (struct h2s*)h2_error_stream;
+		h2c_report_glitch(h2c, 1, "rcvd H2 trailers on closed stream");
 		TRACE_USER("rcvd H2 trailers on closed stream", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, h2s, &rxbuf);
 		goto send_rst;
 	}
@@ -3523,7 +3590,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		h2c_report_glitch(h2c, 1, "HEADERS on invalid stream ID");
 		TRACE_ERROR("HEADERS on invalid stream ID", H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
 		HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
-		sess_log(h2c->conn->owner);
+		h2_sess_log_conn(h2c->conn->owner);
 		session_inc_http_req_ctr(h2c->conn->owner);
 		session_inc_http_err_ctr(h2c->conn->owner);
 		goto conn_err;
@@ -3532,7 +3599,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		goto out; // IDLE but too many sc still present
 	}
 	else if (h2_fe_max_total_streams &&
-		 h2c->stream_cnt >= h2_fe_max_total_streams + h2c_max_concurrent_streams(h2c)) {
+		 h2c->stream_cnt >= h2_fe_max_total_streams + h2c->streams_hard_limit) {
 		/* We've already told this client we were going to close a
 		 * while ago and apparently it didn't care, so it's time to
 		 * stop processing its requests for real.
@@ -3541,7 +3608,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		h2c_report_glitch(h2c, 1, "Stream limit violated");
 		TRACE_STATE("Stream limit violated", H2_EV_STRM_SHUT, h2c->conn);
 		HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
-		sess_log(h2c->conn->owner);
+		h2_sess_log_conn(h2c->conn->owner);
 		session_inc_http_req_ctr(h2c->conn->owner);
 		session_inc_http_err_ctr(h2c->conn->owner);
 		goto conn_err;
@@ -3574,16 +3641,18 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		 * error code in the connection and counted it in the relevant
 		 * stats. We still count a req error in both cases.
 		 */
-		sess_log(h2c->conn->owner);
 		session_inc_http_req_ctr(h2c->conn->owner);
 		session_inc_http_err_ctr(h2c->conn->owner);
 
 		if (h2c->st0 >= H2_CS_ERROR) {
+			h2_sess_log_conn(h2c->conn->owner);
 			TRACE_USER("Unrecoverable error decoding H2 request", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
 			goto out;
 		}
 
 		/* recoverable stream error (e.g. too large request) */
+		HA_ATOMIC_INC(&h2c->px_counters->strm_proto_err);
+		h2_sess_log_strm(h2c->conn->owner);
 		TRACE_USER("rcvd unparsable H2 request", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, h2s, &rxbuf);
 		goto strm_err;
 	}
@@ -3658,9 +3727,9 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		 * ID.
 		 */
 		if (h2c->last_sid <= 0 ||
-		    h2c->last_sid > h2c->max_id + 2 * h2c_max_concurrent_streams(h2c)) {
+		    h2c->last_sid > h2c->max_id + 2 * h2c->streams_hard_limit) {
 			/* not set yet or was too high */
-			h2c->last_sid = h2c->max_id + 2 * h2c_max_concurrent_streams(h2c);
+			h2c->last_sid = h2c->max_id + 2 * h2c->streams_hard_limit;
 			h2c_send_goaway_error(h2c, NULL);
 		}
 	}
@@ -3945,7 +4014,7 @@ static int h2_frame_check_vs_state(struct h2c *h2c, struct h2s *h2s)
 		h2c_error(h2c, H2_ERR_PROTOCOL_ERROR);
 		if (!h2c->nb_streams && !(h2c->flags & H2_CF_IS_BACK)) {
 			/* only log if no other stream can report the error */
-			sess_log(h2c->conn->owner);
+			h2_sess_log_conn(h2c->conn->owner);
 		}
 		HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 		TRACE_DEVEL("leaving in error (idle&!hdrs&!prio)", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_PROTO_ERR, h2c->conn, h2s);
@@ -4189,6 +4258,8 @@ static void h2_process_demux(struct h2c *h2c)
 	struct h2_fh hdr;
 	unsigned int padlen = 0;
 	int32_t old_iw = h2c->miw;
+	uint frames_budget = 0;
+	uint rst_budget = 0;
 
 	TRACE_ENTER(H2_EV_H2C_WAKE, h2c->conn);
 
@@ -4215,7 +4286,7 @@ static void h2_process_demux(struct h2c *h2c)
 					h2c->st0 = H2_CS_ERROR2;
 					if (b_data(&h2c->dbuf) ||
 					    !(((const struct session *)h2c->conn->owner)->fe->options & (PR_O_NULLNOLOG|PR_O_IGNORE_PRB)))
-						sess_log(h2c->conn->owner);
+						h2_sess_log_conn(h2c->conn->owner);
 				}
 				goto done;
 			}
@@ -4239,7 +4310,7 @@ static void h2_process_demux(struct h2c *h2c)
 					TRACE_ERROR("failed to receive settings", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_RX_SETTINGS|H2_EV_PROTO_ERR, h2c->conn);
 					h2c->st0 = H2_CS_ERROR2;
 					if (!(h2c->flags & H2_CF_IS_BACK))
-						sess_log(h2c->conn->owner);
+						h2_sess_log_conn(h2c->conn->owner);
 				}
 				goto done;
 			}
@@ -4251,19 +4322,19 @@ static void h2_process_demux(struct h2c *h2c)
 				h2c_error(h2c, H2_ERR_PROTOCOL_ERROR);
 				h2c->st0 = H2_CS_ERROR2;
 				if (!(h2c->flags & H2_CF_IS_BACK))
-					sess_log(h2c->conn->owner);
+					h2_sess_log_conn(h2c->conn->owner);
 				HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 				goto done;
 			}
 
-			if ((int)hdr.len < 0 || (int)hdr.len > global.tune.bufsize) {
+			if ((int)hdr.len < 0 || (int)hdr.len > b_size(&h2c->dbuf)) {
 				/* RFC7540#3.5: a GOAWAY frame MAY be omitted */
 				h2c_report_glitch(h2c, 1, "invalid settings frame length");
 				TRACE_ERROR("invalid settings frame length", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_RX_SETTINGS|H2_EV_PROTO_ERR, h2c->conn);
 				h2c_error(h2c, H2_ERR_FRAME_SIZE_ERROR);
 				h2c->st0 = H2_CS_ERROR2;
 				if (!(h2c->flags & H2_CF_IS_BACK))
-					sess_log(h2c->conn->owner);
+					h2_sess_log_conn(h2c->conn->owner);
 				goto done;
 			}
 
@@ -4275,6 +4346,14 @@ static void h2_process_demux(struct h2c *h2c)
 			HA_ATOMIC_INC(&h2c->px_counters->settings_rcvd);
 			goto new_frame;
 		}
+	}
+
+	if (h2c->flags & H2_CF_IS_BACK) {
+		frames_budget = h2_be_max_frames_at_once;
+	}
+	else {
+		frames_budget = h2_fe_max_frames_at_once;
+		rst_budget    = h2_fe_max_rst_at_once;
 	}
 
 	/* process as many incoming frames as possible below */
@@ -4303,13 +4382,13 @@ static void h2_process_demux(struct h2c *h2c)
 				break;
 			}
 
-			if ((int)hdr.len < 0 || (int)hdr.len > global.tune.bufsize) {
+			if ((int)hdr.len < 0 || (int)hdr.len > b_size(&h2c->dbuf)) {
 				h2c_report_glitch(h2c, 1, "invalid H2 frame length");
 				TRACE_ERROR("invalid H2 frame length", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_PROTO_ERR, h2c->conn);
 				h2c_error(h2c, H2_ERR_FRAME_SIZE_ERROR);
 				if (!h2c->nb_streams && !(h2c->flags & H2_CF_IS_BACK)) {
 					/* only log if no other stream can report the error */
-					sess_log(h2c->conn->owner);
+					h2_sess_log_conn(h2c->conn->owner);
 				}
 				HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 				break;
@@ -4339,7 +4418,7 @@ static void h2_process_demux(struct h2c *h2c)
 					TRACE_ERROR("invalid H2 padded frame length", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_PROTO_ERR, h2c->conn);
 					h2c_error(h2c, H2_ERR_FRAME_SIZE_ERROR);
 					if (!(h2c->flags & H2_CF_IS_BACK))
-						sess_log(h2c->conn->owner);
+						h2_sess_log_conn(h2c->conn->owner);
 					HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 					goto done;
 				}
@@ -4360,7 +4439,7 @@ static void h2_process_demux(struct h2c *h2c)
 					 */
 					h2c_error(h2c, H2_ERR_PROTOCOL_ERROR);
 					if (!(h2c->flags & H2_CF_IS_BACK))
-						sess_log(h2c->conn->owner);
+						h2_sess_log_conn(h2c->conn->owner);
 					HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 					goto done;
 				}
@@ -4384,13 +4463,13 @@ static void h2_process_demux(struct h2c *h2c)
 			h2c->st0 = H2_CS_FRAME_P;
 
 			/* check for minimum basic frame format validity */
-			ret = h2_frame_check(h2c->dft, 1, h2c->dsi, h2c->dfl, global.tune.bufsize);
+			ret = h2_frame_check(h2c->dft, 1, h2c->dsi, h2c->dfl, b_size(&h2c->dbuf));
 			if (ret != H2_ERR_NO_ERROR) {
 				h2c_report_glitch(h2c, 1, "received invalid H2 frame header");
 				TRACE_ERROR("received invalid H2 frame header", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_PROTO_ERR, h2c->conn);
 				h2c_error(h2c, ret);
 				if (!(h2c->flags & H2_CF_IS_BACK))
-					sess_log(h2c->conn->owner);
+					h2_sess_log_conn(h2c->conn->owner);
 				HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 				goto done;
 			}
@@ -4483,7 +4562,7 @@ static void h2_process_demux(struct h2c *h2c)
 			TRACE_ERROR("received unexpected H2 CONTINUATION frame", H2_EV_RX_FRAME|H2_EV_RX_CONT|H2_EV_H2C_ERR, h2c->conn, h2s);
 			h2c_error(h2c, H2_ERR_PROTOCOL_ERROR);
 			if (!(h2c->flags & H2_CF_IS_BACK))
-				sess_log(h2c->conn->owner);
+				h2_sess_log_conn(h2c->conn->owner);
 			HA_ATOMIC_INC(&h2c->px_counters->conn_proto_err);
 			goto done;
 
@@ -4579,6 +4658,29 @@ static void h2_process_demux(struct h2c *h2c)
 				h2c->st0 = H2_CS_FRAME_H;
 			}
 		}
+
+		/* If more frames remain in the buffer, let's first check if we've
+		 * depleted the frames processing budget. Consuming the RST budget
+		 * makes the tasklet go to TL_BULK to make it less priority than
+		 * other processing since it's often used by attacks, while other
+		 * frame types just yield normally.
+		 */
+		if (b_data(&h2c->dbuf)) {
+			if (h2c->dft == H2_FT_RST_STREAM && (rst_budget && !--rst_budget)) {
+				/* we've consumed all RST frames permitted by
+				 * the budget, we have to yield now.
+				 */
+				tasklet_wakeup(h2c->wait_event.tasklet, 0);
+				break;
+			}
+			else if ((frames_budget && !--frames_budget)) {
+				/* we've consumed all frames permitted by the
+				 * budget, we have to yield now.
+				 */
+				tasklet_wakeup(h2c->wait_event.tasklet);
+				break;
+			}
+		}
 	}
 
 	if (h2c_update_strm_rx_win(h2c) &&
@@ -4661,16 +4763,7 @@ static void h2_resume_each_sending_h2s(struct h2c *h2c, struct list *head)
 			continue;
 		}
 
-		if (h2s->subs && h2s->subs->events & SUB_RETRY_SEND) {
-			h2s->flags |= H2_SF_NOTIFIED;
-			tasklet_wakeup(h2s->subs->tasklet);
-			h2s->subs->events &= ~SUB_RETRY_SEND;
-			if (!h2s->subs->events)
-				h2s->subs = NULL;
-		}
-		else if (h2s->flags & (H2_SF_WANT_SHUTR|H2_SF_WANT_SHUTW)) {
-			tasklet_wakeup(h2s->shut_tl);
-		}
+		h2s_notify_send(h2s);
 	}
 
 	TRACE_LEAVE(H2_EV_H2C_SEND|H2_EV_H2S_WAKE, h2c->conn);
@@ -5376,6 +5469,8 @@ do_leave:
 
 	h2c->task = NULL;
 	h2c_error(h2c, H2_ERR_NO_ERROR);
+
+	/* here we don't have any h2c left, let's kill all h2c-less streams */
 	h2_wake_some_streams(h2c, 0);
 
 	if (br_data(h2c->mbuf)) {
@@ -5422,11 +5517,8 @@ do_leave:
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 
-	/* either we can release everything now or it will be done later once
-	 * the last stream closes.
-	 */
-	if (eb_is_empty(&h2c->streams_by_id))
-		h2_release(h2c);
+	/* now we're done */
+	h2_release(h2c);
 
 	TRACE_LEAVE(H2_EV_H2C_WAKE);
 	return NULL;
@@ -5645,13 +5737,12 @@ static void h2_detach(struct sedesc *sd)
 
 			if (h2c->conn->flags & CO_FL_PRIVATE) {
 				/* Add the connection in the session server list, if not already done */
-				if (!session_add_conn(sess, h2c->conn))
-					h2c->conn->owner = NULL;
+				session_add_conn(sess, h2c->conn);
 
 				if (eb_is_empty(&h2c->streams_by_id)) {
-					if (!h2c->conn->owner) {
+					if (!LIST_INLIST(&h2c->conn->sess_el)) {
 						/* Session insertion above has failed and connection is idle, remove it. */
-						h2c->conn->mux->destroy(h2c);
+						CALL_MUX_NO_RET(h2c->conn->mux, destroy(h2c));
 						TRACE_DEVEL("leaving on error after killing outgoing connection", H2_EV_STRM_END|H2_EV_H2C_ERR);
 						return;
 					}
@@ -5664,7 +5755,7 @@ static void h2_detach(struct sedesc *sd)
 
 					/* Ensure session can keep a new idle connection. */
 					if (session_check_idle_conn(sess, h2c->conn) != 0) {
-						h2c->conn->mux->destroy(h2c);
+						CALL_MUX_NO_RET(h2c->conn->mux, destroy(h2c));
 						TRACE_DEVEL("leaving without reusable idle connection", H2_EV_STRM_END);
 						return;
 					}
@@ -5695,7 +5786,7 @@ static void h2_detach(struct sedesc *sd)
 
 					if (!srv_add_to_idle_list(objt_server(h2c->conn->target), h2c->conn, 1)) {
 						/* The server doesn't want it, let's kill the connection right away */
-						h2c->conn->mux->destroy(h2c);
+						CALL_MUX_NO_RET(h2c->conn->mux, destroy(h2c));
 						TRACE_DEVEL("leaving on error after killing outgoing connection", H2_EV_STRM_END|H2_EV_H2C_ERR);
 						return;
 					}
@@ -6066,7 +6157,7 @@ next_frame:
 			goto fail;
 		}
 
-		if ((unsigned)hdr.len > (unsigned)global.tune.bufsize) {
+		if ((unsigned)hdr.len > (unsigned)b_size(&h2c->dbuf)) {
 			/* RFC7540#4.2: invalid frame length */
 			h2c_report_glitch(h2c, 1, "too large CONTINUATION frame");
 			TRACE_STATE("too large CONTINUATION frame", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_RX_HDR|H2_EV_RX_CONT|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
@@ -6193,8 +6284,22 @@ next_frame:
 	msgf = (h2c->dff & H2_F_HEADERS_END_STREAM) ? 0 : H2_MSGF_BODY;
 	msgf |= (*flags & H2_SF_BODY_TUNNEL) ? H2_MSGF_BODY_TUNNEL: 0;
 	/* If an Extended CONNECT has been sent on this stream, set message flag
-	 * to convert 200 response to 101 htx response */
+	 * to convert 200 response to 101 htx response. We only support this if
+	 * the connection supports RFC8441.
+	 * On the backend, that means the origin server advertised the setting.
+	 * On the frontend, RFC 8441 §3 only requires the server (us) to
+	 * advertise it; clients are not required to echo it back. Use whether
+	 * we ourselves advertised it as the gate.
+	 */
+	if (h2c->flags & H2_CF_IS_BACK)
+		msgf |= (h2c->flags & H2_CF_RCVD_RFC8441) ? H2_MSGF_EXT_CONN_OK : 0;
+	else if (!(global.tune.options & GTUNE_DISABLE_H2_WEBSOCKET))
+		msgf |= H2_MSGF_EXT_CONN_OK;
+
 	msgf |= (*flags & H2_SF_EXT_CONNECT_SENT) ? H2_MSGF_EXT_CONNECT: 0;
+
+	/* when dealing with trailers, we need to check the content-length */
+	msgf |= (*flags & H2_SF_DATA_CLEN) ? H2_MSGF_BODY_CL : 0;
 
 	if (*flags & H2_SF_HEADERS_RCVD)
 		goto trailers;
@@ -6245,6 +6350,15 @@ next_frame:
 			/* RFC9113#8.1 : HEADERS frame with the ES flag set that carries an informational status code is malformed */
 			h2c_report_glitch(h2c, 1, "invalid interim response with ES flag");
 			TRACE_STATE("invalid interim response with ES flag", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
+			goto fail;
+		}
+		/* Note that bodyless only applies to responses, even when
+		 * reported on the request (e.g. HEAD).
+		 */
+		if ((msgf & H2_MSGF_BODY_CL) && *body_len > 0 &&
+		    (!(h2c->flags & H2_CF_IS_BACK) || !(*flags & H2_SF_BODYLESS_RESP))) {
+			h2c_report_glitch(h2c, 1, "ES on HEADERS before end of content-length");
+			TRACE_STATE("ES on HEADERS before end of content-length", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
 			goto fail;
 		}
 		/* no more data are expected for this message */
@@ -6312,6 +6426,7 @@ next_frame:
 
 	/* Trailers terminate a DATA sequence */
 	if (h2_make_htx_trailers(list, htx) <= 0) {
+		h2c_report_glitch(h2c, 1, "failed to append HTX trailers into rxbuf");
 		TRACE_STATE("failed to append HTX trailers into rxbuf", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2S_ERR, h2c->conn);
 		htx->flags |= HTX_FL_PARSING_ERROR;
 		goto fail;
@@ -6413,8 +6528,22 @@ try_again:
 
  end_transfer:
 	/* here we're done with the frame, all the payload (except padding) was
-	 * transferred.
+	 * transferred. So let's consume the padding now.
+	 *
+	 * The padding may not have been fully received, so we must take care to
+	 * not consume more than avaiable and eventually retry later.
 	 */
+	BUG_ON(h2c->dfl != h2c->dpl);
+	flen = b_data(&h2c->dbuf);
+	if (flen >  h2c->dfl)
+		flen = h2c->dfl;
+	b_del(&h2c->dbuf, flen);
+	h2c->dfl -= flen;
+	h2c->dpl -= flen;
+	h2c->rcvd_c += flen;
+	h2c->rcvd_s += flen;
+	if (h2c->dfl)
+		goto fail;
 
 	if (!(h2s->flags & H2_SF_BODY_TUNNEL) && (h2c->dff & H2_F_DATA_END_STREAM)) {
 		/* no more data are expected for this message. This add the EOM
@@ -6429,9 +6558,6 @@ try_again:
 		}
 	}
 
-	h2c->rcvd_c += h2c->dpl;
-	h2c->rcvd_s += h2c->dpl;
-	h2c->dpl = 0;
 	h2c->st0 = H2_CS_FRAME_A; // send the corresponding window update
 	htx_to_buf(htx, scbuf);
 	TRACE_LEAVE(H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
@@ -6481,7 +6607,7 @@ static size_t h2s_snd_fhdrs(struct h2s *h2s, struct htx *htx)
 			break;
 
 		if (type == HTX_BLK_HDR) {
-			BUG_ON(!sl); /* The start-line mut be defined before any headers */
+			BUG_ON(!sl); /* The start-line must be defined before any headers */
 			if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
 				TRACE_ERROR("too many headers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
 				goto fail;
@@ -6527,7 +6653,7 @@ static size_t h2s_snd_fhdrs(struct h2s *h2s, struct htx *htx)
 		}
 	}
 
-	/* The start-line me be defined */
+	/* The start-line must be defined */
 	BUG_ON(!sl);
 
 	/* marker for end of headers */
@@ -6751,7 +6877,7 @@ static size_t h2s_snd_bhdrs(struct h2s *h2s, struct htx *htx)
 			break;
 
 		if (type == HTX_BLK_HDR) {
-			BUG_ON(!sl); /* The start-line mut be defined before any headers */
+			BUG_ON(!sl); /* The start-line must be defined before any headers */
 			if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
 				TRACE_ERROR("too many headers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
 				goto fail;
@@ -6840,7 +6966,7 @@ static size_t h2s_snd_bhdrs(struct h2s *h2s, struct htx *htx)
 		}
 	}
 
-	/* The start-line me be defined */
+	/* The start-line must be defined */
 	BUG_ON(!sl);
 
 	/* Now add the server name to a header (if requested) */
@@ -7234,7 +7360,7 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 	 * the time. This goes for headers, data blocks and any data extracted
 	 * from the HTX blocks.
 	 */
-	if (unlikely(fsize == count &&
+	if (unlikely(fsize == count && b_size(mbuf) == b_size(buf) &&
 	             htx_nbblks(htx) == 1 && type == HTX_BLK_DATA &&
 	             fsize <= h2s_mws(h2s) && fsize <= h2c->mws && fsize <= h2c->mfs)) {
 		void *old_area = mbuf->area;
@@ -7385,7 +7511,7 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 	if (fsize > h2c->mws)
 		fsize = h2c->mws;
 
-	/* now let's copy this this into the output buffer */
+	/* now let's copy this into the output buffer */
 	memcpy(outbuf.area + 9, htx_get_blk_ptr(htx, blk), fsize);
 	h2s->sws -= fsize;
 	h2c->mws -= fsize;
@@ -7788,7 +7914,6 @@ static size_t h2_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	struct htx *h2s_htx = NULL;
 	struct htx *buf_htx = NULL;
 	struct buffer *rxbuf = NULL;
-	struct htx_ret htxret;
 	size_t ret = 0;
 	uint prev_h2c_flags = h2c->flags;
 	unsigned long long prev_body_len = h2s->body_len;
@@ -7823,17 +7948,7 @@ static size_t h2_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 		goto end;
 	}
 
-	htxret = htx_xfer_blks(buf_htx, h2s_htx, count, HTX_BLK_UNUSED);
-	count -= htxret.ret;
-
-	if (h2s_htx->flags & HTX_FL_PARSING_ERROR) {
-		buf_htx->flags |= HTX_FL_PARSING_ERROR;
-		if (htx_is_empty(buf_htx))
-			se_fl_set(h2s->sd, SE_FL_EOI);
-	}
-	else if (htx_is_empty(h2s_htx)) {
-		buf_htx->flags |= (h2s_htx->flags & HTX_FL_EOM);
-	}
+	count -= htx_xfer(buf_htx, h2s_htx, count, HTX_XFER_DEFAULT);
 
 	htx_to_buf(buf_htx, buf);
 	htx_to_buf(h2s_htx, rxbuf);
@@ -8096,6 +8211,15 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	size_t sz , ret = 0;
 
 	TRACE_ENTER(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
+
+	if (h2s->st >= H2_SS_HLOC) {
+		/* Cannot emit any new data if stream already closed. Data
+		 * draining will be performed via snd_buf.
+		 */
+		TRACE_DEVEL("stream already closed, disable FF", H2_EV_H2S_SEND, h2s->h2c->conn, h2s);
+		h2s->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto end;
+	}
 
 	/* If we were not just woken because we wanted to send but couldn't,
 	 * and there's somebody else that is waiting to send, do nothing,
@@ -8638,26 +8762,87 @@ static int h2_parse_initial_window_size(char **args, int section_type, struct pr
 	return 0;
 }
 
+/* config parser for global "tune.h2.log-errors" */
+static int h2_parse_log_errors(char **args, int section_type, struct proxy *curpx,
+                                        const struct proxy *defpx, const char *file, int line,
+                                        char **err)
+{
+	int *vptr;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	/* backend/frontend/default */
+	vptr = &h2_settings_log_errors;
+	if (strcmp(args[1], "none") == 0)
+		*vptr = H2_ERR_LOG_ERR_NONE;
+	else if (strcmp(args[1], "connection") == 0)
+		*vptr = H2_ERR_LOG_ERR_CONN;
+	else if (strcmp(args[1], "stream") == 0)
+		*vptr = H2_ERR_LOG_ERR_STRM;
+	else {
+		memprintf(err, "'%s' expects 'none', 'connection', or 'stream'", args[0]);
+		return -1;
+	}
+	return 0;
+}
+
 /* config parser for global "tune.h2.{be.,fe.,}max-concurrent-streams" */
 static int h2_parse_max_concurrent_streams(char **args, int section_type, struct proxy *curpx,
                                            const struct proxy *defpx, const char *file, int line,
                                            char **err)
 {
 	uint *vptr;
-
-	if (too_many_args(1, args, err, NULL))
-		return -1;
+	int arg;
 
 	/* backend/frontend/default */
 	vptr = (args[0][8] == 'b') ? &h2_be_settings_max_concurrent_streams :
 	       (args[0][8] == 'f') ? &h2_fe_settings_max_concurrent_streams :
 	       &h2_settings_max_concurrent_streams;
 
+
+	if (args[0][8] != 'f' && too_many_args(1, args, err, NULL))
+		return -1;
+
 	*vptr = atoi(args[1]);
 	if ((int)*vptr < 0) {
 		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
 		return -1;
 	}
+
+	if (args[0][8] != 'f')
+		goto leave;
+
+	/* tune.h2.fe. here */
+	for (arg = 2; *args[arg]; arg += 2) {
+		if (strcmp(args[arg], "rq-load") == 0) {
+			if (strcmp(args[arg + 1], "ignore") == 0)
+				h2_fe_max_rq_load = ~0;
+			else if (strcmp(args[arg + 1], "auto") == 0)
+				h2_fe_max_rq_load = 0;
+			else if (!*args[arg + 1] || (h2_fe_max_rq_load = atoi(args[arg + 1])) <= 0) {
+				memprintf(err, "'%s' expects a strictly positive run-queue length, or 'auto' or 'ignore'.", args[0]);
+				return -1;
+			}
+		}
+		else if (strcmp(args[arg], "min") == 0) {
+			if (!*args[arg + 1] || (h2_fe_min_concurrent_streams = atoi(args[arg + 1])) <= 0) {
+				memprintf(err, "'%s' expects a strictly positive minimum number of streams'.", args[0]);
+				return -1;
+			}
+
+			if (h2_fe_min_concurrent_streams > h2_fe_settings_max_concurrent_streams) {
+				memprintf(err, "'%s' minimum number of streams (%u) cannot be higher than the maximum (%u)'.",
+					  args[0], h2_fe_min_concurrent_streams, h2_fe_settings_max_concurrent_streams);
+				return -1;
+			}
+		}
+		else if (*args[arg]) {
+			memprintf(err, "'%s' only supports 'rq-load' or 'min' after the numeric value, but found '%s'.", args[0], args[arg]);
+			return -1;
+		}
+	}
+ leave:
 	return 0;
 }
 
@@ -8679,6 +8864,30 @@ static int h2_parse_max_total_streams(char **args, int section_type, struct prox
 		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
 		return -1;
 	}
+	return 0;
+}
+
+/* config parser for global "tune.h2.{be.,fe.,}max-{frames,rst}-at-once" */
+static int h2_parse_max_frames_at_once(char **args, int section_type, struct proxy *curpx,
+                                       const struct proxy *defpx, const char *file, int line,
+                                       char **err)
+{
+	uint *vptr;
+
+	/* backend/frontend/default */
+	if (strcmp(args[0], "tune.h2.be.max-frames-at-once") == 0)
+		vptr = &h2_be_max_frames_at_once;
+	else if (strcmp(args[0], "tune.h2.fe.max-frames-at-once") == 0)
+		vptr = &h2_fe_max_frames_at_once;
+	else if (strcmp(args[0], "tune.h2.fe.max-rst-at-once") == 0)
+		vptr = &h2_fe_max_rst_at_once;
+	else
+		BUG_ON(1, "unhandled keyword");
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	*vptr = atoi(args[1]);
 	return 0;
 }
 
@@ -8780,14 +8989,18 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.h2.be.glitches-threshold",  h2_parse_glitches_threshold     },
 	{ CFG_GLOBAL, "tune.h2.be.initial-window-size", h2_parse_initial_window_size    },
 	{ CFG_GLOBAL, "tune.h2.be.max-concurrent-streams", h2_parse_max_concurrent_streams },
+	{ CFG_GLOBAL, "tune.h2.be.max-frames-at-once",  h2_parse_max_frames_at_once     },
 	{ CFG_GLOBAL, "tune.h2.be.rxbuf",               h2_parse_rxbuf                  },
 	{ CFG_GLOBAL, "tune.h2.fe.glitches-threshold",  h2_parse_glitches_threshold     },
 	{ CFG_GLOBAL, "tune.h2.fe.initial-window-size", h2_parse_initial_window_size    },
 	{ CFG_GLOBAL, "tune.h2.fe.max-concurrent-streams", h2_parse_max_concurrent_streams },
+	{ CFG_GLOBAL, "tune.h2.fe.max-frames-at-once",  h2_parse_max_frames_at_once     },
+	{ CFG_GLOBAL, "tune.h2.fe.max-rst-at-once",     h2_parse_max_frames_at_once     },
 	{ CFG_GLOBAL, "tune.h2.fe.max-total-streams",   h2_parse_max_total_streams      },
 	{ CFG_GLOBAL, "tune.h2.fe.rxbuf",               h2_parse_rxbuf                  },
 	{ CFG_GLOBAL, "tune.h2.header-table-size",      h2_parse_header_table_size      },
 	{ CFG_GLOBAL, "tune.h2.initial-window-size",    h2_parse_initial_window_size    },
+	{ CFG_GLOBAL, "tune.h2.log-errors",             h2_parse_log_errors             },
 	{ CFG_GLOBAL, "tune.h2.max-concurrent-streams", h2_parse_max_concurrent_streams },
 	{ CFG_GLOBAL, "tune.h2.max-frame-size",         h2_parse_max_frame_size         },
 	{ CFG_GLOBAL, "tune.h2.zero-copy-fwd-send",     h2_parse_zero_copy_fwd_snd },

@@ -12,6 +12,7 @@ import functools
 import json
 import re
 import sys
+import urllib.error
 import urllib.request
 from os import environ
 from packaging import version
@@ -19,9 +20,10 @@ from packaging import version
 #
 # this CI is used for both development and stable branches of HAProxy
 #
-# naming convention used, if branch name matches:
+# naming convention used, if branch/tag name matches:
 #
 #   "haproxy-" - stable branches
+#   "vX.Y.Z"   - release tags
 #   otherwise  - development branch (i.e. "latest" ssl variants, "latest" github images)
 #
 
@@ -32,13 +34,24 @@ def get_all_github_tags(url):
     headers = {}
     if environ.get("GITHUB_TOKEN") is not None:
         headers["Authorization"] = "token {}".format(environ.get("GITHUB_TOKEN"))
-    request = urllib.request.Request(url, headers=headers)
-    try:
-        tags = urllib.request.urlopen(request)
-    except:
-        return None
-    tags = json.loads(tags.read().decode("utf-8"))
-    return [tag['name'] for tag in tags]
+    all_tags = []
+    page = 1
+    sep = "&" if "?" in url else "?"
+    while True:
+        paginated_url = "{}{}per_page=100&page={}".format(url, sep, page)
+        request = urllib.request.Request(paginated_url, headers=headers)
+        try:
+            response = urllib.request.urlopen(request)
+        except urllib.error.URLError:
+            return all_tags if all_tags else None
+        tags = json.loads(response.read().decode("utf-8"))
+        if not tags:
+            break
+        all_tags.extend([tag['name'] for tag in tags])
+        if len(tags) < 100:
+            break
+        page += 1
+    return all_tags if all_tags else None
 
 @functools.lru_cache(5)
 def determine_latest_openssl(ssl):
@@ -56,7 +69,7 @@ def aws_lc_version_string_to_num(version_string):
     return tuple(map(int, version_string[1:].split('.')))
 
 def aws_lc_version_valid(version_string):
-    return re.match('^v[0-9]+(\.[0-9]+)*$', version_string)
+    return re.match(r'^v[0-9]+(\.[0-9]+)*$', version_string)
 
 @functools.lru_cache(5)
 def determine_latest_aws_lc(ssl):
@@ -64,6 +77,8 @@ def determine_latest_aws_lc(ssl):
     if not tags:
         return "AWS_LC_VERSION=failed_to_detect"
     valid_tags = list(filter(aws_lc_version_valid, tags))
+    if not valid_tags:
+        return "AWS_LC_VERSION=failed_to_detect"
     latest_tag = max(valid_tags, key=aws_lc_version_string_to_num)
     return "AWS_LC_VERSION={}".format(latest_tag[1:])
 
@@ -71,15 +86,16 @@ def aws_lc_fips_version_string_to_num(version_string):
     return tuple(map(int, version_string[12:].split('.')))
 
 def aws_lc_fips_version_valid(version_string):
-    return re.match('^AWS-LC-FIPS-[0-9]+(\.[0-9]+)*$', version_string)
+    return re.match(r'^AWS-LC-FIPS-[0-9]+(\.[0-9]+)*$', version_string)
 
 @functools.lru_cache(5)
 def determine_latest_aws_lc_fips(ssl):
-    # the AWS-LC-FIPS tags are at the end of the list, so let's get a lot
-    tags = get_all_github_tags("https://api.github.com/repos/aws/aws-lc/tags?per_page=200")
+    tags = get_all_github_tags("https://api.github.com/repos/aws/aws-lc/tags")
     if not tags:
         return "AWS_LC_FIPS_VERSION=failed_to_detect"
     valid_tags = list(filter(aws_lc_fips_version_valid, tags))
+    if not valid_tags:
+        return "AWS_LC_FIPS_VERSION=failed_to_detect"
     latest_tag = max(valid_tags, key=aws_lc_fips_version_string_to_num)
     return "AWS_LC_FIPS_VERSION={}".format(latest_tag[12:])
 
@@ -87,7 +103,7 @@ def wolfssl_version_string_to_num(version_string):
     return tuple(map(int, version_string[1:].removesuffix('-stable').split('.')))
 
 def wolfssl_version_valid(version_string):
-    return re.match('^v[0-9]+(\.[0-9]+)*-stable$', version_string)
+    return re.match(r'^v[0-9]+(\.[0-9]+)*-stable$', version_string)
 
 @functools.lru_cache(5)
 def determine_latest_wolfssl(ssl):
@@ -120,16 +136,20 @@ def clean_compression(compression):
 def main(ref_name):
     print("Generating matrix for branch '{}'.".format(ref_name))
 
+    is_stable = "haproxy-" in ref_name or re.match(r'^v\d+\.\d+\.\d+$', ref_name)
+
     matrix = []
 
     # Ubuntu
 
-    if "haproxy-" in ref_name:
+    if is_stable:
         os = "ubuntu-24.04"         # stable branch
         os_arm = "ubuntu-24.04-arm" # stable branch
+        os_i686 = "ubuntu-24.04"    # stable branch
     else:
         os = "ubuntu-24.04"         # development branch
         os_arm = "ubuntu-24.04-arm" # development branch
+        os_i686 = "ubuntu-24.04"    # development branch
 
     TARGET = "linux-glibc"
     for CC in ["gcc", "clang"]:
@@ -187,6 +207,7 @@ def main(ref_name):
                         'OPT_CFLAGS="-O1"',
                         "USE_ZLIB=1",
                         "USE_OT=1",
+                        "DEBUG=-DDEBUG_STRICT=2",
                         "OT_INC=${HOME}/opt-ot/include",
                         "OT_LIB=${HOME}/opt-ot/lib",
                         "OT_RUNPATH=1",
@@ -228,7 +249,7 @@ def main(ref_name):
             # "BORINGSSL=yes",
         ]
 
-        if "haproxy-" not in ref_name: # development branch
+        if not is_stable: # development branch
             ssl_versions = ssl_versions + [
                 "OPENSSL_VERSION=latest",
                 "LIBRESSL_VERSION=latest",
@@ -275,24 +296,63 @@ def main(ref_name):
                 }
             )
 
-    # macOS
-
-    if "haproxy-" in ref_name:
-        os = "macos-13"     # stable branch
-    else:
+    # macOS on dev branches
+    if not is_stable:
         os = "macos-26"     # development branch
 
-    TARGET = "osx"
-    for CC in ["clang"]:
-        matrix.append(
-            {
-                "name": "{}, {}, no features".format(os, CC),
-                "os": os,
-                "TARGET": TARGET,
-                "CC": CC,
-                "FLAGS": [],
-            }
-        )
+        TARGET = "osx"
+        for CC in ["clang"]:
+            matrix.append(
+                {
+                    "name": "{}, {}, no features".format(os, CC),
+                    "os": os,
+                    "TARGET": TARGET,
+                    "CC": CC,
+                    "FLAGS": [],
+                }
+            )
+
+    # Alpine / musl
+
+    matrix.append(
+        {
+            "name": "Alpine+musl, gcc",
+            "os": "ubuntu-latest",
+            "container": {
+                "image": "alpine:latest",
+                "options": "--privileged --ulimit core=-1 --security-opt seccomp=unconfined",
+                "volumes": ["/tmp/core:/tmp/core"],
+            },
+            "TARGET": "linux-musl",
+            "CC": "gcc",
+            "FLAGS": [
+                "ARCH_FLAGS='-ggdb3'",
+                "USE_LUA=1",
+                "LUA_INC=/usr/include/lua5.3",
+                "LUA_LIB=/usr/lib/lua5.3",
+                "USE_OPENSSL=1",
+                "USE_PCRE2=1",
+                "USE_PCRE2_JIT=1",
+                "USE_PROMEX=1",
+            ],
+        }
+    )
+
+    # i686
+
+    matrix.append(
+        {
+            "name": "{}, i686-linux-gnu-gcc".format(os_i686),
+            "os": os_i686,
+            "TARGET": "linux-glibc",
+            "CC": "i686-linux-gnu-gcc",
+            "FLAGS": [
+                "USE_OPENSSL=1",
+                "USE_PCRE2=1",
+                "USE_PCRE2_JIT=1",
+            ],
+        }
+    )
 
     # Print matrix
 

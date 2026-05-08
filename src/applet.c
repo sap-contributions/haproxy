@@ -31,7 +31,6 @@ unsigned int nb_applets = 0;
 
 DECLARE_TYPED_POOL(pool_head_appctx,  "appctx",  struct appctx);
 
-
 /* trace source and events */
 static void applet_trace(enum trace_level level, uint64_t mask,
 			 const struct trace_source *src,
@@ -417,7 +416,7 @@ void appctx_shut(struct appctx *appctx)
 	TRACE_ENTER(APPLET_EV_RELEASE, appctx);
 
 	if (appctx->applet->release)
-		appctx->applet->release(appctx);
+		CALL_APPLET_NO_RET(appctx->applet, release(appctx));
 	applet_fl_set(appctx, APPCTX_FL_SHUTDOWN);
 
 	b_dequeue(&appctx->buffer_wait);
@@ -505,14 +504,14 @@ size_t appctx_htx_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t coun
 
 	ret = appctx_htx->data;
 	buf_htx = htx_from_buf(buf);
-	if (htx_is_empty(buf_htx) && htx_used_space(appctx_htx) <= count) {
+	if (b_size(&appctx->outbuf) == b_size(buf) && htx_is_empty(buf_htx) && htx_used_space(appctx_htx) <= count) {
 		htx_to_buf(buf_htx, buf);
 		htx_to_buf(appctx_htx, &appctx->outbuf);
 		b_xfer(buf, &appctx->outbuf, b_data(&appctx->outbuf));
 		goto out;
 	}
 
-	htx_xfer_blks(buf_htx, appctx_htx, count, HTX_BLK_UNUSED);
+	htx_xfer(buf_htx, appctx_htx, count, HTX_XFER_DEFAULT);
 	buf_htx->flags |= (appctx_htx->flags & (HTX_FL_PARSING_ERROR|HTX_FL_PROCESSING_ERROR));
 	if (htx_is_empty(appctx_htx)) {
 		buf_htx->flags |= (appctx_htx->flags & HTX_FL_EOM);
@@ -551,7 +550,7 @@ size_t appctx_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 	if (flags & CO_RFL_BUF_FLUSH)
 		applet_fl_set(appctx, APPCTX_FL_FASTFWD);
 
-	ret = appctx->applet->rcv_buf(appctx, buf, count, flags);
+	ret = CALL_APPLET_WITH_RET(appctx->applet, rcv_buf(appctx, buf, count, flags));
 	if (ret)
 		applet_fl_clr(appctx, APPCTX_FL_OUTBLK_FULL);
 
@@ -609,7 +608,7 @@ size_t appctx_htx_snd_buf(struct appctx *appctx, struct buffer *buf, size_t coun
 		goto end;
 	}
 
-	htx_xfer_blks(appctx_htx, buf_htx, count, HTX_BLK_UNUSED);
+	htx_xfer(appctx_htx, buf_htx, count, HTX_XFER_DEFAULT);
 	if (htx_is_empty(buf_htx)) {
 		appctx_htx->flags |= (buf_htx->flags & HTX_FL_EOM);
 	}
@@ -659,7 +658,7 @@ size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 		goto end;
 	}
 
-	ret = appctx->applet->snd_buf(appctx, buf, count, flags);
+	ret = CALL_APPLET_WITH_RET(appctx->applet, snd_buf(appctx, buf, count, flags));
 
 	if (applet_fl_test(appctx, (APPCTX_FL_ERROR|APPCTX_FL_ERR_PENDING)))
 		se_report_term_evt(appctx->sedesc, se_tevt_type_snd_err);
@@ -716,7 +715,7 @@ int appctx_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	}
 
 	b_add(sdo->iobuf.buf, sdo->iobuf.offset);
-	ret = appctx->applet->fastfwd(appctx, sdo->iobuf.buf, len, 0);
+	ret = CALL_APPLET_WITH_RET(appctx->applet, fastfwd(appctx, sdo->iobuf.buf, len, 0));
 	b_sub(sdo->iobuf.buf, sdo->iobuf.offset);
 	sdo->iobuf.data += ret;
 
@@ -852,8 +851,8 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 	/* Don't call I/O handler if the applet was shut (release callback was
 	 * already called)
 	 */
-	if (!se_fl_test(app->sedesc, SE_FL_SHR | SE_FL_SHW))
-		app->applet->fct(app);
+	if (!se_fl_test(app->sedesc, SE_FL_SHR) || !se_fl_test(app->sedesc, SE_FL_SHW))
+		CALL_APPLET_NO_RET(app->applet, fct(app));
 
 	TRACE_POINT(APPLET_EV_PROCESS, app);
 
@@ -900,7 +899,7 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 			stream_dump_and_crash(&app->obj_type, read_freq_ctr(&app->call_rate));
 	}
 
-	sc->app_ops->wake(sc);
+	sc_applet_process(sc);
 	channel_release_buffer(ic, &app->buffer_wait);
 	TRACE_LEAVE(APPLET_EV_PROCESS, app);
 	return t;
@@ -954,7 +953,7 @@ struct task *task_process_applet(struct task *t, void *context, unsigned int sta
 	 * already called)
 	 */
 	if (!applet_fl_test(app, APPCTX_FL_SHUTDOWN))
-		app->applet->fct(app);
+		CALL_APPLET_NO_RET(app->applet, fct(app));
 
 	TRACE_POINT(APPLET_EV_PROCESS, app);
 
@@ -993,7 +992,7 @@ struct task *task_process_applet(struct task *t, void *context, unsigned int sta
 			stream_dump_and_crash(&app->obj_type, read_freq_ctr(&app->call_rate));
 	}
 
-	sc->app_ops->wake(sc);
+	sc_applet_process(sc);
 	appctx_release_buffers(app);
 	TRACE_LEAVE(APPLET_EV_PROCESS, app);
 	return t;

@@ -1,10 +1,10 @@
 #!/bin/sh
 
+DESTDIR=${DESTDIR:-${PWD}/../vtest/}
+TMPDIR=${TMPDIR:-$(mktemp -d)}
 set -eux
 
-curl -fsSL https://github.com/vtest/VTest2/archive/main.tar.gz  -o VTest.tar.gz
-mkdir ../vtest
-tar xvf VTest.tar.gz -C ../vtest --strip-components=1
+git clone https://code.vinyl-cache.org/vtest/VTest2 "${TMPDIR}/vtest"
 # Special flags due to: https://github.com/vtest/VTest/issues/12
 
 # Note: do not use "make -C ../vtest", otherwise MAKEFLAGS contains "w"
@@ -13,7 +13,7 @@ tar xvf VTest.tar.gz -C ../vtest --strip-components=1
 # MFLAGS works on BSD but misses variable definitions on GNU Make.
 # Better just avoid the -C and do the cd ourselves then.
 
-cd ../vtest
+cd "${TMPDIR}/vtest"
 
 set +e
 CPUS=${CPUS:-$(nproc 2>/dev/null)}
@@ -28,3 +28,6 @@ if test -f /opt/homebrew/include/pcre2.h; then
 else
    make -j${CPUS} FLAGS="-O2 -s -Wall"
 fi
+
+mkdir -p "${DESTDIR}"
+cp "${TMPDIR}/vtest/vtest" "${DESTDIR}"

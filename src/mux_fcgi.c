@@ -862,7 +862,7 @@ static void fcgi_strm_notify_recv(struct fcgi_strm *fstrm)
 {
 	if (fstrm->subs && (fstrm->subs->events & SUB_RETRY_RECV)) {
 		TRACE_POINT(FCGI_EV_STRM_WAKE, fstrm->fconn->conn, fstrm);
-		tasklet_wakeup(fstrm->subs->tasklet);
+		tasklet_wakeup(fstrm->subs->tasklet, TASK_WOKEN_IO);
 		fstrm->subs->events &= ~SUB_RETRY_RECV;
 		if (!fstrm->subs->events)
 			fstrm->subs = NULL;
@@ -875,7 +875,7 @@ static void fcgi_strm_notify_send(struct fcgi_strm *fstrm)
 	if (fstrm->subs && (fstrm->subs->events & SUB_RETRY_SEND)) {
 		TRACE_POINT(FCGI_EV_STRM_WAKE, fstrm->fconn->conn, fstrm);
 		fstrm->flags |= FCGI_SF_NOTIFIED;
-		tasklet_wakeup(fstrm->subs->tasklet);
+		tasklet_wakeup(fstrm->subs->tasklet, TASK_WOKEN_IO);
 		fstrm->subs->events &= ~SUB_RETRY_SEND;
 		if (!fstrm->subs->events)
 			fstrm->subs = NULL;
@@ -886,26 +886,28 @@ static void fcgi_strm_notify_send(struct fcgi_strm *fstrm)
 	}
 }
 
-/* Alerts the data layer, trying to wake it up by all means, following
- * this sequence :
- *   - if the fcgi stream' data layer is subscribed to recv, then it's woken up
- *     for recv
- *   - if its subscribed to send, then it's woken up for send
- *   - if it was subscribed to neither, its ->wake() callback is called
- * It is safe to call this function with a closed stream which doesn't have a
- * stream connector anymore.
+
+/* Alerts the data layer by waking it up. TASK_WOKEN_MSG state is used by
+ * default and if the data layer is also subscribed to recv or send,
+ * TASK_WOKEN_IO is added. But first of all, we check if the shut tasklet must
+ * be woken up or not instead.
  */
 static void fcgi_strm_alert(struct fcgi_strm *fstrm)
 {
 	TRACE_POINT(FCGI_EV_STRM_WAKE, fstrm->fconn->conn, fstrm);
-	if (fstrm->subs ||
-	    (fstrm->flags & (FCGI_SF_WANT_SHUTR|FCGI_SF_WANT_SHUTW))) {
-		fcgi_strm_notify_recv(fstrm);
-		fcgi_strm_notify_send(fstrm);
-	}
-	else if (fcgi_strm_sc(fstrm) && fcgi_strm_sc(fstrm)->app_ops->wake != NULL) {
-		TRACE_POINT(FCGI_EV_STRM_WAKE, fstrm->fconn->conn, fstrm);
-		fcgi_strm_sc(fstrm)->app_ops->wake(fcgi_strm_sc(fstrm));
+	if (!fstrm->subs && (fstrm->flags & (FCGI_SF_WANT_SHUTR|FCGI_SF_WANT_SHUTW)))
+		tasklet_wakeup(fstrm->shut_tl);
+	else if (fcgi_strm_sc(fstrm)) {
+		unsigned int state = TASK_WOKEN_MSG;
+
+		if (fstrm->subs) {
+			if (fstrm->subs->events & SUB_RETRY_SEND)
+				fstrm->flags |= FCGI_SF_NOTIFIED;
+			fstrm->subs->events = 0;
+			fstrm->subs = NULL;
+			state |= TASK_WOKEN_IO;
+		}
+		tasklet_wakeup(fcgi_strm_sc(fstrm)->wait_event.tasklet, state);
 	}
 }
 
@@ -1889,9 +1891,6 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 
 	TRACE_ENTER(FCGI_EV_TX_RECORD|FCGI_EV_TX_PARAMS, fconn->conn, fstrm, htx);
 
-	memset(&params, 0, sizeof(params));
-	params.p = get_trash_chunk();
-
 	mbuf = br_tail(fconn->mbuf);
   retry:
 	if (!fcgi_get_buf(fconn, mbuf)) {
@@ -1912,16 +1911,22 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 	if (outbuf.size < FCGI_RECORD_HEADER_SZ)
 		goto full;
 
+	/* FCGI record size is uint16_t; cap output to avoid truncation in
+	 * fcgi_set_record_size() when tune.bufsize is large. */
+	if (outbuf.size > 0xFFFF + FCGI_RECORD_HEADER_SZ)
+		outbuf.size = 0xFFFF + FCGI_RECORD_HEADER_SZ;
+
 	/* vsn: 1(FCGI_VERSION), type: (4)FCGI_PARAMS, id: fstrm->id,
 	 *  len: 0x0000 (fill later), padding: 0x00, rsv: 0x00 */
 	memcpy(outbuf.area, "\x01\x04\x00\x00\x00\x00\x00\x00", FCGI_RECORD_HEADER_SZ);
 	fcgi_set_record_id(outbuf.area, fstrm->id);
 	outbuf.data = FCGI_RECORD_HEADER_SZ;
 
-	blk = htx_get_head_blk(htx);
-	while (blk) {
+	memset(&params, 0, sizeof(params));
+	params.p = get_trash_chunk();
+
+	for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 		enum htx_blk_type type;
-		uint32_t size = htx_get_blksz(blk);
 		struct fcgi_param p;
 
 		type = htx_get_blk_type(blk);
@@ -2015,9 +2020,7 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 				if (!fcgi_encode_param(&outbuf, &p)) {
 					if (b_space_wraps(mbuf))
 						goto realign_again;
-					if (outbuf.data == FCGI_RECORD_HEADER_SZ)
-						goto full;
-					goto done;
+					goto full;
 				}
 				break;
 
@@ -2036,8 +2039,7 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 					if (!fcgi_encode_param(&outbuf, &p)) {
 						if (b_space_wraps(mbuf))
 							goto realign_again;
-						if (outbuf.data == FCGI_RECORD_HEADER_SZ)
-							goto full;
+						goto full;
 					}
 					TRACE_STATE("add server name header", FCGI_EV_TX_RECORD|FCGI_EV_TX_PARAMS, fconn->conn, fstrm);
 				}
@@ -2046,8 +2048,6 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 			default:
 				break;
 		}
-		total += size;
-		blk = htx_remove_blk(htx, blk);
 	}
 
   done:
@@ -2073,8 +2073,9 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 	    !fcgi_encode_default_param(fconn, fstrm, &params, &outbuf, FCGI_SP_CONT_LEN)    ||
 	    !fcgi_encode_default_param(fconn, fstrm, &params, &outbuf, FCGI_SP_SRV_SOFT)    ||
 	    !fcgi_encode_default_param(fconn, fstrm, &params, &outbuf, FCGI_SP_HTTPS)) {
-		TRACE_ERROR("error encoding default params", FCGI_EV_TX_RECORD|FCGI_EV_STRM_ERR, fconn->conn, fstrm);
-		goto error;
+		if (b_space_wraps(mbuf))
+			goto realign_again;
+		goto full;
 	}
 
 	/* update the record's size */
@@ -2082,17 +2083,31 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 	fcgi_set_record_size(outbuf.area, outbuf.data - FCGI_RECORD_HEADER_SZ);
 	b_add(mbuf, outbuf.data);
 
+	/* remove all header blocks including the EOH and compute the
+	 * corresponding size.
+	 */
+	blk = htx_get_head_blk(htx);
+	while (blk) {
+		total += htx_get_blksz(blk);
+		blk = htx_remove_blk(htx, blk);
+		/* The removed block is the EOH */
+		if (htx_get_blk_type(blk) == HTX_BLK_EOH)
+			break;
+	}
+
   end:
 	TRACE_LEAVE(FCGI_EV_TX_RECORD|FCGI_EV_TX_PARAMS, fconn->conn, fstrm, htx, (size_t[]){total});
 	return total;
   full:
+	if (b_size(&outbuf) == b_size(mbuf) || b_size(&outbuf) == 0xFFFF + FCGI_RECORD_HEADER_SZ) {
+		TRACE_ERROR("Request too large to be sent", FCGI_EV_TX_RECORD|FCGI_EV_STRM_ERR, fconn->conn, fstrm);
+		goto error;
+	}
 	if ((mbuf = br_tail_add(fconn->mbuf)) != NULL)
 		goto retry;
 	fconn->flags |= FCGI_CF_MUX_MFULL;
 	fstrm->flags |= FCGI_SF_BLK_MROOM;
 	TRACE_STATE("mbuf ring full", FCGI_EV_TX_RECORD|FCGI_EV_FSTRM_BLK|FCGI_EV_FCONN_BLK, fconn->conn, fstrm);
-	if (total)
-		goto error;
 	goto end;
 
   error:
@@ -2151,7 +2166,15 @@ static size_t fcgi_strm_send_stdin(struct fcgi_conn *fconn, struct fcgi_strm *fs
 		goto end;
 	type = htx_get_blk_type(blk);
 	size = htx_get_blksz(blk);
-	if (unlikely(size == count && htx_nbblks(htx) == 1 && type == HTX_BLK_DATA)) {
+	/* FCGI content_len is uint16_t. With tune.bufsize >= 65544 a single
+	 * HTX block can exceed 65535 bytes; the implicit truncation in
+	 * fcgi_set_record_size() would then desynchronize the record
+	 * stream and let the client smuggle a forged FCGI request to the
+	 * backend. Refuse zero-copy in that case and let the copy path
+	 * split the data across multiple records.
+	 */
+	if (unlikely(size <= 0xFFFF && size == count && b_size(mbuf) == b_size(buf) &&
+		     htx_nbblks(htx) == 1 && type == HTX_BLK_DATA)) {
 		void *old_area = mbuf->area;
 		int eom = (htx->flags & HTX_FL_EOM);
 
@@ -2208,6 +2231,11 @@ static size_t fcgi_strm_send_stdin(struct fcgi_conn *fconn, struct fcgi_strm *fs
 
 	if (outbuf.size < FCGI_RECORD_HEADER_SZ + extra_bytes)
 		goto full;
+
+	/* FCGI content_len is uint16_t; cap output to avoid truncation in
+	 * fcgi_set_record_size() when tune.bufsize is large. */
+	if (outbuf.size > 0xFFFF + FCGI_RECORD_HEADER_SZ)
+		outbuf.size = 0xFFFF + FCGI_RECORD_HEADER_SZ;
 
 	/* vsn: 1(FCGI_VERSION), type: (5)FCGI_STDIN, id: fstrm->id,
 	 *  len: 0x0000 (fill later), padding: 0x00, rsv: 0x00 */
@@ -2723,13 +2751,42 @@ static void fcgi_process_demux(struct fcgi_conn *fconn)
 	fcgi_conn_restart_reading(fconn, 0);
 }
 
+/* resume each fstrm eligible for sending in list head <head> */
+static void fcgi_resume_each_sending_fstrm(struct fcgi_conn *fconn, struct list *head)
+{
+	struct fcgi_strm *fstrm, *fstrm_back;
+
+	TRACE_ENTER(FCGI_EV_FCONN_SEND|FCGI_EV_FCONN_WAKE, fconn->conn);
+
+	list_for_each_entry_safe(fstrm, fstrm_back, &fconn->send_list, send_list) {
+		if (fconn->state == FCGI_CS_CLOSED || fconn->flags & FCGI_CF_MUX_BLOCK_ANY)
+			break;
+
+		fstrm->flags &= ~FCGI_SF_BLK_ANY;
+
+		if (fstrm->flags & FCGI_SF_NOTIFIED)
+			continue;
+
+		/* If the sender changed his mind and unsubscribed, let's just
+		 * remove the stream from the send_list.
+		 */
+		if (!(fstrm->flags & (FCGI_SF_WANT_SHUTR|FCGI_SF_WANT_SHUTW)) &&
+		    (!fstrm->subs || !(fstrm->subs->events & SUB_RETRY_SEND))) {
+			LIST_DEL_INIT(&fstrm->send_list);
+			continue;
+		}
+
+		fcgi_strm_notify_send(fstrm);
+	}
+
+	TRACE_LEAVE(FCGI_EV_FCONN_SEND|FCGI_EV_FCONN_WAKE, fconn->conn);
+}
+
 /* process Tx records from streams to be multiplexed. Returns > 0 if it reached
  * the end.
  */
 static int fcgi_process_mux(struct fcgi_conn *fconn)
 {
-	struct fcgi_strm *fstrm, *fstrm_back;
-
 	TRACE_ENTER(FCGI_EV_FCONN_WAKE, fconn->conn);
 
 	if (unlikely(fconn->state < FCGI_CS_RECORD_H)) {
@@ -2752,36 +2809,7 @@ static int fcgi_process_mux(struct fcgi_conn *fconn)
 	}
 
   mux:
-	list_for_each_entry_safe(fstrm, fstrm_back, &fconn->send_list, send_list) {
-		if (fconn->state == FCGI_CS_CLOSED || fconn->flags & FCGI_CF_MUX_BLOCK_ANY)
-			break;
-
-		if (fstrm->flags & FCGI_SF_NOTIFIED)
-			continue;
-
-		/* If the sender changed his mind and unsubscribed, let's just
-		 * remove the stream from the send_list.
-		 */
-		if (!(fstrm->flags & (FCGI_SF_WANT_SHUTR|FCGI_SF_WANT_SHUTW)) &&
-		    (!fstrm->subs || !(fstrm->subs->events & SUB_RETRY_SEND))) {
-			LIST_DEL_INIT(&fstrm->send_list);
-			continue;
-		}
-
-		if (fstrm->subs && fstrm->subs->events & SUB_RETRY_SEND) {
-			TRACE_POINT(FCGI_EV_STRM_WAKE, fconn->conn, fstrm);
-			fstrm->flags &= ~FCGI_SF_BLK_ANY;
-			fstrm->flags |= FCGI_SF_NOTIFIED;
-			tasklet_wakeup(fstrm->subs->tasklet);
-			fstrm->subs->events &= ~SUB_RETRY_SEND;
-			if (!fstrm->subs->events)
-				fstrm->subs = NULL;
-		} else {
-			/* it's the shut request that was queued */
-			TRACE_POINT(FCGI_EV_STRM_WAKE, fconn->conn, fstrm);
-			tasklet_wakeup(fstrm->shut_tl);
-		}
-	}
+	fcgi_resume_each_sending_fstrm(fconn, &fconn->send_list);
 
  fail:
 	if (fconn->state == FCGI_CS_CLOSED) {
@@ -2985,40 +3013,9 @@ static int fcgi_send(struct fcgi_conn *fconn)
 	/* We're not full anymore, so we can wake any task that are waiting
 	 * for us.
 	 */
-	if (!(fconn->flags & (FCGI_CF_MUX_MFULL | FCGI_CF_DEM_MROOM)) && fconn->state >= FCGI_CS_RECORD_H) {
-		struct fcgi_strm *fstrm;
+	if (!(fconn->flags & (FCGI_CF_MUX_MFULL | FCGI_CF_DEM_MROOM)) && fconn->state >= FCGI_CS_RECORD_H)
+		fcgi_resume_each_sending_fstrm(fconn, &fconn->send_list);
 
-		list_for_each_entry(fstrm, &fconn->send_list, send_list) {
-			if (fconn->state == FCGI_CS_CLOSED || fconn->flags & FCGI_CF_MUX_BLOCK_ANY)
-				break;
-
-			if (fstrm->flags & FCGI_SF_NOTIFIED)
-				continue;
-
-			/* If the sender changed his mind and unsubscribed, let's just
-			 * remove the stream from the send_list.
-			 */
-			if (!(fstrm->flags & (FCGI_SF_WANT_SHUTR|FCGI_SF_WANT_SHUTW)) &&
-			    (!fstrm->subs || !(fstrm->subs->events & SUB_RETRY_SEND))) {
-				LIST_DEL_INIT(&fstrm->send_list);
-				continue;
-			}
-
-			if (fstrm->subs && fstrm->subs->events & SUB_RETRY_SEND) {
-				TRACE_DEVEL("waking up pending stream", FCGI_EV_FCONN_SEND|FCGI_EV_STRM_WAKE, conn, fstrm);
-				fstrm->flags &= ~FCGI_SF_BLK_ANY;
-				fstrm->flags |= FCGI_SF_NOTIFIED;
-				tasklet_wakeup(fstrm->subs->tasklet);
-				fstrm->subs->events &= ~SUB_RETRY_SEND;
-				if (!fstrm->subs->events)
-					fstrm->subs = NULL;
-			} else {
-				/* it's the shut request that was queued */
-				TRACE_POINT(FCGI_EV_STRM_WAKE, fconn->conn, fstrm);
-				tasklet_wakeup(fstrm->shut_tl);
-			}
-		}
-	}
 	/* We're done, no more to send */
 	if (!br_data(fconn->mbuf)) {
 		TRACE_DEVEL("leaving with everything sent", FCGI_EV_FCONN_SEND, conn);
@@ -3758,13 +3755,12 @@ static void fcgi_detach(struct sedesc *sd)
 	    (fconn->flags & FCGI_CF_KEEP_CONN)) {
 		if (fconn->conn->flags & CO_FL_PRIVATE) {
 			/* Add the connection in the session serverlist, if not already done */
-			if (!session_add_conn(sess, fconn->conn))
-				fconn->conn->owner = NULL;
+			session_add_conn(sess, fconn->conn);
 
 			if (eb_is_empty(&fconn->streams_by_id)) {
-				if (!fconn->conn->owner) {
+				if (!LIST_INLIST(&fconn->conn->sess_el)) {
 					/* Session insertion above has failed and connection is idle, remove it. */
-					fconn->conn->mux->destroy(fconn);
+					CALL_MUX_NO_RET(fconn->conn->mux, destroy(fconn));
 					TRACE_DEVEL("outgoing connection killed", FCGI_EV_STRM_END|FCGI_EV_FCONN_ERR);
 					return;
 				}
@@ -3777,7 +3773,7 @@ static void fcgi_detach(struct sedesc *sd)
 
 				/* Ensure session can keep a new idle connection. */
 				if (session_check_idle_conn(sess, fconn->conn) != 0) {
-					fconn->conn->mux->destroy(fconn);
+					CALL_MUX_NO_RET(fconn->conn->mux, destroy(fconn));
 					TRACE_DEVEL("outgoing connection killed", FCGI_EV_STRM_END|FCGI_EV_FCONN_ERR);
 					return;
 				}
@@ -3808,7 +3804,7 @@ static void fcgi_detach(struct sedesc *sd)
 
 				if (!srv_add_to_idle_list(objt_server(fconn->conn->target), fconn->conn, 1)) {
 					/* The server doesn't want it, let's kill the connection right away */
-					fconn->conn->mux->destroy(fconn);
+					CALL_MUX_NO_RET(fconn->conn->mux, destroy(fconn));
 					TRACE_DEVEL("outgoing connection killed", FCGI_EV_STRM_END|FCGI_EV_FCONN_ERR);
 					return;
 				}

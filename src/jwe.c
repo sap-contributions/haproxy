@@ -26,6 +26,7 @@
 struct alg_enc {
 	const char *name;
 	int value;
+	int enabled;
 };
 
 /* https://datatracker.ietf.org/doc/html/rfc7518#section-4.1 */
@@ -38,10 +39,10 @@ typedef enum {
 	JWE_ALG_A192KW,
 	JWE_ALG_A256KW,
 	JWE_ALG_DIR,
-	// JWE_ALG_ECDH_ES,
-	// JWE_ALG_ECDH_ES_A128KW,
-	// JWE_ALG_ECDH_ES_A192KW,
-	// JWE_ALG_ECDH_ES_A256KW,
+	JWE_ALG_ECDH_ES,
+	JWE_ALG_ECDH_ES_A128KW,
+	JWE_ALG_ECDH_ES_A192KW,
+	JWE_ALG_ECDH_ES_A256KW,
 	JWE_ALG_A128GCMKW,
 	JWE_ALG_A192GCMKW,
 	JWE_ALG_A256GCMKW,
@@ -50,26 +51,35 @@ typedef enum {
 	// JWE_ALG_PBES2_HS512_A256KW,
 } jwe_alg;
 
-struct alg_enc jwe_algs[] = {
-	{ "RSA1_5", JWE_ALG_RSA1_5 },
-	{ "RSA-OAEP", JWE_ALG_RSA_OAEP },
-	{ "RSA-OAEP-256", JWE_ALG_RSA_OAEP_256 },
-	{ "A128KW", JWE_ALG_A128KW },
-	{ "A192KW", JWE_ALG_A192KW },
-	{ "A256KW", JWE_ALG_A256KW },
-	{ "dir", JWE_ALG_DIR },
-	{ "ECDH-ES", JWE_ALG_UNMANAGED },
-	{ "ECDH-ES+A128KW", JWE_ALG_UNMANAGED },
-	{ "ECDH-ES+A192KW", JWE_ALG_UNMANAGED },
-	{ "ECDH-ES+A256KW", JWE_ALG_UNMANAGED },
-	{ "A128GCMKW", JWE_ALG_A128GCMKW },
-	{ "A192GCMKW", JWE_ALG_A192GCMKW },
-	{ "A256GCMKW", JWE_ALG_A256GCMKW },
-	{ "PBES2-HS256+A128KW", JWE_ALG_UNMANAGED },
-	{ "PBES2-HS384+A192KW", JWE_ALG_UNMANAGED },
-	{ "PBES2-HS512+A256KW", JWE_ALG_UNMANAGED },
-	{ NULL, JWE_ALG_UNMANAGED },
+enum {
+	ALG_ENC_DISABLED = 0,
+	ALG_ENC_ENABLED = 1
 };
+
+struct alg_enc jwe_algs_dflt[] = {
+	/* The weak RSA1.5 algorithm gets disabled by default as suggested in
+	 * section 3.2 of RFC 8725 */
+	{ "RSA1_5",		JWE_ALG_RSA1_5,		ALG_ENC_DISABLED },
+	{ "RSA-OAEP",		JWE_ALG_RSA_OAEP,	ALG_ENC_ENABLED },
+	{ "RSA-OAEP-256",	JWE_ALG_RSA_OAEP_256,	ALG_ENC_ENABLED },
+	{ "A128KW",		JWE_ALG_A128KW,		ALG_ENC_ENABLED },
+	{ "A192KW",		JWE_ALG_A192KW,		ALG_ENC_ENABLED },
+	{ "A256KW",		JWE_ALG_A256KW,		ALG_ENC_ENABLED },
+	{ "dir",		JWE_ALG_DIR,		ALG_ENC_ENABLED },
+	{ "ECDH-ES",		JWE_ALG_ECDH_ES,	ALG_ENC_ENABLED },
+	{ "ECDH-ES+A128KW",	JWE_ALG_ECDH_ES_A128KW, ALG_ENC_ENABLED },
+	{ "ECDH-ES+A192KW",	JWE_ALG_ECDH_ES_A192KW, ALG_ENC_ENABLED },
+	{ "ECDH-ES+A256KW",	JWE_ALG_ECDH_ES_A256KW, ALG_ENC_ENABLED },
+	{ "A128GCMKW",		JWE_ALG_A128GCMKW,	ALG_ENC_ENABLED },
+	{ "A192GCMKW",		JWE_ALG_A192GCMKW,	ALG_ENC_ENABLED },
+	{ "A256GCMKW",		JWE_ALG_A256GCMKW,	ALG_ENC_ENABLED },
+	{ "PBES2-HS256+A128KW", JWE_ALG_UNMANAGED,	ALG_ENC_DISABLED },
+	{ "PBES2-HS384+A192KW", JWE_ALG_UNMANAGED,	ALG_ENC_DISABLED },
+	{ "PBES2-HS512+A256KW", JWE_ALG_UNMANAGED,	ALG_ENC_DISABLED },
+	{ NULL,			JWE_ALG_UNMANAGED,	ALG_ENC_DISABLED },
+};
+
+struct alg_enc *jwe_algs = NULL;
 
 /* https://datatracker.ietf.org/doc/html/rfc7518#section-5.1 */
 typedef enum {
@@ -82,15 +92,17 @@ typedef enum {
 	JWE_ENC_A256GCM,
 } jwe_enc;
 
-struct alg_enc jwe_encodings[] = {
-	{ "A128CBC-HS256", JWE_ENC_A128CBC_HS256 },
-	{ "A192CBC-HS384", JWE_ENC_A192CBC_HS384 },
-	{ "A256CBC-HS512", JWE_ENC_A256CBC_HS512 },
-	{ "A128GCM", JWE_ENC_A128GCM },
-	{ "A192GCM", JWE_ENC_A192GCM },
-	{ "A256GCM", JWE_ENC_A256GCM },
-	{ NULL, JWE_ENC_UNMANAGED },
+struct alg_enc jwe_encodings_dflt[] = {
+	{ "A128CBC-HS256",	JWE_ENC_A128CBC_HS256,	ALG_ENC_ENABLED },
+	{ "A192CBC-HS384",	JWE_ENC_A192CBC_HS384,	ALG_ENC_ENABLED },
+	{ "A256CBC-HS512",	JWE_ENC_A256CBC_HS512,	ALG_ENC_ENABLED },
+	{ "A128GCM",		JWE_ENC_A128GCM,	ALG_ENC_ENABLED },
+	{ "A192GCM",		JWE_ENC_A192GCM,	ALG_ENC_ENABLED },
+	{ "A256GCM",		JWE_ENC_A256GCM,	ALG_ENC_ENABLED },
+	{ NULL,			JWE_ENC_UNMANAGED,	ALG_ENC_DISABLED },
 };
+
+struct alg_enc *jwe_encodings = NULL;
 
 
 /*
@@ -114,6 +126,10 @@ enum jwe_elt {
 struct jose_fields {
 	struct buffer *tag;
 	struct buffer *iv;
+	struct buffer *epk;
+	EVP_PKEY *pubkey;
+	struct buffer *apu;
+	struct buffer *apv;
 };
 
 
@@ -127,6 +143,8 @@ static inline int parse_alg_enc(struct buffer *buf, struct alg_enc *array)
 
 	while (item->name) {
 		if (strncmp(item->name, b_orig(buf), (int)b_data(buf)) == 0) {
+			if (item->enabled == ALG_ENC_DISABLED)
+				return -1;
 			val = item->value;
 			break;
 		}
@@ -137,11 +155,32 @@ static inline int parse_alg_enc(struct buffer *buf, struct alg_enc *array)
 }
 
 /*
- * Look for field <field_name> in JSON <decoded_jose> and base64url decode its
- * content in buffer <out>.
- * The field might not be found, it won't be raised as an error.
+ * Get the string corresponding to <id> that can be either an encoding or an
+ * algorithm.
  */
-static inline int decode_jose_field(struct buffer *decoded_jose, const char *field_name, struct buffer *out)
+static inline const char* algenc2str(int id, struct alg_enc *array)
+{
+	struct alg_enc *item = array;
+
+	while (item->name) {
+		if (item->value == id)
+			return item->name;
+		++item;
+	}
+
+	return NULL;
+}
+
+
+/*
+ * Look for field <field_name> in JSON <decoded_jose> and if it is found,
+ * allocate an <out> buffer and base64url decode the field's content in it.
+ * If <mandatory> is set to 1, an error will be raised if the field is not
+ * found.
+ * Returns 0 in case of success, 1 in case of error (decoding or alloc error).
+ */
+static inline int decode_jose_field(struct buffer *decoded_jose, const char *field_name,
+				    struct buffer **out, int mandatory)
 {
 	struct buffer *trash = get_trash_chunk();
 	int size = 0;
@@ -153,26 +192,40 @@ static inline int decode_jose_field(struct buffer *decoded_jose, const char *fie
 				b_orig(trash), b_size(trash));
 	if (size != -1) {
 		trash->data = size;
-		size = base64urldec(b_orig(trash), b_data(trash),
-				    b_orig(out), b_size(out));
-		if (size < 0)
+
+		*out = alloc_trash_chunk();
+		if (!*out)
 			return 1;
-		out->data = size;
-	}
+
+		size = base64urldec(b_orig(trash), b_data(trash),
+				    b_orig(*out), b_size(*out));
+		if (size < 0) {
+			free_trash_chunk(*out);
+			*out = NULL;
+			return 1;
+		}
+		(*out)->data = size;
+	} else if (mandatory)
+		return 1;
 
 	return 0;
 }
 
+static int build_EC_PKEY_from_buf(struct buffer *jwk, EVP_PKEY **pkey);
 
 /*
- * Extract the "alg" and "enc" of the JOSE header as well as some algo-specific
- * base64url encoded fields.
+ * Extract multiple base64url encoded fields from the JOSE header that are
+ * required for the subsequent decrypt operations. Depending on the used
+ * algorithms the required fields will change.
  */
 static int parse_jose(struct buffer *decoded_jose, int *alg, int *enc, struct jose_fields *jose_fields)
 {
 	struct buffer *trash = NULL;
 	int retval = 0;
 	int size = 0;
+
+	int gcm = 0;
+	int ec = 0;
 
 	/* Look for "alg" field */
 	trash = get_trash_chunk();
@@ -196,18 +249,77 @@ static int parse_jose(struct buffer *decoded_jose, int *alg, int *enc, struct jo
 	if (*enc == JWE_ENC_UNMANAGED)
 		goto end;
 
-	/* Look for "tag" field (used by aes gcm encryption) */
-	if (decode_jose_field(decoded_jose, "$.tag", jose_fields->tag))
-		goto end;
+	switch (*alg) {
+	case JWE_ALG_ECDH_ES:
+	case JWE_ALG_ECDH_ES_A128KW:
+	case JWE_ALG_ECDH_ES_A192KW:
+	case JWE_ALG_ECDH_ES_A256KW:
+		ec = 1;
+		break;
+	case JWE_ALG_A128GCMKW:
+	case JWE_ALG_A192GCMKW:
+	case JWE_ALG_A256GCMKW:
+		gcm = 1;
+		break;
+	default: break;
+	}
 
-	/* Look for "iv" field (used by aes gcm encryption) */
-	if (decode_jose_field(decoded_jose, "$.iv", jose_fields->iv))
-		goto end;
+
+	if (gcm) {
+		/* Look for "tag" field (used by aes gcm encryption) */
+		if (decode_jose_field(decoded_jose, "$.tag", &jose_fields->tag, 1))
+			goto end;
+
+		/* Look for "iv" field (used by aes gcm encryption) */
+		if (decode_jose_field(decoded_jose, "$.iv", &jose_fields->iv, 1))
+			goto end;
+	}
+
+	if (ec) {
+		/* Look for mandatory "epk" field (used by ecdh encryption) */
+		const char *tokptr = NULL;
+		int toklen = 0;
+		int token_type = mjson_find(b_orig(decoded_jose), b_data(decoded_jose), "$.epk",
+					    &tokptr, &toklen);
+		if (token_type != MJSON_TOK_OBJECT)
+			goto end;
+
+		jose_fields->epk = alloc_trash_chunk();
+		if (!jose_fields->epk)
+			goto end;
+
+		if (!chunk_memcpy(jose_fields->epk, tokptr, toklen))
+			goto end;
+
+		if (build_EC_PKEY_from_buf(jose_fields->epk, &jose_fields->pubkey))
+			goto end;
+
+		/* Look for optional "apu" field (used by ecdh encryption) */
+		if (decode_jose_field(decoded_jose, "$.apu", &jose_fields->apu, 0))
+			goto end;
+
+		/* Look for optional "apv" field (used by ecdh encryption) */
+		if (decode_jose_field(decoded_jose, "$.apv", &jose_fields->apv, 0))
+			goto end;
+	}
 
 	retval = 1;
 
 end:
 	return retval;
+}
+
+static void clear_jose_fields(struct jose_fields *jose_fields)
+{
+	if (!jose_fields)
+		return;
+
+	free_trash_chunk(jose_fields->tag);
+	free_trash_chunk(jose_fields->iv);
+	free_trash_chunk(jose_fields->epk);
+	EVP_PKEY_free(jose_fields->pubkey);
+	free_trash_chunk(jose_fields->apu);
+	free_trash_chunk(jose_fields->apv);
 }
 
 
@@ -230,7 +342,6 @@ static int decrypt_cek_aesgcmkw(struct buffer *cek, struct buffer *aead_tag, str
 	case JWE_ALG_A128GCMKW: key_size = 128; break;
 	case JWE_ALG_A192GCMKW: key_size = 192; break;
 	case JWE_ALG_A256GCMKW: key_size = 256; break;
-		break;
 	default:
 		goto end;
 	}
@@ -327,7 +438,7 @@ end:
  * the one found in the JWE token.
  * The tag is built out of a HMAC of some concatenated data taken from the JWE
  * token (see https://datatracker.ietf.org/doc/html/rfc7518#section-5.2). The
- * firest half of the previously decrypted cek is used as HMAC key.
+ * first half of the previously decrypted cek is used as HMAC key.
  * Returns 0 in case of success, 1 otherwise.
  */
 static int build_and_check_tag(jwe_enc enc,  struct jwt_item items[JWE_ELT_MAX],
@@ -372,8 +483,12 @@ static int build_and_check_tag(jwe_enc enc,  struct jwt_item items[JWE_ELT_MAX],
 	          (unsigned char*)b_orig(hmac), (unsigned int*)&hmac->data))
 		goto end;
 
+	/* Double check that buffer lengths line up before the comparison */
+	if (unlikely(b_data(decoded_items[JWE_ELT_TAG]) != b_data(hmac) >> 1))
+		goto end;
+
 	/* Use the first half of the HMAC output M as the Authentication Tag output T */
-	retval = memcmp(b_orig(decoded_items[JWE_ELT_TAG]), b_orig(hmac), b_data(hmac) >> 1);
+	retval = CRYPTO_memcmp(b_orig(decoded_items[JWE_ELT_TAG]), b_orig(hmac), b_data(hmac) >> 1);
 
 end:
 	free_trash_chunk(tag_data);
@@ -501,7 +616,7 @@ static inline void clear_decoded_items(struct buffer *decoded_items[JWE_ELT_MAX]
 /*
  * Decrypt the contents of a JWE token thanks to the user-provided base64
  * encoded secret. This converter can only be used for tokens that have a
- * symetric algorithm (AESKW, AESGCMKW or "dir" special case).
+ * symmetric algorithm (AESKW, AESGCMKW or "dir" special case).
  * Returns the decrypted contents, or nothing if any error happened.
  */
 static int sample_conv_jwt_decrypt_secret(const struct arg *args, struct sample *smp, void *private)
@@ -516,8 +631,6 @@ static int sample_conv_jwt_decrypt_secret(const struct arg *args, struct sample 
 	struct buffer **cek = NULL;
 	struct buffer *decrypted_cek = NULL;
 	struct buffer *out = NULL;
-	struct buffer *alg_tag = NULL;
-	struct buffer *alg_iv = NULL;
 	int size = 0;
 	jwe_alg alg = JWE_ALG_UNMANAGED;
 	jwe_enc enc = JWE_ENC_UNMANAGED;
@@ -531,18 +644,8 @@ static int sample_conv_jwt_decrypt_secret(const struct arg *args, struct sample 
 	if (!chunk_cpy(input, &smp->data.u.str))
 		goto end;
 
-	if (jwt_tokenize(input, items, &item_num) || item_num != JWE_ELT_MAX)
+	if (jwt_tokenize(input, items, item_num))
 		goto end;
-
-	alg_tag = alloc_trash_chunk();
-	if (!alg_tag)
-		goto end;
-	alg_iv = alloc_trash_chunk();
-	if (!alg_iv)
-		goto end;
-
-	fields.tag = alg_tag;
-	fields.iv = alg_iv;
 
 	/* Base64Url decode the JOSE header */
 	decoded_items[JWE_ELT_JOSE] = alloc_trash_chunk();
@@ -614,7 +717,8 @@ static int sample_conv_jwt_decrypt_secret(const struct arg *args, struct sample 
 		(*cek)->data = cek_size;
 
 		if (gcm) {
-			if (!decrypt_cek_aesgcmkw(*cek, alg_tag, alg_iv, decrypted_cek, &secret_smp.data.u.str, alg))
+			if (!decrypt_cek_aesgcmkw(*cek, fields.tag, fields.iv, decrypted_cek,
+			                          &secret_smp.data.u.str, alg))
 				goto end;
 		} else {
 			if (!decrypt_cek_aeskw(*cek, decrypted_cek, &secret_smp.data.u.str, alg))
@@ -628,6 +732,10 @@ static int sample_conv_jwt_decrypt_secret(const struct arg *args, struct sample 
 			goto end;
 
 		chunk_memcpy(decrypted_cek, secret_smp.data.u.str.area, secret_smp.data.u.str.data);
+	} else {
+		/* Empty CEK with a non-"dir" algorithm: nothing we can use to
+		 * derive a key. Bail out instead of passing NULL down. */
+		goto end;
 	}
 
 	/* Decode the encrypted content thanks to decrypted_cek secret */
@@ -642,42 +750,29 @@ static int sample_conv_jwt_decrypt_secret(const struct arg *args, struct sample 
 	retval = 1;
 
 end:
+	clear_jose_fields(&fields);
 	free_trash_chunk(input);
+	free_trash_chunk(secret);
 	free_trash_chunk(decrypted_cek);
 	free_trash_chunk(out);
-	free_trash_chunk(alg_tag);
-	free_trash_chunk(alg_iv);
 	clear_decoded_items(decoded_items);
 	return retval;
 }
 
 
-static int decrypt_cek_rsa(struct buffer *cek, struct buffer *decrypted_cek,
-                           struct buffer *cert, jwe_alg crypt_alg)
+/*
+ * Decrypt the content of <cek> buffer into <decrypted_cek> buffer thanks to the
+ * private key <pkey> using algorithm <crypt_alg> (RSA).
+ * Returns 0 in case of success, 1 otherwise.
+ */
+static int do_decrypt_cek_rsa(struct buffer *cek, struct buffer *decrypted_cek,
+                              EVP_PKEY *pkey, jwe_alg crypt_alg)
 {
 	EVP_PKEY_CTX *ctx = NULL;
 	const EVP_MD *md = NULL;
-	EVP_PKEY *pkey = NULL;
-	int retval = 0;
+	int retval = 1;
 	int pad = 0;
 	size_t outl = b_size(decrypted_cek);
-
-	struct ckch_store *store = NULL;
-
-	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
-		goto end;
-
-	store = ckchs_lookup(b_orig(cert));
-	if (!store || !store->data->key || !store->conf.jwt) {
-		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
-		goto end;
-	}
-
-	pkey = store->data->key;
-
-	EVP_PKEY_up_ref(pkey);
-
-	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 
 	switch(crypt_alg) {
 	case JWE_ALG_RSA1_5:
@@ -721,11 +816,298 @@ static int decrypt_cek_rsa(struct buffer *cek, struct buffer *decrypted_cek,
 
 	decrypted_cek->data = outl;
 
-	retval = 1;
+	retval = 0;
 
 end:
 	EVP_PKEY_CTX_free(ctx);
+	return retval;
+}
+
+
+/*
+ * Look for <cert> in the ckch_store tree and use its private key to decrypt
+ * <cek> into <decrypted_cek> using <crypt_alg> algorithm (of the RSA alg
+ * family).
+ * Returns 0 in case of success, 1 otherwise.
+ */
+static int decrypt_cek_rsa(struct buffer *cek, struct buffer *decrypted_cek,
+                           struct buffer *cert, jwe_alg crypt_alg)
+{
+	EVP_PKEY *pkey = NULL;
+	int retval = 1;
+
+	struct ckch_store *store = NULL;
+
+	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+		goto end;
+
+	store = ckchs_lookup(b_orig(cert));
+	if (!store || !store->data->key || !store->conf.jwt) {
+		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+		goto end;
+	}
+
+	pkey = store->data->key;
+
+	EVP_PKEY_up_ref(pkey);
+
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+
+	if (do_decrypt_cek_rsa(cek, decrypted_cek, pkey, crypt_alg))
+		goto end;
+
+	retval = 0;
+end:
 	EVP_PKEY_free(pkey);
+	return retval;
+}
+
+
+/*
+ * Derive an ECDH secret out of the user-provided EC private key <privkey> and
+ * the public key built out of the JWK found in the JOSE header ("epk" field).
+ * Return 0 in case of success, 1 otherwise.
+ */
+static int derive_ecdh_secret(EVP_PKEY *privkey, EVP_PKEY *epk_key, struct buffer *derived)
+{
+	EVP_PKEY_CTX *ctx = NULL;
+	int retval = 1;
+	size_t derived_len = 0;
+
+	if (!derived)
+		goto end;
+
+	ctx = EVP_PKEY_CTX_new(privkey, NULL);
+	if (!ctx)
+		goto end;
+
+	if (EVP_PKEY_derive_init(ctx) != 1)
+		goto end;
+
+	if (EVP_PKEY_derive_set_peer(ctx, epk_key) != 1)
+		goto end;
+
+	if (EVP_PKEY_derive(ctx, NULL, &derived_len) != 1)
+		goto end;
+
+	if (derived_len > b_size(derived))
+		goto end;
+
+	if (EVP_PKEY_derive(ctx, (unsigned char*)derived->area, &derived_len) != 1)
+		goto end;
+	derived->data = derived_len;
+
+	retval = 0;
+end:
+	EVP_PKEY_CTX_free(ctx);
+	return retval;
+}
+
+
+/*
+ * Append <val_len> in big endian form and 4 bytes to the <out> buffer as well
+ * as the <val> content.
+ */
+static inline void append_data_len(struct buffer *out, const char *val, int val_len)
+{
+	uint32_t be_len = htonl(val_len);
+	chunk_memcat(out, (char*)&be_len, (int)sizeof(be_len));
+	chunk_memcat(out, val, val_len);
+}
+
+
+/*
+ * Build the concatKDF buffer (see section 4.6.2 of RFC7518).
+ * Return 0 in case of success, 1 otherwise.
+ */
+static int build_concatkdf_otherinfo(const char *alg_id, struct buffer *apu, struct buffer *apv,
+                                     uint32_t keydatalen, struct buffer *out)
+{
+	int retval = 1;
+
+	if (!out)
+		goto end;
+
+	/*
+	 * Key derivation is performed using the Concat KDF, as defined in
+	 * Section 5.8.1 of [NIST.800-56A]
+	 *	"For this format, OtherInfo is a bit string equal to the
+	 *	following concatenation:
+	 *	AlgorithmID || PartyUInfo || PartyVInfo {|| SuppPubInfo }{||SuppPrivInfo }"
+	 *
+	 * From https://datatracker.ietf.org/doc/html/rfc7518#section-4.6.2
+	 *	SuppPubInfo : This is set to the keydatalen represented as a
+	 *	32-bit big-endian integer.
+	 */
+	append_data_len(out, alg_id, strlen(alg_id));
+	append_data_len(out, (apu ? b_orig(apu) : NULL), (apu ? b_data(apu) : 0));
+	append_data_len(out, (apv ? b_orig(apv) : NULL), (apv ? b_data(apv) : 0));
+
+	keydatalen = htonl(keydatalen);
+	chunk_memcat(out, (char*)&keydatalen, (int)sizeof(keydatalen));
+
+	retval = 0;
+
+end:
+	return retval;
+}
+
+
+/*
+ * Decrypt the content of <cek> buffer into <decrypted_cek> buffer thanks to the
+ * private key <pkey> using algorithm <crypt_alg> (RSA).
+ * Returns 0 in case of success, 1 otherwise.
+ */
+static int do_decrypt_cek_ec(struct buffer *cek, struct buffer *decrypted_cek, EVP_PKEY *privkey,
+                             EVP_PKEY *pubkey, jwe_alg crypt_alg, jwe_enc crypt_enc,
+                             struct buffer *apu, struct buffer *apv)
+{
+	int retval = 1;
+	int key_size = 0;
+	struct buffer *derived_secret = NULL;
+	struct buffer *otherinfo = NULL;
+	struct buffer *tmpbuf = NULL;
+	const char *alg_id = NULL;
+
+	jwe_alg kw_alg = JWE_ALG_UNMANAGED;
+
+	int ecdhes = 0;
+	unsigned char *concatkdf_ptr = NULL;
+	size_t *concatkdf_len = 0;
+
+	/* rfc7518#section-4.6.2
+	 * Key derivation is performed using the Concat KDF, as defined in
+	 * Section 5.8.1 of [NIST.800-56A], where the Digest Method is SHA-256. */
+	const EVP_MD *md = EVP_sha256();
+	int hashlen = EVP_MD_size(md);
+	EVP_MD_CTX *ctx = NULL;
+	int keydatalen = 0;
+	int counter = 0;
+	int offset = 0;
+	int reps = 0;
+
+	switch(crypt_alg) {
+	case JWE_ALG_ECDH_ES:
+		ecdhes = 1;
+		switch(crypt_enc) {
+		case JWE_ENC_A128GCM:
+			key_size = 128;
+			break;
+		case JWE_ENC_A192GCM:
+			key_size = 192;
+			break;
+		case JWE_ENC_A256GCM:
+		case JWE_ENC_A128CBC_HS256:
+			key_size = 256;
+			break;
+		case JWE_ENC_A192CBC_HS384:
+			key_size = 384;
+			break;
+		case JWE_ENC_A256CBC_HS512:
+			key_size = 512;
+			break;
+		default:
+			goto end;
+		}
+		alg_id = algenc2str(crypt_enc, jwe_encodings);
+		if (!alg_id)
+			goto end;
+		break;
+	case JWE_ALG_ECDH_ES_A128KW:
+		key_size = 128;
+		kw_alg = JWE_ALG_A128KW;
+		break;
+	case JWE_ALG_ECDH_ES_A192KW:
+		key_size = 192;
+		kw_alg = JWE_ALG_A192KW;
+		break;
+	case JWE_ALG_ECDH_ES_A256KW:
+		key_size = 256;
+		kw_alg = JWE_ALG_A256KW;
+		break;
+	default:
+		goto end;
+	}
+
+	if (!alg_id) {
+		alg_id = algenc2str(crypt_alg, jwe_algs);
+		if (!alg_id)
+			goto end;
+	}
+
+	derived_secret = alloc_trash_chunk();
+	if (!derived_secret)
+		goto end;
+
+	otherinfo = alloc_trash_chunk();
+	if (!otherinfo)
+		goto end;
+
+	if (derive_ecdh_secret(privkey, pubkey, derived_secret))
+		goto end;
+
+	if (build_concatkdf_otherinfo(alg_id, apu, apv, key_size, otherinfo))
+		goto end;
+
+	ctx = EVP_MD_CTX_create();
+	if (!ctx)
+		goto end;
+
+	/* Data derivation as in Section 5.8.1 of [NIST.800-56A]
+	 * https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-56Ar2.pdf
+	 *
+	 * For ECDH-ES the buffer built after the concatKDF operation will be
+	 * used directly to decrypt the contents. When ECDH-ES+AES Key Wrap is
+	 * used we must wrap the cek with the built buffer using the right AES
+	 * KW algorithm.
+	 */
+	if (!ecdhes) {
+		tmpbuf = alloc_trash_chunk();
+		if (!tmpbuf)
+			goto end;
+		concatkdf_ptr = (unsigned char*)tmpbuf->area;
+		concatkdf_len = &tmpbuf->data;
+	} else {
+		concatkdf_ptr = (unsigned char*)decrypted_cek->area;
+		concatkdf_len = &decrypted_cek->data;
+	}
+
+	/* The decrypted cek to be used for actual data decrypt
+	 * operation will be built in the following block. */
+	keydatalen = (key_size >> 3);
+	reps = keydatalen / hashlen;
+
+	for (counter = 0; counter <= reps; ++counter) {
+
+		uint32_t be_counter = htonl(counter+1);
+
+		if (EVP_DigestInit_ex(ctx, md, NULL) != 1 ||
+		    EVP_DigestUpdate(ctx, (char*)&be_counter, sizeof(be_counter)) != 1 ||
+		    EVP_DigestUpdate(ctx, b_orig(derived_secret), b_data(derived_secret)) != 1 ||
+		    EVP_DigestUpdate(ctx, b_orig(otherinfo), b_data(otherinfo)) != 1 ||
+		    EVP_DigestFinal_ex(ctx, concatkdf_ptr + offset, NULL) != 1)
+			goto end;
+
+		offset += hashlen;
+
+	}
+
+	*concatkdf_len = keydatalen;
+
+	if (!ecdhes) {
+		/* Need to used the previously generated key to wrap the CEK
+		 * with the "A128KW", "A192KW", or "A256KW" algorithms. */
+		if (!decrypt_cek_aeskw(cek, decrypted_cek, tmpbuf, kw_alg))
+			goto end;
+	}
+
+	retval = 0;
+
+end:
+	free_trash_chunk(derived_secret);
+	free_trash_chunk(otherinfo);
+	free_trash_chunk(tmpbuf);
+	EVP_MD_CTX_free(ctx);
 	return retval;
 }
 
@@ -733,7 +1115,7 @@ end:
 /*
  * Decrypt the contents of a JWE token thanks to the user-provided certificate
  * and private key. This converter can only be used for tokens that have an
- * asymetric algorithm (RSA only for now).
+ * asymmetric algorithm (RSA only for now).
  * Returns the decrypted contents, or nothing if any error happened.
  */
 static int sample_conv_jwt_decrypt_cert(const struct arg *args, struct sample *smp, void *private)
@@ -747,12 +1129,14 @@ static int sample_conv_jwt_decrypt_cert(const struct arg *args, struct sample *s
 	jwe_alg alg = JWE_ALG_UNMANAGED;
 	jwe_enc enc = JWE_ENC_UNMANAGED;
 	int rsa = 0;
+	int ec = 0;
 	int size = 0;
 	struct buffer *cert = NULL;
 	struct buffer **cek = NULL;
 	struct buffer *decrypted_cek = NULL;
 	struct buffer *out = NULL;
 	struct jose_fields fields = {};
+	EVP_PKEY *privkey = NULL;
 
 	input = alloc_trash_chunk();
 	if (!input)
@@ -761,7 +1145,7 @@ static int sample_conv_jwt_decrypt_cert(const struct arg *args, struct sample *s
 	if (!chunk_cpy(input, &smp->data.u.str))
 		goto end;
 
-	if (jwt_tokenize(input, items, &item_num) || item_num != JWE_ELT_MAX)
+	if (jwt_tokenize(input, items, item_num))
 		goto end;
 
 	/* Base64Url decode the JOSE header */
@@ -784,6 +1168,12 @@ static int sample_conv_jwt_decrypt_cert(const struct arg *args, struct sample *s
 	case JWE_ALG_RSA_OAEP_256:
 		rsa = 1;
 		break;
+	case JWE_ALG_ECDH_ES:
+	case JWE_ALG_ECDH_ES_A128KW:
+	case JWE_ALG_ECDH_ES_A192KW:
+	case JWE_ALG_ECDH_ES_A256KW:
+		ec = 1;
+		break;
 	default:
 		/* Not managed yet */
 		goto end;
@@ -799,30 +1189,58 @@ static int sample_conv_jwt_decrypt_cert(const struct arg *args, struct sample *s
 	if (chunk_printf(cert, "%.*s", (int)b_data(&cert_smp.data.u.str), b_orig(&cert_smp.data.u.str)) <= 0)
 		goto end;
 
-	/* With asymetric crypto algorithms we should always have a CEK */
-	if (!items[JWE_ELT_CEK].length)
-		goto end;
+	/* With ECDH-ES no CEK will be provided. */
+	if (!ec || alg != JWE_ALG_ECDH_ES) {
 
-	cek = &decoded_items[JWE_ELT_CEK];
+		/* With asymmetric crypto algorithms we should always have a CEK */
+		if (!items[JWE_ELT_CEK].length)
+			goto end;
 
-	*cek = alloc_trash_chunk();
-	if (!*cek)
-		goto end;
+		cek = &decoded_items[JWE_ELT_CEK];
+
+		*cek = alloc_trash_chunk();
+		if (!*cek)
+			goto end;
+
+
+		size = base64urldec(items[JWE_ELT_CEK].start, items[JWE_ELT_CEK].length,
+				    (*cek)->area, (*cek)->size);
+		if (size < 0) {
+			goto end;
+		}
+		(*cek)->data = size;
+	}
 
 	decrypted_cek = alloc_trash_chunk();
 	if (!decrypted_cek) {
 		goto end;
 	}
 
-	size = base64urldec(items[JWE_ELT_CEK].start, items[JWE_ELT_CEK].length,
-	                    (*cek)->area, (*cek)->size);
-	if (size < 0) {
+	if (rsa && decrypt_cek_rsa(*cek, decrypted_cek, cert, alg))
 		goto end;
-	}
-	(*cek)->data = size;
+	else if (ec) {
+		struct ckch_store *store = NULL;
 
-	if (rsa && !decrypt_cek_rsa(*cek, decrypted_cek, cert, alg))
-		goto end;
+		if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+			goto end;
+
+		store = ckchs_lookup(b_orig(cert));
+		if (!store || !store->data->key || !store->conf.jwt) {
+			HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+			goto end;
+		}
+
+		privkey = store->data->key;
+
+		EVP_PKEY_up_ref(privkey);
+
+		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+
+		if (do_decrypt_cek_ec((cek != NULL) ? *cek : NULL, decrypted_cek,
+				      privkey, fields.pubkey,
+				      alg, enc, fields.apu, fields.apv))
+			goto end;
+	}
 
 	if (decrypt_ciphertext(enc, items, decoded_items, decrypted_cek, &out))
 		goto end;
@@ -840,6 +1258,8 @@ end:
 	free_trash_chunk(decrypted_cek);
 	free_trash_chunk(out);
 	clear_decoded_items(decoded_items);
+	clear_jose_fields(&fields);
+	EVP_PKEY_free(privkey);
 	return retval;
 }
 
@@ -894,11 +1314,929 @@ static int sample_conv_jwt_decrypt_secret_check(struct arg *args, struct sample_
 }
 
 
+/*
+ * Convert a base64url encoded buffer into a BIGNUM.
+ */
+static BIGNUM *base64url_to_BIGNUM(struct buffer *b64url_buf)
+{
+	BIGNUM *bn = NULL;
+	struct buffer *decoded = get_trash_chunk();
+	int size = 0;
+
+	if (!b64url_buf)
+		return NULL;
+
+	size = base64urldec(b_orig(b64url_buf), b_data(b64url_buf),
+			    b_orig(decoded), b_size(decoded));
+	if (size < 0)
+		return NULL;
+	decoded->data = size;
+
+	bn = BN_bin2bn((const unsigned char *)b_orig(decoded), b_data(decoded), NULL);
+
+	return bn;
+}
+
+/*
+ * Extract a field named <field> of type string out of the <jwk> JSON buffer and
+ * dump its value in <out>.
+ * Return 0 in case of success, 1 in case of error (JSON parsing error or value
+ * not found).
+ */
+static int get_jwk_field(struct buffer *jwk, const char *field, struct buffer *out)
+{
+	int size = 0;
+
+	chunk_reset(out);
+
+	size = mjson_get_string(b_orig(jwk), b_data(jwk), field,
+				b_orig(out), b_size(out));
+	if (size == -1)
+		return 1;
+
+	out->data = size;
+	return 0;
+}
+
+enum {
+	RSA_BIGNUM_N,
+	RSA_BIGNUM_E,
+	RSA_BIGNUM_D,
+	RSA_BIGNUM_P,
+	RSA_BIGNUM_Q,
+	RSA_BIGNUM_DP,
+	RSA_BIGNUM_DQ,
+	RSA_BIGNUM_QI,
+
+	RSA_BIGNUM_COUNT
+};
+
+
+/*
+ * Build the EVP_PKEY out of the BIGNUMs parsed by the caller.
+ * The RSA_set0_ functions were deprecated in OpenSSL3, hence the two different
+ * code blocks.
+ * Returns 0 in case of success, 1 otherwise.
+ */
+static int do_build_RSA_PKEY(BIGNUM *nums[RSA_BIGNUM_COUNT], EVP_PKEY **pkey)
+#if HA_OPENSSL_VERSION_NUMBER >= 0x30000000L
+{
+	int retval = 1;
+	OSSL_PARAM *params = NULL;
+	OSSL_PARAM_BLD *param_bld = NULL;
+	EVP_PKEY_CTX *pctx = NULL;
+
+	param_bld = OSSL_PARAM_BLD_new();
+
+	if (!OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_N, nums[RSA_BIGNUM_N]) ||
+	    !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_E, nums[RSA_BIGNUM_E]) ||
+	    !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_D, nums[RSA_BIGNUM_D]) ||
+	    !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_FACTOR1, nums[RSA_BIGNUM_P]) ||
+	    !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_FACTOR2, nums[RSA_BIGNUM_Q]) ||
+	    !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_EXPONENT1, nums[RSA_BIGNUM_DP]) ||
+	    !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_EXPONENT2, nums[RSA_BIGNUM_DQ]) ||
+	    !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, nums[RSA_BIGNUM_QI]))
+		goto end;
+
+	params = OSSL_PARAM_BLD_to_param(param_bld);
+
+	if (!params)
+		goto end;
+
+	pctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+	if (!pctx)
+		goto end;
+	if (EVP_PKEY_fromdata_init(pctx) != 1)
+		goto end;
+
+	if (EVP_PKEY_fromdata(pctx, pkey, EVP_PKEY_KEYPAIR, params) != 1)
+		goto end;
+
+	retval = 0;
+end:
+	OSSL_PARAM_BLD_free(param_bld);
+	OSSL_PARAM_free(params);
+	EVP_PKEY_CTX_free(pctx);
+
+	return retval;
+}
+#else /* HA_OPENSSL_VERSION_NUMBER < 0x30000000L */
+{
+	int retval = 1;
+	RSA *rsa = NULL;
+
+	rsa = RSA_new();
+	if (!rsa)
+		goto end;
+
+	if (RSA_set0_key(rsa, nums[RSA_BIGNUM_N], nums[RSA_BIGNUM_E], nums[RSA_BIGNUM_D]) != 1 ||
+	    RSA_set0_factors(rsa, nums[RSA_BIGNUM_P], nums[RSA_BIGNUM_Q]) != 1 ||
+	    RSA_set0_crt_params(rsa, nums[RSA_BIGNUM_DP], nums[RSA_BIGNUM_DQ], nums[RSA_BIGNUM_QI]) != 1)
+		goto end;
+
+	*pkey = EVP_PKEY_new();
+	if (!*pkey)
+		goto end;
+
+	if (EVP_PKEY_set1_RSA(*pkey, rsa) != 1)
+		goto end;
+
+	retval = 0;
+end:
+	RSA_free(rsa);
+	return retval;
+}
+#endif
+
+static inline void clear_bignums(BIGNUM **nums, int count)
+{
+	int idx = 0;
+
+	while (idx < count)
+		BN_free(nums[idx++]);
+}
+
+/*
+ * Build an EVP_PKEY that contains an RSA private key out of a JWK buffer that
+ * must have an "RSA" key type ("kty" field).
+ * Return 0 in case of success, 1 otherwise.
+ */
+static int build_RSA_PKEY_from_buf(struct buffer *jwk, EVP_PKEY **pkey)
+{
+	BIGNUM *nums[RSA_BIGNUM_COUNT] = {};
+	int retval = 1;
+
+	struct buffer *tmpbuf = alloc_trash_chunk();
+
+	if (!tmpbuf)
+		goto end;
+
+	/*
+	 * Extract all the mandatory fields that all represent BIGNUMs out of
+	 * the JWK buffer.
+	 */
+	if (get_jwk_field(jwk, "$.n", tmpbuf) || (nums[RSA_BIGNUM_N] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.e", tmpbuf) || (nums[RSA_BIGNUM_E] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.d", tmpbuf) || (nums[RSA_BIGNUM_D] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.p", tmpbuf) || (nums[RSA_BIGNUM_P] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.q", tmpbuf) || (nums[RSA_BIGNUM_Q] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.dp", tmpbuf) || (nums[RSA_BIGNUM_DP] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.dq", tmpbuf) || (nums[RSA_BIGNUM_DQ] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.qi", tmpbuf) || (nums[RSA_BIGNUM_QI] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+
+	retval = do_build_RSA_PKEY(nums, pkey);
+
+end:
+	/* The bignums are duplicated with OpenSSL3+ but not with the older API */
+#if HA_OPENSSL_VERSION_NUMBER >= 0x30000000L
+	clear_bignums(nums, RSA_BIGNUM_COUNT);
+#else
+	if (retval)
+		clear_bignums(nums, RSA_BIGNUM_COUNT);
+#endif
+
+	free_trash_chunk(tmpbuf);
+	if (retval) {
+		EVP_PKEY_free(*pkey);
+		*pkey = NULL;
+	}
+
+	return retval;
+}
+
+enum {
+	EC_BIGNUM_X,
+	EC_BIGNUM_Y,
+	EC_BIGNUM_D,
+
+	EC_BIGNUM_COUNT
+};
+
+
+#if HA_OPENSSL_VERSION_NUMBER >= 0x30000000L
+/*
+ * Build an EC pubkey out of its 'x' and 'y' parameters for EC curve with <nid>.
+ * Dump the corresponding pubkey in <out> buffer.
+ * Returns 0 in case of success, 1 otherwise.
+ */
+static inline int curve_param_to_pubkey(int nid, BIGNUM *x, BIGNUM *y, struct buffer *out)
+{
+	EC_POINT *ec_point = NULL;
+	EC_GROUP *group = NULL;
+	BN_CTX *bnctx = NULL;
+	int retval = 1;
+
+	if (!out)
+		goto end;
+
+	group = EC_GROUP_new_by_curve_name(nid);
+	if (!group)
+		goto end;
+
+	bnctx = BN_CTX_new();
+	if (!bnctx)
+		goto end;
+
+	ec_point = EC_POINT_new(group);
+	if (!ec_point)
+		goto end;
+
+	if (EC_POINT_set_affine_coordinates(group, ec_point, x, y, bnctx) < 0)
+		goto end;
+
+	out->data = EC_POINT_point2oct(group, ec_point, POINT_CONVERSION_UNCOMPRESSED,
+	                               (unsigned char*)b_orig(out), b_size(out), bnctx);
+
+	if (out->data == 0)
+		goto end;
+
+	retval = 0;
+
+end:
+	EC_POINT_free(ec_point);
+	EC_GROUP_free(group);
+	BN_CTX_free(bnctx);
+	return retval;
+}
+#endif
+
+
+/*
+ * Build an EVP_PKEY that contains an EC key (either public or private) out of a
+ * JWK buffer that must have an "EC" key type ("kty" field). A public key must
+ * have valid "x" and "y" fields and a private key must have a "d" field as
+ * well.
+ * Return 0 in case of success, 1 otherwise.
+ */
+static int do_build_EC_PKEY(struct buffer *curve, BIGNUM *nums[EC_BIGNUM_COUNT], EVP_PKEY **pkey)
+#if HA_OPENSSL_VERSION_NUMBER >= 0x30000000L
+{
+	int retval = 1;
+	struct buffer *pubkey = NULL;
+	int nid = 0;
+
+	OSSL_PARAM *params = NULL;
+	OSSL_PARAM_BLD *param_bld = NULL;
+	EVP_PKEY_CTX *pctx = NULL;
+
+	nid = curves2nid(b_orig(curve));
+	if (nid == -1)
+		goto end;
+
+	pubkey = alloc_trash_chunk();
+	if (!pubkey)
+		goto end;
+
+	if (curve_param_to_pubkey(nid, nums[EC_BIGNUM_X], nums[EC_BIGNUM_Y], pubkey))
+		goto end;
+
+	param_bld = OSSL_PARAM_BLD_new();
+
+	if (!OSSL_PARAM_BLD_push_utf8_string(param_bld, OSSL_PKEY_PARAM_GROUP_NAME,
+					     b_orig(curve), b_data(curve)) ||
+	    !OSSL_PARAM_BLD_push_octet_string(param_bld, OSSL_PKEY_PARAM_PUB_KEY,
+					      pubkey->area, pubkey->data) ||
+	    (nums[EC_BIGNUM_D] && !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY, nums[EC_BIGNUM_D])))
+		goto end;
+
+	params = OSSL_PARAM_BLD_to_param(param_bld);
+
+	if (!params)
+		goto end;
+
+	pctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+	if (!pctx)
+		goto end;
+
+	if (EVP_PKEY_fromdata_init(pctx) != 1 ||
+	    EVP_PKEY_fromdata(pctx, pkey, EVP_PKEY_KEYPAIR, params) != 1)
+		goto end;
+
+	retval = 0;
+
+end:
+	free_trash_chunk(pubkey);
+	OSSL_PARAM_BLD_free(param_bld);
+	EVP_PKEY_CTX_free(pctx);
+	OSSL_PARAM_free(params);
+	return retval;
+}
+#else
+{
+	EC_KEY *ec_key = NULL;
+	int retval = 1;
+	int nid = 0;
+
+	nid = curves2nid(b_orig(curve));
+	if (nid == -1)
+		goto end;
+
+	ec_key = EC_KEY_new_by_curve_name(nid);
+	if (!ec_key)
+		goto end;
+
+	if (nums[EC_BIGNUM_D] && EC_KEY_set_private_key(ec_key, nums[EC_BIGNUM_D]) < 0)
+		goto end;
+
+	if (EC_KEY_set_public_key_affine_coordinates(ec_key, nums[EC_BIGNUM_X], nums[EC_BIGNUM_Y]) < 0)
+		goto end;
+
+	if (EC_KEY_check_key(ec_key) == 0)
+		goto end;
+
+	*pkey = EVP_PKEY_new();
+	if (!*pkey)
+		goto end;
+
+	if (EVP_PKEY_set1_EC_KEY(*pkey, ec_key) == 0)
+		goto end;
+
+	retval = 0;
+
+end:
+	EC_KEY_free(ec_key);
+	if (retval) {
+		EVP_PKEY_free(*pkey);
+		*pkey = NULL;
+	}
+	return retval;
+}
+#endif
+
+
+/*
+ * Build an EVP_PKEY that contains an EC key out of a JWK buffer that must have
+ * an "EC" key type ("kty" field).
+ * Return 0 in case of success, 1 otherwise.
+ */
+static int build_EC_PKEY_from_buf(struct buffer *jwk, EVP_PKEY **pkey)
+{
+	BIGNUM *nums[EC_BIGNUM_COUNT] = {};
+	int retval = 1;
+	struct buffer *crv = NULL, *tmpbuf = NULL;
+
+	crv = alloc_trash_chunk();
+	if (!crv)
+		goto end;
+
+	tmpbuf = alloc_trash_chunk();
+	if (!tmpbuf)
+		goto end;
+
+	if (get_jwk_field(jwk, "$.x", tmpbuf) || (nums[EC_BIGNUM_X] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	if (get_jwk_field(jwk, "$.y", tmpbuf) || (nums[EC_BIGNUM_Y] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+	/* "d" is optional, we might have a pure public key with only "x" and
+	 * "y" provided. */
+	if (get_jwk_field(jwk, "$.d", tmpbuf) == 0 && (nums[EC_BIGNUM_D] = base64url_to_BIGNUM(tmpbuf)) == NULL)
+		goto end;
+
+	if (get_jwk_field(jwk, "$.crv", crv))
+		goto end;
+
+	retval = do_build_EC_PKEY(crv, nums, pkey);
+
+#if 0
+	if (!retval) {
+		BIO *bp = BIO_new_fp(stdout, BIO_NOCLOSE);
+		EVP_PKEY_print_private(bp, *pkey, 1, NULL);
+		BIO_free(bp);
+	}
+#endif
+
+end:
+	clear_bignums(nums, EC_BIGNUM_COUNT);
+
+	free_trash_chunk(crv);
+	free_trash_chunk(tmpbuf);
+	if (retval) {
+		EVP_PKEY_free(*pkey);
+		*pkey = NULL;
+	}
+
+	return retval;
+}
+
+
+
+typedef enum {
+	JWK_KTY_OCT,
+	JWK_KTY_RSA,
+	JWK_KTY_EC
+} jwk_type;
+
+struct jwk {
+	jwk_type type;
+	struct buffer *kid;
+	union {
+		EVP_PKEY *pkey;
+		struct buffer *secret;
+	};
+};
+
+static void clear_jwk(struct jwk *jwk)
+{
+	if (!jwk)
+		return;
+
+	free_trash_chunk(jwk->kid);
+	jwk->kid = NULL;
+
+	switch (jwk->type) {
+	case JWK_KTY_OCT:
+		free_trash_chunk(jwk->secret);
+		jwk->secret = NULL;
+		break;
+	case JWK_KTY_RSA:
+	case JWK_KTY_EC:
+		EVP_PKEY_free(jwk->pkey);
+		jwk->pkey = NULL;
+		break;
+	default:
+		break;
+	}
+}
+
+
+/*
+ * Convert a JWK in buffer <jwk_buf> into either an RSA private key stored in an
+ * EVP_PKEY or a secret (for symmetric algorithms).
+ * Returns 0 in case of success, 1 otherwise.
+ */
+static int process_jwk(struct buffer *jwk_buf, struct jwk *jwk)
+{
+	struct buffer *kty = NULL;
+	int retval = 1;
+
+	kty = get_trash_chunk();
+	if (get_jwk_field(jwk_buf, "$.kty", kty))
+		goto end;
+
+	/* Look for optional "kid" field */
+	jwk->kid = alloc_trash_chunk();
+	if (!jwk->kid)
+		goto end;
+	get_jwk_field(jwk_buf, "$.kid", jwk->kid);
+
+	if (chunk_strcmp(kty, "oct") == 0) {
+		struct buffer *tmpbuf = get_trash_chunk();
+		int size = 0;
+
+		jwk->type = JWK_KTY_OCT;
+
+		jwk->secret = alloc_trash_chunk();
+		if (!jwk->secret)
+			goto end;
+
+		if (get_jwk_field(jwk_buf, "$.k", tmpbuf))
+			goto end;
+
+		size = base64urldec(b_orig(tmpbuf), b_data(tmpbuf),
+				    b_orig(jwk->secret), b_size(jwk->secret));
+		if (size < 0) {
+			goto end;
+		}
+		jwk->secret->data = size;
+
+	} else if (chunk_strcmp(kty, "RSA") == 0) {
+		jwk->type = JWK_KTY_RSA;
+
+		if (build_RSA_PKEY_from_buf(jwk_buf, &jwk->pkey))
+			goto end;
+	} else if (chunk_strcmp(kty, "EC") == 0) {
+		jwk->type = JWK_KTY_EC;
+
+		if (build_EC_PKEY_from_buf(jwk_buf, &jwk->pkey))
+			goto end;
+	} else
+		goto end;
+
+	retval = 0;
+
+end:
+	if (retval)
+		clear_jwk(jwk);
+	return retval;
+}
+
+
+static int sample_conv_jwt_decrypt_jwk_check(struct arg *args, struct sample_conv *conv,
+                                             const char *file, int line, char **err)
+{
+	vars_check_arg(&args[0], NULL);
+
+	if (args[0].type == ARGT_STR) {
+		EVP_PKEY *pkey = NULL;
+		struct buffer *trash = get_trash_chunk();
+
+		if (get_jwk_field(&args[0].data.str, "$.kty", trash) == 0) {
+			if (chunk_strcmp(trash, "oct") == 0) {
+				struct buffer *key = get_trash_chunk();
+				if (get_jwk_field(&args[0].data.str, "$.k", key)) {
+					memprintf(err, "Missing 'k' field in JWK");
+					return 0;
+				}
+			} else if (chunk_strcmp(trash, "RSA") == 0) {
+				if (build_RSA_PKEY_from_buf(&args[0].data.str, &pkey)) {
+					memprintf(err, "Failed to parse RSA JWK");
+					return 0;
+				}
+				EVP_PKEY_free(pkey);
+			} else if (chunk_strcmp(trash, "EC") == 0) {
+				if (build_EC_PKEY_from_buf(&args[0].data.str, &pkey)) {
+					memprintf(err, "Failed to parse EC JWK");
+					return 0;
+				}
+				EVP_PKEY_free(pkey);
+			} else {
+				memprintf(err, "Unmanaged key type (expected 'oct', 'RSA' or 'EC'");
+				return 0;
+			}
+		} else {
+			memprintf(err, "Missing key type (expected 'oct', 'RSA' or 'EC')");
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+
+/*
+ * Decrypt the contents of a JWE token thanks to the user-provided JWK that can
+ * either contain an RSA private key or a secret.
+ * Returns the decrypted contents, or nothing if any error happened.
+ */
+static int sample_conv_jwt_decrypt_jwk(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *input = NULL;
+	unsigned int item_num = JWE_ELT_MAX;
+	struct sample jwk_smp;
+	struct jwt_item items[JWE_ELT_MAX] = {};
+	struct buffer *decoded_items[JWE_ELT_MAX] = {};
+	jwe_alg alg = JWE_ALG_UNMANAGED;
+	jwe_enc enc = JWE_ENC_UNMANAGED;
+	int size = 0;
+	int rsa = 0;
+	int dir = 0;
+	int gcm = 0;
+	int oct = 0;
+	int ec = 0;
+	int retval = 0;
+	struct buffer **cek = NULL;
+	struct buffer *decrypted_cek = NULL;
+	struct buffer *out = NULL;
+	struct jose_fields fields = {};
+
+	struct buffer *jwk_buf = NULL;
+	struct jwk jwk = {};
+
+	smp_set_owner(&jwk_smp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&args[0], &jwk_smp))
+		goto end;
+
+	/* Copy JWK parameter */
+	jwk_buf = alloc_trash_chunk();
+	if (!jwk_buf)
+		goto end;
+	if (!chunk_cpy(jwk_buf, &jwk_smp.data.u.str))
+		goto end;
+
+	/* Copy JWE input token */
+	input = alloc_trash_chunk();
+	if (!input)
+		goto end;
+	if (!chunk_cpy(input, &smp->data.u.str))
+		goto end;
+
+	if (jwt_tokenize(input, items, item_num))
+		goto end;
+
+	/* Base64Url decode the JOSE header */
+	decoded_items[JWE_ELT_JOSE] = alloc_trash_chunk();
+	if (!decoded_items[JWE_ELT_JOSE])
+		goto end;
+	size = base64urldec(items[JWE_ELT_JOSE].start, items[JWE_ELT_JOSE].length,
+			    b_orig(decoded_items[JWE_ELT_JOSE]), b_size(decoded_items[JWE_ELT_JOSE]));
+	if (size < 0)
+		goto end;
+	decoded_items[JWE_ELT_JOSE]->data = size;
+
+	if (!parse_jose(decoded_items[JWE_ELT_JOSE], &alg, &enc, &fields))
+		goto end;
+
+	/* Check if "alg" fits certificate-based JWEs */
+	switch (alg) {
+	case JWE_ALG_RSA1_5:
+	case JWE_ALG_RSA_OAEP:
+	case JWE_ALG_RSA_OAEP_256:
+		rsa = 1;
+		break;
+	case JWE_ALG_A128KW:
+	case JWE_ALG_A192KW:
+	case JWE_ALG_A256KW:
+		gcm = 0;
+		oct = 1;
+		break;
+	case JWE_ALG_A128GCMKW:
+	case JWE_ALG_A192GCMKW:
+	case JWE_ALG_A256GCMKW:
+		gcm = 1;
+		oct = 1;
+		break;
+	case JWE_ALG_DIR:
+		dir = 1;
+		oct = 1;
+		break;
+	case JWE_ALG_ECDH_ES:
+	case JWE_ALG_ECDH_ES_A128KW:
+	case JWE_ALG_ECDH_ES_A192KW:
+	case JWE_ALG_ECDH_ES_A256KW:
+		ec = 1;
+		break;
+	default:
+		/* Not managed yet */
+		goto end;
+	}
+
+	/* Parse JWK argument. */
+	if (process_jwk(jwk_buf, &jwk))
+		goto end;
+
+	/* Check that the provided JWK is of the proper type */
+	if ((oct && jwk.type != JWK_KTY_OCT) ||
+	    (rsa && jwk.type != JWK_KTY_RSA) ||
+	    (ec && jwk.type != JWK_KTY_EC))
+		goto end;
+
+	if (dir) {
+		/* The secret given as parameter should be used directly to
+		 * decode the encrypted content. */
+		decrypted_cek = alloc_trash_chunk();
+		if (!decrypted_cek)
+			goto end;
+
+		chunk_memcpy(decrypted_cek, b_orig(jwk.secret), b_data(jwk.secret));
+	} else if (ec) {
+		/* With algorithms other than "ECDH-ES" we should always have a CEK */
+		if (alg != JWE_ALG_ECDH_ES) {
+			if (!items[JWE_ELT_CEK].length)
+				goto end;
+
+			cek = &decoded_items[JWE_ELT_CEK];
+
+			*cek = alloc_trash_chunk();
+			if (!*cek)
+				goto end;
+
+			size = base64urldec(items[JWE_ELT_CEK].start, items[JWE_ELT_CEK].length,
+					    (*cek)->area, (*cek)->size);
+			if (size < 0) {
+				goto end;
+			}
+			(*cek)->data = size;
+		}
+
+		decrypted_cek = alloc_trash_chunk();
+		if (!decrypted_cek) {
+			goto end;
+		}
+
+		if (do_decrypt_cek_ec((cek != NULL) ? *cek : NULL, decrypted_cek, jwk.pkey, fields.pubkey,
+				      alg, enc, fields.apu, fields.apv))
+			goto end;
+	} else {
+		/* With algorithms other than "dir" we should always have a CEK */
+		if (!items[JWE_ELT_CEK].length)
+			goto end;
+
+		cek = &decoded_items[JWE_ELT_CEK];
+
+		*cek = alloc_trash_chunk();
+		if (!*cek)
+			goto end;
+
+		size = base64urldec(items[JWE_ELT_CEK].start, items[JWE_ELT_CEK].length,
+				    (*cek)->area, (*cek)->size);
+		if (size < 0) {
+			goto end;
+		}
+		(*cek)->data = size;
+
+		decrypted_cek = alloc_trash_chunk();
+		if (!decrypted_cek) {
+			goto end;
+		}
+
+		if (rsa) {
+			if (do_decrypt_cek_rsa(*cek, decrypted_cek, jwk.pkey, alg))
+				goto end;
+		} else {
+			if (gcm) {
+				if (!decrypt_cek_aesgcmkw(*cek, fields.tag, fields.iv, decrypted_cek, jwk.secret, alg))
+					goto end;
+			} else {
+				if (!decrypt_cek_aeskw(*cek, decrypted_cek, jwk.secret, alg))
+					goto end;
+			}
+		}
+	}
+
+	if (decrypt_ciphertext(enc, items, decoded_items, decrypted_cek, &out))
+		goto end;
+
+	smp->data.u.str.data = b_data(out);
+	smp->data.u.str.area = b_orig(out);
+	smp->data.type = SMP_T_BIN;
+	smp_dup(smp);
+
+	retval = 1;
+
+end:
+	clear_jwk(&jwk);
+	clear_jose_fields(&fields);
+	free_trash_chunk(jwk_buf);
+	free_trash_chunk(input);
+	free_trash_chunk(decrypted_cek);
+	free_trash_chunk(out);
+	clear_decoded_items(decoded_items);
+	return retval;
+}
+
+
+/*
+ * Duplicate algorithm and encoding arrays so that their enabled flags
+ * can be overwritten (when using the jwt.encrypt_alg/enc_list options).
+ * Return 0 in case of success, -1 otherwise.
+ */
+static int dup_alg_enc_arrays(void)
+{
+	int ret = -1;
+
+	if (!jwe_algs) {
+		jwe_algs = malloc(sizeof(jwe_algs_dflt));
+		if (!jwe_algs) {
+			ha_alert("Unable to allocate the JWE algorithms array.\n");
+			goto end;
+		}
+		memcpy(jwe_algs, jwe_algs_dflt, sizeof(jwe_algs_dflt));
+	}
+
+	if (!jwe_encodings) {
+		jwe_encodings = malloc(sizeof(jwe_encodings_dflt));
+		if (!jwe_encodings) {
+			ha_alert("Unable to allocate the JWE encodings array.\n");
+			goto end;
+		}
+		memcpy(jwe_encodings, jwe_encodings_dflt, sizeof(jwe_encodings_dflt));
+	}
+
+	ret = 0;
+
+end:
+	return ret;
+}
+
+static int jwe_init(void)
+{
+	/* Duplicate algorithm and encoding arrays so that their enabled flags
+	 * can be overwritten */
+	return dup_alg_enc_arrays();
+}
+
+REGISTER_PRE_CHECK(jwe_init);
+
+static void jwe_deinit(void)
+{
+	ha_free(&jwe_algs);
+	ha_free(&jwe_encodings);
+}
+
+REGISTER_POST_DEINIT(jwe_deinit);
+
+/*
+ * Look for an entry named <algname> in array <arr> and set its 'enabled' field
+ * to <value>.
+ * Return 0 in case of success, 1 otherwise (item not found).
+ */
+static int set_alg_enc_flag(struct alg_enc *arr, char *algname, int algname_len, int value)
+{
+	struct alg_enc *item = &arr[0];
+
+	while (item->name) {
+		if (algname_len == strlen(item->name) && strncmp(algname, item->name, algname_len) == 0) {
+			item->enabled = value;
+			return 0;
+		}
+		++item;
+	}
+
+	return 1;
+}
+
+/* Set the 'enabled' field to <val> for all members of <arr>. */
+static void set_all_alg_enc_flags(struct alg_enc *arr, int val)
+{
+	struct alg_enc *item = &arr[0];
+
+	while (item->name) {
+		item->enabled = val;
+		++item;
+	}
+}
+
+/*
+ * Parse algorithm list comprised of colon-separated algorithms having the same
+ * format as in jwe_algs_dflt or jwe_encodings_dflt arrays.
+ * When the option is used, all the algorithms are first disabled so any
+ * unspecified algo will not be enabled anymore.
+ */
+static int jwe_parse_global_alg_enc_list(char **args, int section_type, struct proxy *curpx,
+                                         const struct proxy *defpx, const char *file, int line,
+                                         char **err)
+{
+	struct alg_enc *arr = NULL;
+	char *p, *arg = args[1];
+	char *arg_end = arg+strlen(arg);
+	char *alg, *alg_end;
+
+	int value = ALG_ENC_ENABLED;
+	int ret = -1;
+
+	if (dup_alg_enc_arrays())
+		goto end;
+
+	if (args[0][12] == 'a') {
+		/* "jwt.decrypt_alg_list" */
+		arr = jwe_algs;
+	} else {
+		/* "jwt.decrypt_enc_list" */
+		arr = jwe_encodings;
+	}
+
+	/* Disable all algorithms/encodings */
+	set_all_alg_enc_flags(arr, ALG_ENC_DISABLED);
+
+	while (*arg) {
+		value = ALG_ENC_ENABLED;
+
+		if (*arg == '!') {
+			++arg;
+			value = ALG_ENC_DISABLED;
+		}
+		alg = arg;
+		alg_end = NULL;
+
+		p = strchr(arg, ':');
+		if (p) {
+			alg_end = p;
+			arg = p + 1;
+		} else {
+			alg_end = arg_end;
+			arg = arg_end;
+		}
+
+		/* If "ALL" is used all previously disabled algo will be
+		 * reenabled */
+		if (strncmp(alg, "ALL", alg_end - alg) == 0) {
+			set_all_alg_enc_flags(arr, ALG_ENC_ENABLED);
+		} else {
+			if (set_alg_enc_flag(arr, alg, alg_end-alg, value) != 0) {
+				memprintf(err, "Unknown algorithm/encoding %.*s\n", (int)(alg_end-alg), alg);
+				goto end;
+			}
+		}
+	}
+
+	ret = 0;
+end:
+	return ret;
+
+}
+
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "jwt.decrypt_alg_list", jwe_parse_global_alg_enc_list },
+	{ CFG_GLOBAL, "jwt.decrypt_enc_list", jwe_parse_global_alg_enc_list },
+	{ 0, NULL, NULL },
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+
 
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	/* JSON Web Token converters */
 	{ "jwt_decrypt_secret",    sample_conv_jwt_decrypt_secret, ARG1(1,STR), sample_conv_jwt_decrypt_secret_check, SMP_T_BIN, SMP_T_BIN },
-	{ "jwt_decrypt_cert",      sample_conv_jwt_decrypt_cert,   ARG1(1,STR), sample_conv_jwt_decrypt_cert_check,    SMP_T_BIN, SMP_T_BIN },
+	{ "jwt_decrypt_cert",      sample_conv_jwt_decrypt_cert,   ARG1(1,STR), sample_conv_jwt_decrypt_cert_check,   SMP_T_BIN, SMP_T_BIN },
+	{ "jwt_decrypt_jwk",       sample_conv_jwt_decrypt_jwk,    ARG1(1,STR), sample_conv_jwt_decrypt_jwk_check,    SMP_T_BIN, SMP_T_BIN },
 	{ NULL, NULL, 0, 0, 0 },
 
 }};

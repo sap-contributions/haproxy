@@ -102,6 +102,20 @@ void conn_delete_from_tree(struct connection *conn, int thr)
 	ceb64_item_delete(conn_tree, hash_node.node, hash_node.key, conn);
 }
 
+/* Installs the MUX layer for <conn> connection. The behavior is slightly
+ * different for frontend and backend sides.
+ *
+ * For frontend connections, MUX is set up via session initialization
+ * completion. In case of failure, the session and the whole connection stack
+ * are freed. Caller should set <closed_connection> to a non NULL value as it
+ * will be set to 1 to report the connection release.
+ *
+ * For backend connections, MUX layer is immediately initialized by selecting
+ * the most appropriate one depending on the connection protocol. In case of
+ * failure, connection is left as it is and the upper layer is notified.
+ *
+ * Returns 0 on success else a negative error code.
+ */
 int conn_create_mux(struct connection *conn, int *closed_connection)
 {
 	if (closed_connection)
@@ -141,7 +155,7 @@ int conn_create_mux(struct connection *conn, int *closed_connection)
 fail:
 		/* let the upper layer know the connection failed */
 		if (sc) {
-			sc->app_ops->wake(sc);
+			tasklet_wakeup(sc->wait_event.tasklet, TASK_WOKEN_MSG);
 		}
 		else if (conn_reverse_in_preconnect(conn)) {
 			struct listener *l = conn_active_reverse_listener(conn);
@@ -182,7 +196,7 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 	 * information to create one, typically from the ALPN. If we're
 	 * done with the handshake, attempt to create one.
 	 */
-	if (unlikely(!conn->mux) && !(conn->flags & CO_FL_WAIT_XPRT)) {
+	if (unlikely(!conn->mux) && !(conn->flags & (CO_FL_WAIT_XPRT|CO_FL_QSTRM_RECV|CO_FL_QSTRM_SEND))) {
 		ret = conn_create_mux(conn, NULL);
 		if (ret < 0)
 			goto done;
@@ -232,14 +246,14 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 
-		ret = conn->mux->wake(conn);
+		ret = CALL_MUX_WITH_RET(conn->mux, wake(conn));
 		if (ret < 0)
 			goto done;
 
 		if (conn_in_list) {
 			if (srv && (srv->cur_admin & SRV_ADMF_MAINT)) {
 				/* Do not store an idle conn if server in maintenance. */
-				conn->mux->destroy(conn->ctx);
+				CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 				ret = -1;
 				goto done;
 			}
@@ -247,7 +261,7 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 			if (conn->flags & CO_FL_SESS_IDLE) {
 				if (!session_reinsert_idle_conn(conn->owner, conn)) {
 					/* session add conn failure */
-					conn->mux->destroy(conn->ctx);
+					CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 					ret = -1;
 				}
 			}
@@ -291,7 +305,7 @@ int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
 	old_mux_ctx = conn->ctx;
 	conn->mux = new_mux;
 	conn->ctx = ctx;
-	if (new_mux->init(conn, bind_conf->frontend, conn->owner, buf) == -1) {
+	if (CALL_MUX_WITH_RET(new_mux, init(conn, bind_conf->frontend, conn->owner, buf)) == -1) {
 		/* The mux upgrade failed, so restore the old mux */
 		conn->ctx = old_mux_ctx;
 		conn->mux = old_mux;
@@ -300,7 +314,7 @@ int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
 
 	/* The mux was upgraded, destroy the old one */
 	*buf = BUF_NULL;
-	old_mux->destroy(old_mux_ctx);
+	CALL_MUX_NO_RET(old_mux, destroy(old_mux_ctx));
 	return 0;
 }
 
@@ -383,6 +397,17 @@ int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess
 		if (!mux_ops)
 			return -1;
 	}
+
+	/* unless the connection is private or it's temporarily reserved to the
+	 * session due to a mux presenting a risk of head-of-line blocking and
+	 * the reuse mode is set to "safe", we should reset the owner to avoid
+	 * any ambiguity.
+	 */
+	if (!(conn->flags & CO_FL_PRIVATE) &&
+	    ((prx->options & PR_O_REUSE_MASK) != PR_O_REUSE_SAFE ||
+	     !(mux_ops->flags & MX_FL_HOL_RISK)))
+		conn->owner = NULL;
+
 	return conn_install_mux(conn, mux_ops, ctx, prx, sess);
 }
 
@@ -412,7 +437,7 @@ int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *ses
 		struct ist mux_proto;
 		const char *alpn_str = NULL;
 		int alpn_len = 0;
-		int mode = tcpchk_rules_type_to_proto_mode(check->tcpcheck_rules->flags);
+		int mode = tcpchk_rules_type_to_proto_mode(check->tcpcheck->rs->flags);
 
 		conn_get_alpn(conn, &alpn_str, &alpn_len);
 		mux_proto = ist2(alpn_str, alpn_len);
@@ -658,7 +683,7 @@ void conn_free(struct connection *conn)
 void conn_release(struct connection *conn)
 {
 	if (conn->mux) {
-		conn->mux->destroy(conn->ctx);
+		CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 	}
 	else {
 		conn_stop_tracking(conn);
@@ -862,6 +887,8 @@ const char *conn_err_code_str(struct connection *c)
 	case CO_ER_SOCKS4_ABORT:   return "SOCKS4 Proxy handshake aborted by server";
 
 	case CO_ER_SSL_FATAL:      return "SSL fatal error";
+
+	case CO_ER_QSTRM:          return "Error during QMux transport parameters initial exchange";
 
 	case CO_ER_REVERSE:        return "Reverse connect failure";
 
@@ -3034,7 +3061,7 @@ static struct task *mux_stopping_process(struct task *t, void *ctx, unsigned int
 
 	list_for_each_entry_safe(conn, back, &mux_stopping_data[tid].list, stopping_list) {
 		if (conn->mux && conn->mux->wake)
-			conn->mux->wake(conn);
+			CALL_MUX_NO_RET(conn->mux, wake(conn));
 	}
 
 	return t;

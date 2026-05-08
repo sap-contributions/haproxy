@@ -59,7 +59,7 @@ extern struct pool_head *pool_head_uniqueid;
 
 extern struct data_cb sess_conn_cb;
 
-struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer *input);
+void *stream_new(struct session *sess, struct stconn *sc, struct buffer *input);
 void stream_free(struct stream *s);
 int stream_upgrade_from_sc(struct stconn *sc, struct buffer *input);
 int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_proto);
@@ -68,8 +68,6 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
 void stream_shutdown_self(struct stream *stream, int why);
 void stream_dump_and_crash(enum obj_type *obj, int rate);
 void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const char *pfx, uint32_t anon_key);
-
-struct ist stream_generate_unique_id(struct stream *strm, struct lf_expr *format);
 
 void stream_process_counters(struct stream *s);
 void sess_change_server(struct stream *strm, struct server *newsrv);
@@ -412,6 +410,7 @@ static inline void stream_shutdown(struct stream *s, int why)
 static inline unsigned int stream_map_task_state(unsigned int state)
 {
 	return ((state & TASK_WOKEN_TIMER) ? STRM_EVT_TIMER : 0)         |
+		((state & TASK_WOKEN_RES)  ? STRM_EVT_RES : 0)           |
 		((state & TASK_WOKEN_MSG)  ? STRM_EVT_MSG : 0)           |
 		((state & TASK_F_UEVT1)    ? STRM_EVT_SHUT_SRV_DOWN : 0) |
 		((state & TASK_F_UEVT3)    ? STRM_EVT_SHUT_SRV_UP : 0)   |

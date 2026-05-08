@@ -36,9 +36,13 @@
 void sc_update_rx(struct stconn *sc);
 void sc_update_tx(struct stconn *sc);
 
+void sc_abort(struct stconn *sc);
+void sc_shutdown(struct stconn *sc);
+void sc_chk_rcv(struct stconn *sc);
+
 struct task *sc_conn_io_cb(struct task *t, void *ctx, unsigned int state);
 int sc_conn_sync_recv(struct stconn *sc);
-void sc_conn_sync_send(struct stconn *sc);
+int sc_conn_sync_send(struct stconn *sc);
 
 int sc_applet_sync_recv(struct stconn *sc);
 void sc_applet_sync_send(struct stconn *sc);
@@ -74,6 +78,70 @@ static inline struct buffer *sc_ob(const struct stconn *sc)
 {
 	return &sc_oc(sc)->buf;
 }
+
+
+/* The application layer tells the stream connector that it just got the input
+ * buffer it was waiting for. A read activity is reported. The SC_FL_HAVE_BUFF
+ * flag is set and held until sc_used_buff() is called to indicate it was
+ * used.
+ */
+static inline void sc_have_buff(struct stconn *sc)
+{
+	if (sc->flags & SC_FL_NEED_BUFF) {
+		sc->flags &= ~SC_FL_NEED_BUFF;
+		sc->flags |=  SC_FL_HAVE_BUFF;
+		sc_ep_report_read_activity(sc);
+	}
+}
+
+/* The stream connector failed to get an input buffer and is waiting for it.
+ * It indicates a willingness to deliver data to the buffer that will have to
+ * be retried. As such, callers will often automatically clear SE_FL_HAVE_NO_DATA
+ * to be called again as soon as SC_FL_NEED_BUFF is cleared.
+ */
+static inline void sc_need_buff(struct stconn *sc)
+{
+	sc->flags |= SC_FL_NEED_BUFF;
+}
+
+/* The stream connector indicates that it has successfully allocated the buffer
+ * it was previously waiting for so it drops the SC_FL_HAVE_BUFF bit.
+ */
+static inline void sc_used_buff(struct stconn *sc)
+{
+	sc->flags &= ~SC_FL_HAVE_BUFF;
+}
+
+/* Tell a stream connector some room was made in the input buffer and any
+ * failed attempt to inject data into it may be tried again. This is usually
+ * called after a successful transfer of buffer contents to the other side.
+ *  A read activity is reported.
+ */
+static inline void sc_have_room(struct stconn *sc)
+{
+	if (sc->flags & SC_FL_NEED_ROOM) {
+		sc->flags &= ~SC_FL_NEED_ROOM;
+		sc->room_needed = 0;
+		sc_ep_report_read_activity(sc);
+	}
+}
+
+/* The stream connector announces it failed to put data into the input buffer
+ * by lack of room. Since it indicates a willingness to deliver data to the
+ * buffer that will have to be retried. Usually the caller will also clear
+ * SE_FL_HAVE_NO_DATA to be called again as soon as SC_FL_NEED_ROOM is cleared.
+ *
+ * The caller is responsible to specified the amount of free space required to
+ * progress. It must take care to not exceed the buffer size.
+ */
+static inline void sc_need_room(struct stconn *sc, ssize_t room_needed)
+{
+	sc->flags |= SC_FL_NEED_ROOM;
+	BUG_ON_HOT(room_needed > (ssize_t)c_size(sc_ic(sc)));
+	sc->room_needed = room_needed;
+}
+
+
 /* returns the stream's task associated to this stream connector */
 static inline struct task *sc_strm_task(const struct stconn *sc)
 {
@@ -296,38 +364,6 @@ static inline int sc_is_recv_allowed(const struct stconn *sc)
 	return !(sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM));
 }
 
-/* This is to be used after making some room available in a channel. It will
- * return without doing anything if the stream connector's RX path is blocked.
- * It will automatically mark the stream connector as busy processing the end
- * point in order to avoid useless repeated wakeups.
- * It will then call ->chk_rcv() to enable receipt of new data.
- */
-static inline void sc_chk_rcv(struct stconn *sc)
-{
-	if (sc_ep_test(sc, SE_FL_APPLET_NEED_CONN) &&
-	    sc_state_in(sc_opposite(sc)->state, SC_SB_RDY|SC_SB_EST|SC_SB_DIS|SC_SB_CLO)) {
-		sc_ep_clr(sc, SE_FL_APPLET_NEED_CONN);
-		sc_ep_report_read_activity(sc);
-	}
-
-	if (!sc_is_recv_allowed(sc))
-		return;
-
-	if (!sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST))
-		return;
-
-	sc_ep_set(sc, SE_FL_HAVE_NO_DATA);
-	if (likely(sc->app_ops->chk_rcv))
-		sc->app_ops->chk_rcv(sc);
-}
-
-/* Calls chk_snd on the endpoint using the data layer */
-static inline void sc_chk_snd(struct stconn *sc)
-{
-	if (likely(sc->app_ops->chk_snd))
-		sc->app_ops->chk_snd(sc);
-}
-
 
 /* Perform a synchronous receive using the right version, depending the endpoing
  * is a connection or an applet.
@@ -344,10 +380,15 @@ static inline int sc_sync_recv(struct stconn *sc)
 /* Perform a synchronous send using the right version, depending the endpoing is
  * a connection or an applet.
  */
-static inline void sc_sync_send(struct stconn *sc)
+static inline int sc_sync_send(struct stconn *sc, unsigned cnt)
 {
-	if (sc_ep_test(sc, SE_FL_T_MUX))
-		sc_conn_sync_send(sc);
+	if (!sc_ep_test(sc, SE_FL_T_MUX))
+		return 0;
+	if (cnt >= 2 && co_data(sc_oc(sc))) {
+		task_wakeup(__sc_strm(sc)->task, TASK_WOKEN_MSG);
+		return 0;
+	}
+	return sc_conn_sync_send(sc);
 }
 
 /* Combines both sc_update_rx() and sc_update_tx() at once */
@@ -467,24 +508,10 @@ static inline void sc_schedule_abort(struct stconn *sc)
 	sc->flags |= SC_FL_ABRT_WANTED;
 }
 
-/* Abort the SC and notify the endpoint using the data layer */
-static inline void sc_abort(struct stconn *sc)
-{
-	if (likely(sc->app_ops->abort))
-		sc->app_ops->abort(sc);
-}
-
 /* Schedule a shutdown for the SC */
 static inline void sc_schedule_shutdown(struct stconn *sc)
 {
 	sc->flags |= SC_FL_SHUT_WANTED;
-}
-
-/* Shutdown the SC and notify the endpoint using the data layer */
-static inline void sc_shutdown(struct stconn *sc)
-{
-	if (likely(sc->app_ops->shutdown))
-		sc->app_ops->shutdown(sc);
 }
 
 #endif /* _HAPROXY_SC_STRM_H */

@@ -25,7 +25,8 @@
 
 
 /* Check an action ruleset validity. It returns the number of error encountered
- * and err_code is updated if a warning is emitted.
+ * and err_code is updated if a warning is emitted. It also takes this
+ * opportunity for filling the execution context based on available info.
  */
 int check_action_rules(struct list *rules, struct proxy *px, int *err_code)
 {
@@ -40,6 +41,13 @@ int check_action_rules(struct list *rules, struct proxy *px, int *err_code)
 		}
 		*err_code |= warnif_tcp_http_cond(px, rule->cond);
 		ha_free(&errmsg);
+
+		if (!rule->exec_ctx.type) {
+			if (rule->kw && rule->kw->exec_ctx.type)
+				rule->exec_ctx = rule->kw->exec_ctx;
+			else if (rule->action_ptr)
+				rule->exec_ctx = EXEC_CTX_MAKE(TH_EX_CTX_FUNC, rule->action_ptr);
+		}
 	}
 
 	return err;
@@ -188,12 +196,29 @@ int cfg_parse_rule_set_timeout(const char **args, int idx, struct act_rule *rule
 	const char *res;
 	const char *timeout_name = args[idx++];
 
-	if (strcmp(timeout_name, "server") == 0) {
+	if (strcmp(timeout_name, "connect") == 0) {
+		if (!(px->cap & PR_CAP_BE)) {
+			memprintf(err, "'%s' has no backend capability", px->id);
+			return -1;
+		}
+		rule->arg.timeout.type = ACT_TIMEOUT_CONNECT;
+	}
+	else if (strcmp(timeout_name, "server") == 0) {
 		if (!(px->cap & PR_CAP_BE)) {
 			memprintf(err, "'%s' has no backend capability", px->id);
 			return -1;
 		}
 		rule->arg.timeout.type = ACT_TIMEOUT_SERVER;
+	}
+	else if (strcmp(timeout_name, "queue") == 0) {
+		if (!(px->cap & PR_CAP_BE)) {
+			memprintf(err, "'%s' has no backend capability", px->id);
+			return -1;
+		}
+		rule->arg.timeout.type = ACT_TIMEOUT_QUEUE;
+	}
+	else if (strcmp(timeout_name, "tarpit") == 0) {
+		rule->arg.timeout.type = ACT_TIMEOUT_TARPIT;
 	}
 	else if (strcmp(timeout_name, "tunnel") == 0) {
 		if (!(px->cap & PR_CAP_BE)) {
@@ -211,7 +236,7 @@ int cfg_parse_rule_set_timeout(const char **args, int idx, struct act_rule *rule
 	}
 	else {
 		memprintf(err,
-		          "'set-timeout' rule supports 'server'/'tunnel'/'client' (got '%s')",
+		          "'set-timeout' rule supports 'client'/'connect'/'queue'/'server'/'tarpit'/'tunnel' (got '%s')",
 		          timeout_name);
 		return -1;
 	}
@@ -360,4 +385,25 @@ void dump_act_rules(const struct list *rules, const char *pfx)
 		printf("%s%s%s\n", pfx ? pfx : "", akwn->kw,
 		       (akwn->flags & KWF_MATCH_PREFIX) ? "*" : "");
 	}
+}
+
+/* adds the keyword list kw_list to the head <head> */
+void act_add_list(struct list *head, struct action_kw_list *kw_list)
+{
+	int i;
+
+	for (i = 0; kw_list->kw[i].kw != NULL; i++) {
+		/* store declaration file/line if known */
+		if (kw_list->kw[i].exec_ctx.type)
+			continue;
+
+		if (caller_initcall) {
+			kw_list->kw[i].exec_ctx.type = TH_EX_CTX_INITCALL;
+			kw_list->kw[i].exec_ctx.initcall = caller_initcall;
+		} else {
+			kw_list->kw[i].exec_ctx.type = TH_EX_CTX_ACTION;
+			kw_list->kw[i].exec_ctx.action_kwl = kw_list;
+		}
+	}
+	LIST_APPEND(head, &kw_list->list);
 }

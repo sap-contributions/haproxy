@@ -8,6 +8,7 @@
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_utils.h>
+#include <haproxy/stconn.h>
 
 /* trace source and events */
 static void qmux_trace(enum trace_level level, uint64_t mask,
@@ -143,24 +144,31 @@ static char *qcc_app_st_to_str(const enum qcc_app_st st)
 
 void qmux_dump_qcc_info(struct buffer *msg, const struct qcc *qcc)
 {
-	const struct quic_conn *qc = qcc->conn->handle.qc;
+	const struct quic_conn *qc = conn_is_quic(qcc->conn) ? qcc->conn->handle.qc : NULL;
 
 	chunk_appendf(msg, " qcc=%p(%c)", qcc, (qcc->flags & QC_CF_IS_BACK) ? 'B' : 'F');
-	if (qcc->conn->handle.qc)
+	if (qc)
 		chunk_appendf(msg, " qc=%p", qcc->conn->handle.qc);
-	chunk_appendf(msg, " .st=%s .sc=%llu .hreq=%llu .flg=0x%04x",
+	chunk_appendf(msg, " .st=%s .sc=%llu .hreq=%llu .flg=0x%04x .evts=%s",
 	              qcc_app_st_to_str(qcc->app_st), (ullong)qcc->nb_sc,
-	              (ullong)qcc->nb_hreq, qcc->flags);
+	              (ullong)qcc->nb_hreq, qcc->flags, tevt_evts2str(qcc->term_evts_log));
 
-	chunk_appendf(msg, " .tx=%llu %llu/%llu bwnd=%llu/%llu",
-	              (ullong)qcc->tx.fc.off_soft, (ullong)qcc->tx.fc.off_real, (ullong)qcc->tx.fc.limit,
-	              (ullong)qcc->tx.buf_in_flight, (ullong)qc->path->cwnd);
+	chunk_appendf(msg, " .tx=%llu %llu/%llu",
+	              (ullong)qcc->tx.fc.off_soft, (ullong)qcc->tx.fc.off_real, (ullong)qcc->tx.fc.limit);
+	if (qc)
+		chunk_appendf(msg, " bwnd=%llu/%llu", (ullong)qcc->tx.buf_in_flight, (ullong)qc->path->cwnd);
 }
 
 void qmux_dump_qcs_info(struct buffer *msg, const struct qcs *qcs)
 {
 	chunk_appendf(msg, " qcs=%p .id=%llu .st=%s .flg=0x%04x", qcs, (ullong)qcs->id,
 	              qcs_st_to_str(qcs->st), qcs->flags);
+
+	if (qcs->sd) {
+		chunk_appendf(msg, " .sd=%p", qcs->sd);
+		chunk_appendf(msg, "(.flg=0x%08x .evts=%s)",
+		              se_fl_get(qcs->sd), tevt_evts2str(qcs->sd->term_evts_log));
+	}
 
 	chunk_appendf(msg, " .rx=%llu/%llu rxb=%u(%u)",
 	              (ullong)qcs->rx.offset_max, (ullong)qcs->rx.msd,
@@ -169,8 +177,8 @@ void qmux_dump_qcs_info(struct buffer *msg, const struct qcs *qcs)
 	                                          (ullong)qcs->tx.fc.off_real,
 	                                          (ullong)qcs->tx.fc.limit);
 
-	if (qcs->stream)
-		bdata_ctr_print(msg, &qcs->stream->data, " buf=");
+	if (conn_is_quic(qcs->qcc->conn) && qcs->tx.stream)
+		bdata_ctr_print(msg, &qcs->tx.stream->data, " buf=");
 
 	chunk_appendf(msg, " .ti=%u/%u/%u",
 	              tot_time_read(&qcs->timer.base),

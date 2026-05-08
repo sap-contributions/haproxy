@@ -219,6 +219,7 @@ size_t EVP_PKEY_to_pub_jwk(EVP_PKEY *pkey, char *dst, size_t dsize)
 /*
  * Generate the JWS payload and converts it to base64url.
  * Use either <kid> or <jwk>, but won't use both
+ * <nonce> is optional.
  *
  * Return the size of the data or 0
  */
@@ -226,13 +227,14 @@ size_t EVP_PKEY_to_pub_jwk(EVP_PKEY *pkey, char *dst, size_t dsize)
 size_t jws_b64_protected(enum jwt_alg alg, char *kid, char *jwk, char *nonce, char *url,
                          char *dst, size_t dsize)
 {
-	char *acc;
-	char *acctype;
 	int ret = 0;
 	struct buffer *json = NULL;
 	const char *algstr;
 
 	switch (alg) {
+		case JWS_ALG_HS256: algstr = "HS256"; break;
+		case JWS_ALG_HS384: algstr = "HS384"; break;
+		case JWS_ALG_HS512: algstr = "HS512"; break;
 		case JWS_ALG_RS256: algstr = "RS256"; break;
 		case JWS_ALG_RS384: algstr = "RS384"; break;
 		case JWS_ALG_RS512: algstr = "RS512"; break;
@@ -246,24 +248,16 @@ size_t jws_b64_protected(enum jwt_alg alg, char *kid, char *jwk, char *nonce, ch
 	if ((json = alloc_trash_chunk()) == NULL)
 		goto out;
 
-	/* kid or jwk ? */
-	acc = kid ? kid : jwk;
-	acctype = kid ? "kid" : "jwk";
-
-	ret = snprintf(json->area, json->size, "{\n"
-			"    \"alg\": \"%s\",\n"
-			"    \"%s\":  %s%s%s,\n"
-			"    \"nonce\":   \"%s\",\n"
-			"    \"url\":   \"%s\"\n"
-			"}\n",
-			algstr, acctype, kid ? "\"" : "", acc, kid ? "\"" : "", nonce, url);
-	if (ret >= json->size) {
-		ret = 0;
-		goto out;
-	}
-
-
-	json->data = ret;
+	chunk_appendf(json, "{");
+	if (kid)
+		chunk_appendf(json, "\"kid\": \"%s\",", kid);
+	else
+		chunk_appendf(json, "\"jwk\": %s,", jwk);
+	if (nonce)
+		chunk_appendf(json, "\"nonce\": \"%s\",", nonce);
+	chunk_appendf(json, "\"alg\": \"%s\",", algstr);
+	chunk_appendf(json, "\"url\": \"%s\"", url);
+	chunk_appendf(json, "}");
 
 	ret = a2base64url(json->area, json->data, dst, dsize);
 out:
@@ -356,7 +350,7 @@ out:
  */
 size_t jws_b64_signature(EVP_PKEY *pkey, enum jwt_alg alg, char *b64protected, char *b64payload, char *dst, size_t dsize)
 {
-	EVP_MD_CTX *ctx;
+	EVP_MD_CTX *ctx = NULL;
 	const EVP_MD *evp_md = NULL;
 	int ret = 0;
 	struct buffer *sign = NULL;
@@ -417,7 +411,7 @@ size_t jws_b64_signature(EVP_PKEY *pkey, enum jwt_alg alg, char *b64protected, c
 
 
 	if (EVP_PKEY_base_id(pkey) == EVP_PKEY_EC) {
-		/* Convert the DigestSign output to an ECDSA_SIG (R and S parameters concatenatedi,
+		/* Convert the DigestSign output to an ECDSA_SIG (R and S parameters concatenated,
 		 * see section 3.4 of RFC7518), and output R and S padded.
 		 */
 		ECDSA_SIG *sig = NULL;
@@ -450,12 +444,59 @@ size_t jws_b64_signature(EVP_PKEY *pkey, enum jwt_alg alg, char *b64protected, c
 	ret = a2base64url(sign->area, sign->data, dst, dsize);
 
 out:
+	EVP_MD_CTX_free(ctx);
 	free_trash_chunk(sign);
 
 	if (ret > 0)
 		return ret;
 	return 0;
 }
+
+
+/*
+ * Generate a JWS HMAC signature using the base64url protected buffer and the base64url payload buffer
+ *
+ * Return the size of the data or 0
+ */
+size_t jws_b64_hmac_signature(char *key, size_t key_len, enum jwt_alg alg, char *b64protected, char *b64payload, char *dst, size_t dsize)
+{
+	const EVP_MD *evp_alg = NULL;
+	int ret = 0;
+	unsigned char mac[EVP_MAX_MD_SIZE] = {};
+	unsigned int mac_len = 0;
+	struct buffer *sig_data = NULL;
+
+	if ((sig_data = alloc_trash_chunk()) == NULL)
+		goto out;
+
+	switch (alg) {
+		case JWS_ALG_HS256: evp_alg = EVP_sha256(); break;
+		case JWS_ALG_HS384: evp_alg = EVP_sha384(); break;
+		case JWS_ALG_HS512: evp_alg = EVP_sha512(); break;
+		default:
+			goto out;
+	}
+
+	if (!chunk_memcat(sig_data, b64protected, strlen(b64protected)) ||
+	    !chunk_memcat(sig_data, ".", 1) ||
+	    !chunk_memcat(sig_data, b64payload, strlen(b64payload)))
+		goto out;
+
+	if (HMAC(evp_alg, key, (int)key_len,
+	         (unsigned char*)sig_data->area, sig_data->data,
+	         mac, &mac_len) == NULL)
+		goto out;
+
+	ret = a2base64url((const char *)mac, mac_len, dst, dsize);
+
+out:
+	free_trash_chunk(sig_data);
+
+	if (ret > 0)
+		return ret;
+	return 0;
+}
+
 
 /*
  * Fill a <dst> buffer of <dsize> size with a jwk thumbprint from a pkey

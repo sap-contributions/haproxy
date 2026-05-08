@@ -467,6 +467,9 @@ static int spoe_handle_receiving_frame_appctx(struct appctx *appctx)
 		goto end;
 	}
 
+	if (!spoe_acquire_buffer(&spoe_ctx->buffer, &spoe_ctx->buffer_wait))
+		goto end;
+
 	if (b_data(&appctx->inbuf) > spoe_appctx->agent->max_frame_size) {
 		spoe_ctx->state = SPOE_CTX_ST_ERROR;
 		spoe_ctx->status_code = (spoe_appctx->status_code + 0x100);
@@ -513,8 +516,11 @@ static void spoe_handle_appctx(struct appctx *appctx)
 				appctx->st0 = SPOE_APPCTX_ST_END;
 				applet_set_error(appctx);
 			}
-			else if (!spoe_handle_receiving_frame_appctx(appctx))
-				break;
+			else {
+				SPOE_APPCTX(appctx)->spoe_ctx->state = SPOE_CTX_ST_WAITING_ACK;
+				if (!spoe_handle_receiving_frame_appctx(appctx))
+					break;
+			}
 			goto switchstate;
 
 		case SPOE_APPCTX_ST_EXIT:
@@ -1106,6 +1112,16 @@ static int spoe_process_event(struct stream *s, struct spoe_context *ctx,
 				 agent->id, spoe_event_str[ev], s->uniq_id, ctx->status_code, ctx->stats.t_process,
 				 agent->counters.nb_errors, agent->counters.nb_processed);
 	}
+	else if (ret == 0) {
+		if ((s->scf->flags & SC_FL_ERROR) ||
+		    ((s->scf->flags & SC_FL_EOS) && proxy_abrt_close_def(s->be, 1))) {
+			ctx->status_code = SPOE_CTX_ERR_INTERRUPT;
+			spoe_stop_processing(agent, ctx);
+			spoe_handle_processing_error(s, agent, ctx, dir);
+			ret = 1;
+		}
+	}
+
 	return ret;
 }
 

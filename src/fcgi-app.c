@@ -221,7 +221,8 @@ static int fcgi_flt_check(struct proxy *px, struct flt_conf *fconf)
 	}
 
 	list_for_each_entry(f, &px->filter_configs, list) {
-		if (f->id == http_comp_flt_id || f->id == cache_store_flt_id)
+		if (f->id == http_comp_req_flt_id || f->id == http_comp_res_flt_id ||
+		    f->id == cache_store_flt_id)
 			continue;
 		else if ((f->id == fconf->id) && f->conf != fcgi_conf) {
 			ha_alert("proxy '%s' : only one fcgi-app supported per backend.\n",
@@ -330,12 +331,12 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 			get_gmtime(date.tv_sec, &tm);
 			trash.data = strftime(trash.area, trash.size, "%a, %d %b %Y %T %Z", &tm);
 			if (trash.data)
-				http_add_header(htx, ist("date"), ist2(trash.area, trash.data));
+				http_add_header(htx, ist("date"), ist2(trash.area, trash.data), 0);
 		}
 
 		/* Add the header "Content-Length:" if possible */
 		sl = http_get_stline(htx);
-		if (s->txn->meth != HTTP_METH_HEAD && sl &&
+		if (s->txn.http->meth != HTTP_METH_HEAD && sl &&
 		    (msg->flags & (HTTP_MSGF_XFER_LEN|HTTP_MSGF_CNT_LEN|HTTP_MSGF_TE_CHNK)) == HTTP_MSGF_XFER_LEN &&
 		    (htx->flags & HTX_FL_EOM)) {
 			struct htx_blk * blk;
@@ -351,7 +352,7 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 					len += htx_get_blksz(blk);
 			}
 			end = ultoa_o(len, trash.area, trash.size);
-			if (http_add_header(htx, ist("content-length"), ist2(trash.area, end-trash.area))) {
+			if (http_add_header(htx, ist("content-length"), ist2(trash.area, end-trash.area), 0)) {
 				sl->flags |= HTX_SL_F_CLEN;
 				msg->flags |= HTTP_MSGF_CNT_LEN;
 			}
@@ -423,7 +424,7 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 			pool_free(pool_head_fcgi_param_rule, param_rule);
 			continue;
 		}
-		if (!http_add_header(htx, param_rule->name, ist2(value->area, value->data)))
+		if (!http_add_header(htx, param_rule->name, ist2(value->area, value->data), 1))
 			goto rewrite_err;
 		pool_free(pool_head_fcgi_param_rule, param_rule);
 	}

@@ -30,6 +30,7 @@
 #include <import/eb64tree.h>
 #include <import/ebmbtree.h>
 
+#include <haproxy/counters.h>
 #include <haproxy/chunk.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/ncbmbuf.h>
@@ -83,7 +84,7 @@ void qc_check_close_on_released_mux(struct quic_conn *qc);
 int quic_stateless_reset_token_cpy(unsigned char *pos, size_t len,
                                    const unsigned char *salt, size_t saltlen);
 int quic_reuse_srv_params(struct quic_conn *qc,
-                          const unsigned char *alpn,
+                          const char *alpn,
                           const struct quic_early_transport_params *etps);
 
 /* Returns true if <qc> is used on the backed side (as a client). */
@@ -193,13 +194,17 @@ static inline void *qc_counters(enum obj_type *o, const struct stats_module *m)
 	p = l ? l->bind_conf->frontend :
 		s ? s->proxy : NULL;
 
-	return p ? EXTRA_COUNTERS_GET(p->extra_counters_fe, m) : NULL;
+	if (l && p)
+		return EXTRA_COUNTERS_GET(p->extra_counters_fe, m);
+	else if (s && p)
+		return EXTRA_COUNTERS_GET(p->extra_counters_be, m);
+	return NULL;
 }
 
 void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 void quic_set_connection_close(struct quic_conn *qc, const struct quic_err err);
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
-int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
+int qc_register_alpn(struct quic_conn *qc, const char *alpn, int alpn_len);
 int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len);
 
 void qc_notify_err(struct quic_conn *qc);

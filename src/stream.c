@@ -50,7 +50,6 @@
 #include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/session.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stick_table.h>
 #include <haproxy/stream.h>
@@ -344,7 +343,7 @@ int stream_buf_available(void *arg)
  * transfer to the stream and <input> is set to BUF_NULL. On error, <input>
  * buffer is unchanged and it is the caller responsibility to release it.
  */
-struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer *input)
+void *stream_new(struct session *sess, struct stconn *sc, struct buffer *input)
 {
 	struct stream *s;
 	struct task *t;
@@ -426,8 +425,6 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->lat_time = s->cpu_time = 0;
 	s->call_rate.curr_tick = s->call_rate.curr_ctr = s->call_rate.prev_ctr = 0;
 	s->passes_connect = s->passes_stconn = s->passes_reqana = s->passes_resana = s->passes_propag = 0;
-	s->pcli_next_pid = 0;
-	s->pcli_flags = 0;
 	s->unique_id = IST_NULL;
 	s->parent = NULL;
 	if ((t = task_new_here()) == NULL)
@@ -547,7 +544,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->scb->ioto = TICK_ETERNITY;
 	s->res.analyse_exp = TICK_ETERNITY;
 
-	s->txn = NULL;
+	s->txn.http = NULL;
 	s->hlua[0] = s->hlua[1] = NULL;
 
 	s->resolv_ctx.requester = NULL;
@@ -555,6 +552,9 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->resolv_ctx.hostname_dn_len = 0;
 	s->resolv_ctx.parent = NULL;
 
+	s->connect_timeout = TICK_ETERNITY;
+	s->queue_timeout = TICK_ETERNITY;
+	s->tarpit_timeout = TICK_ETERNITY;
 	s->tunnel_timeout = TICK_ETERNITY;
 
 	LIST_APPEND(&th_ctx->streams, &s->list);
@@ -658,11 +658,17 @@ void stream_free(struct stream *s)
 	b_dequeue(&s->buffer_wait);
 
 	if (s->req.buf.size || s->res.buf.size) {
-		int count = !!s->req.buf.size + !!s->res.buf.size;
+		int count = 0;
+
+		if (b_is_default(&s->req.buf))
+			count++;
+		if (b_is_default(&s->res.buf))
+			count++;
 
 		b_free(&s->req.buf);
 		b_free(&s->res.buf);
-		offer_buffers(NULL, count);
+		if (count)
+			offer_buffers(NULL, count);
 	}
 
 	pool_free(pool_head_uniqueid, s->unique_id.ptr);
@@ -675,8 +681,10 @@ void stream_free(struct stream *s)
 	hlua_ctx_destroy(s->hlua[1]);
 	s->hlua[0] = s->hlua[1] = NULL;
 
-	if (s->txn)
+	if ((s->flags & SF_TXN_MASK) == SF_TXN_HTTP)
 		http_destroy_txn(s);
+	else if ((s->flags & SF_TXN_MASK) == SF_TXN_PCLI)
+		pcli_destroy_txn(s);
 
 	/* ensure the client-side transport layer is destroyed */
 	/* Be sure it is useless !! */
@@ -764,7 +772,9 @@ void stream_free(struct stream *s)
 	/* We may want to free the maximum amount of pools if the proxy is stopping */
 	if (fe && unlikely(fe->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
 		pool_flush(pool_head_buffer);
+		pool_flush(pool_head_large_buffer);
 		pool_flush(pool_head_http_txn);
+		pool_flush(pool_head_pcli_txn);
 		pool_flush(pool_head_requri);
 		pool_flush(pool_head_capture);
 		pool_flush(pool_head_stream);
@@ -807,11 +817,13 @@ void stream_release_buffers(struct stream *s)
 	int offer = 0;
 
 	if (c_size(&s->req) && c_empty(&s->req)) {
-		offer++;
+		if (b_is_default(&s->req.buf))
+			offer++;
 		b_free(&s->req.buf);
 	}
 	if (c_size(&s->res) && c_empty(&s->res)) {
-		offer++;
+		if (b_is_default(&s->res.buf))
+			offer++;
 		b_free(&s->res.buf);
 	}
 
@@ -940,8 +952,20 @@ int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout
 		s->scf->ioto = timeout;
 		return 1;
 
+	case ACT_TIMEOUT_CONNECT:
+		s->connect_timeout = timeout;
+		return 1;
+
+	case ACT_TIMEOUT_QUEUE:
+		s->queue_timeout = timeout;
+		return 1;
+
 	case ACT_TIMEOUT_SERVER:
 		s->scb->ioto = timeout;
+		return 1;
+
+	case ACT_TIMEOUT_TARPIT:
+		s->tarpit_timeout = timeout;
 		return 1;
 
 	case ACT_TIMEOUT_TUNNEL:
@@ -1094,10 +1118,8 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 			return ACT_RET_ERR;
 
 		/* Finish initialisation of the context. */
-		s->current_rule = rule;
 		if (appctx_init(appctx) == -1)
 			return ACT_RET_ERR;
-		s->current_rule = NULL;
 	}
 	else
 		appctx = __sc_appctx(s->scb);
@@ -1117,12 +1139,12 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 	return ACT_RET_STOP;
 }
 
-/* Parses persist-rules attached to <fe> frontend and report the first macthing
+/* Parses persist-rules attached to <fe> frontend and report the first matching
  * entry, using <sess> session and <s> stream as sample source.
  *
  * As this function is called several times in the same stream context,
  * <persist> will act as a caching value to avoid reprocessing of a similar
- * ruleset. It must be set to a negative value for the first invokation.
+ * ruleset. It must be set to a negative value for the first invocation.
  *
  * Returns 1 if a rule matches, else 0.
  */
@@ -1239,6 +1261,10 @@ static int process_switching_rules(struct stream *s, struct channel *req, int an
 	/* Se the max connection retries for the stream. may be overwritten later */
 	s->max_retries = s->be->conn_retries;
 
+	/* Set the queue and connect timeouts. May be overwritten later */
+	s->connect_timeout = s->be->timeout.connect;
+	s->queue_timeout = s->be->timeout.queue;
+
 	/* we don't want to run the TCP or HTTP filters again if the backend has not changed */
 	if (fe == s->be) {
 		s->req.analysers &= ~AN_REQ_INSPECT_BE;
@@ -1274,8 +1300,8 @@ static int process_switching_rules(struct stream *s, struct channel *req, int an
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= SF_FINST_R;
 
-	if (s->txn)
-		s->txn->status = 500;
+	if ((s->flags & SF_TXN_MASK) == SF_TXN_HTTP)
+		s->txn.http->status = 500;
 	s->req.analysers &= AN_REQ_FLT_END;
 	s->req.analyse_exp = TICK_ETERNITY;
 	DBG_TRACE_DEVEL("leaving on error", STRM_EV_STRM_ANA|STRM_EV_STRM_ERR, s);
@@ -1569,7 +1595,7 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
 
 	s->req.analysers |= AN_REQ_WAIT_HTTP|AN_REQ_HTTP_PROCESS_FE;
 
-	if (unlikely(!s->txn && !http_create_txn(s)))
+	if (unlikely((s->flags & SF_TXN_MASK) != SF_TXN_HTTP && !http_create_txn(s)))
 		return 0;
 
 	conn = sc_conn(sc);
@@ -1828,6 +1854,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	struct channel *req, *res;
 	struct stconn *scf, *scb;
 	unsigned int rate;
+	unsigned int scf_send_cnt, scb_send_cnt;
 
 	activity[tid].stream_calls++;
 	stream_cond_update_cpu_latency(s);
@@ -1855,6 +1882,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	/* Keep a copy of SC flags */
 	scf_flags = scf->flags;
 	scb_flags = scb->flags;
+	scf_send_cnt = scb_send_cnt = 0;
 
 	/* update pending events */
 	s->pending_events |= stream_map_task_state(state);
@@ -1866,6 +1894,10 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 					 (s->pending_events & STRM_EVT_SHUT_SRV_UP) ? SF_ERR_UP:
 					 SF_ERR_KILLED));
 	}
+
+	/* we're starting to work with this endpoint, let's flag it */
+	if (unlikely(!sc_ep_test(scf, SE_FL_APP_STARTED)))
+		sc_ep_set(scf, SE_FL_APP_STARTED);
 
 	/* First, attempt to receive pending data from I/O layers */
 	sc_sync_recv(scf);
@@ -1882,8 +1914,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	}
 
 	/* this data may be no longer valid, clear it */
-	if (s->txn)
-		memset(&s->txn->auth, 0, sizeof(s->txn->auth));
+	if ((s->flags & SF_TXN_MASK) == SF_TXN_HTTP)
+		memset(&s->txn.http->auth, 0, sizeof(s->txn.http->auth));
 
 	/* 1a: Check for low level timeouts if needed. We just set a flag on
 	 * stream connectors when their timeouts have expired.
@@ -2429,8 +2461,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				s->conn_retries = 0;
 				if ((s->be->retry_type &~ PR_RE_CONN_FAILED) &&
 				    (s->be->mode == PR_MODE_HTTP) &&
-				    !(s->txn->flags & TX_D_L7_RETRY))
-					s->txn->flags |= TX_L7_RETRY;
+				    !(s->txn.http->flags & TX_D_L7_RETRY))
+					s->txn.http->flags |= TX_L7_RETRY;
 
 				if (proxy_abrt_close(s->be)) {
 					struct connection *conn = sc_conn(scf);
@@ -2484,11 +2516,34 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			srv = objt_server(s->target);
 			if (scb->state == SC_ST_ASS && srv && srv->rdr_len && (s->flags & SF_REDIRECTABLE))
 				http_perform_server_redirect(s, scb);
+
+			if (unlikely((s->be->options2 & PR_O2_USE_SBUF_QUEUE) && scb->state == SC_ST_QUE)) {
+				struct buffer sbuf = BUF_NULL;
+
+				if (IS_HTX_STRM(s)) {
+					if (!htx_move_to_small_buffer(&sbuf, &req->buf))
+						break;
+				}
+				else {
+					if (b_size(&req->buf) == global.tune.bufsize_small ||
+					    b_data(&req->buf) > global.tune.bufsize_small)
+						break;
+					if (!b_alloc_small(&sbuf))
+						break;
+					b_xfer(&sbuf, &req->buf, b_data(&req->buf));
+				}
+
+				b_free(&req->buf);
+				offer_buffers(s, 1);
+				req->buf = sbuf;
+				DBG_TRACE_DEVEL("request moved to a small buffer", STRM_EV_STRM_PROC, s);
+			}
+
 		} while (scb->state == SC_ST_ASS);
 	}
 
 	/* Let's see if we can send the pending request now */
-	sc_sync_send(scb);
+	sc_sync_send(scb, scb_send_cnt++);
 
 	/*
 	 * Now forward all shutdown requests between both sides of the request buffer
@@ -2598,7 +2653,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	scf_flags = (scf_flags & ~(SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) | (scf->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED));
 
 	/* Let's see if we can send the pending response now */
-	sc_sync_send(scf);
+	sc_sync_send(scf, scf_send_cnt++);
 
 	/*
 	 * Now forward all shutdown requests between both sides of the buffer
@@ -2720,10 +2775,10 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 		stream_process_counters(s);
 
-		if (s->txn && s->txn->status) {
+		if ((s->flags & SF_TXN_MASK) == SF_TXN_HTTP && s->txn.http->status) {
 			int n;
 
-			n = s->txn->status / 100;
+			n = s->txn.http->status / 100;
 			if (n < 1 || n > 5)
 				n = 0;
 
@@ -2807,10 +2862,10 @@ void stream_update_time_stats(struct stream *s)
 		swrate_add_dynamic(&srv->counters.c_time, samples_window, t_connect);
 		swrate_add_dynamic(&srv->counters.d_time, samples_window, t_data);
 		swrate_add_dynamic(&srv->counters.t_time, samples_window, t_close);
-		HA_ATOMIC_UPDATE_MAX(&srv->counters.qtime_max, t_queue);
-		HA_ATOMIC_UPDATE_MAX(&srv->counters.ctime_max, t_connect);
-		HA_ATOMIC_UPDATE_MAX(&srv->counters.dtime_max, t_data);
-		HA_ATOMIC_UPDATE_MAX(&srv->counters.ttime_max, t_close);
+		COUNTERS_UPDATE_MAX(&srv->counters.qtime_max, t_queue);
+		COUNTERS_UPDATE_MAX(&srv->counters.ctime_max, t_connect);
+		COUNTERS_UPDATE_MAX(&srv->counters.dtime_max, t_data);
+		COUNTERS_UPDATE_MAX(&srv->counters.ttime_max, t_close);
 	}
 	if (s->be_tgcounters)
 		samples_window = (((s->be->mode == PR_MODE_HTTP) ?
@@ -2821,10 +2876,10 @@ void stream_update_time_stats(struct stream *s)
 	swrate_add_dynamic(&s->be->be_counters.c_time, samples_window, t_connect);
 	swrate_add_dynamic(&s->be->be_counters.d_time, samples_window, t_data);
 	swrate_add_dynamic(&s->be->be_counters.t_time, samples_window, t_close);
-	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.qtime_max, t_queue);
-	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.ctime_max, t_connect);
-	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.dtime_max, t_data);
-	HA_ATOMIC_UPDATE_MAX(&s->be->be_counters.ttime_max, t_close);
+	COUNTERS_UPDATE_MAX(&s->be->be_counters.qtime_max, t_queue);
+	COUNTERS_UPDATE_MAX(&s->be->be_counters.ctime_max, t_connect);
+	COUNTERS_UPDATE_MAX(&s->be->be_counters.dtime_max, t_data);
+	COUNTERS_UPDATE_MAX(&s->be->be_counters.ttime_max, t_close);
 }
 
 /*
@@ -2876,15 +2931,15 @@ void sess_change_server(struct stream *strm, struct server *newsrv)
 		stream_del_srv_conn(strm);
 		_HA_ATOMIC_DEC(&oldsrv->served);
 		__ha_barrier_atomic_store();
-		if (oldsrv->proxy->lbprm.server_drop_conn)
-			oldsrv->proxy->lbprm.server_drop_conn(oldsrv);
+		if (oldsrv->proxy->lbprm.ops && oldsrv->proxy->lbprm.ops->server_drop_conn)
+			oldsrv->proxy->lbprm.ops->server_drop_conn(oldsrv);
 	}
 
 	if (newsrv) {
 		_HA_ATOMIC_INC(&newsrv->proxy->served);
 		__ha_barrier_atomic_store();
-		if (newsrv->proxy->lbprm.server_take_conn)
-			newsrv->proxy->lbprm.server_take_conn(newsrv);
+		if (newsrv->proxy->lbprm.ops && newsrv->proxy->lbprm.ops->server_take_conn)
+			newsrv->proxy->lbprm.ops->server_take_conn(newsrv);
 		stream_add_srv_conn(strm, newsrv);
 	}
 }
@@ -3028,32 +3083,6 @@ static void init_stream()
 		LIST_INIT(&ha_thread_ctx[thr].streams);
 }
 INITCALL0(STG_INIT, init_stream);
-
-/* Generates a unique ID based on the given <format>, stores it in the given <strm> and
- * returns the unique ID.
- *
- * If this function fails to allocate memory IST_NULL is returned.
- *
- * If an ID is already stored within the stream nothing happens existing unique ID is
- * returned.
- */
-struct ist stream_generate_unique_id(struct stream *strm, struct lf_expr *format)
-{
-	if (isttest(strm->unique_id)) {
-		return strm->unique_id;
-	}
-	else {
-		char *unique_id;
-
-		if ((unique_id = pool_alloc(pool_head_uniqueid)) == NULL)
-			return IST_NULL;
-
-		strm->unique_id = ist2(unique_id, 0);
-		strm->unique_id.len = build_logline(strm, unique_id, UNIQUEID_LEN, format);
-
-		return strm->unique_id;
-	}
-}
 
 /************************************************************************/
 /*           All supported ACL keywords must be declared here.          */
@@ -3239,7 +3268,7 @@ static int check_tcp_switch_stream_mode(struct act_rule *rule, struct proxy *px,
 		px->options |= PR_O_HTTP_UPG;
 
 	if (mux_proto) {
-		mux_ent = conn_get_best_mux_entry(mux_proto->token, PROTO_SIDE_FE, mode);
+		mux_ent = conn_get_best_mux_entry(mux_proto->token, PROTO_SIDE_FE, 0, mode);
 		if (!mux_ent || !isteq(mux_ent->token, mux_proto->token)) {
 			memprintf(err, "MUX protocol '%.*s' is not compatible with the selected mode",
 				  (int)mux_proto->token.len, mux_proto->token.ptr);
@@ -3247,7 +3276,7 @@ static int check_tcp_switch_stream_mode(struct act_rule *rule, struct proxy *px,
 		}
 	}
 	else {
-		mux_ent = conn_get_best_mux_entry(IST_NULL, PROTO_SIDE_FE, mode);
+		mux_ent = conn_get_best_mux_entry(IST_NULL, PROTO_SIDE_FE, 0, mode);
 		if (!mux_ent) {
 			memprintf(err, "Unable to find compatible MUX protocol with the selected mode");
 			return 0;
@@ -3353,7 +3382,7 @@ static enum act_parse_ret stream_parse_use_service(const char **args, int *cur_a
 
 void service_keywords_register(struct action_kw_list *kw_list)
 {
-	LIST_APPEND(&service_keywords, &kw_list->list);
+	act_add_list(&service_keywords, kw_list);
 }
 
 struct action_kw *service_find(const char *kw)
@@ -3599,14 +3628,17 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 		      " age=%s)\n",
 		      human_time(ns_to_sec(now_ns) - ns_to_sec(request_ts), 1));
 
-	if (strm->txn) {
+	if ((strm->flags & SF_TXN_MASK) == SF_TXN_HTTP) {
 		chunk_appendf(buf,
 		      "%s  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s req.f=0x%02x rsp.f=0x%02x", pfx,
-		      strm->txn, strm->txn->flags, strm->txn->meth, strm->txn->status,
-		      h1_msg_state_str(strm->txn->req.msg_state), h1_msg_state_str(strm->txn->rsp.msg_state),
-		      strm->txn->req.flags, strm->txn->rsp.flags);
-		if (ctx && (ctx->flags & CLI_SHOWSESS_F_DUMP_URI) && strm->txn->uri)
-			chunk_appendf(buf, " uri=\"%s\"", HA_ANON_STR(anon_key, strm->txn->uri));
+		      strm->txn.http, strm->txn.http->flags,
+		      strm->txn.http->meth, strm->txn.http->status,
+		      h1_msg_state_str(strm->txn.http->req.msg_state),
+		      h1_msg_state_str(strm->txn.http->rsp.msg_state),
+		      strm->txn.http->req.flags, strm->txn.http->rsp.flags);
+		if (ctx && (ctx->flags & CLI_SHOWSESS_F_DUMP_URI) && strm->txn.http->uri)
+			chunk_appendf(buf, " uri=\"%s\"",
+				      HA_ANON_STR(anon_key, strm->txn.http->uri));
 		chunk_memcat(buf, "\n", 1);
 	}
 
@@ -3643,12 +3675,11 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 		}
 
 		chunk_appendf(buf,
-		              "%s      co0=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n", pfx,
+		              "%s      co0=%p ctrl=%s xprt=%s mux=%s target=%s:%p\n", pfx,
 			      conn,
 			      conn_get_ctrl_name(conn),
 			      conn_get_xprt_name(conn),
 			      conn_get_mux_name(conn),
-			      sc_get_data_name(scf),
 		              obj_type_name(conn->target),
 		              obj_base_ptr(conn->target));
 
@@ -3705,12 +3736,11 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 		}
 
 		chunk_appendf(buf,
-		              "%s      co1=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n", pfx,
+		              "%s      co1=%p ctrl=%s xprt=%s mux=%s target=%s:%p\n", pfx,
 			      conn,
 			      conn_get_ctrl_name(conn),
 			      conn_get_xprt_name(conn),
 			      conn_get_mux_name(conn),
-			      sc_get_data_name(scb),
 		              obj_type_name(conn->target),
 		              obj_base_ptr(conn->target));
 
@@ -3771,11 +3801,12 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 			      htx, htx->flags, htx->size, htx->data, htx_nbblks(htx),
 			      (htx->tail >= htx->head) ? "NO" : "YES");
 	}
-	if (HAS_FILTERS(strm) && strm->strm_flt.current[0]) {
-		const struct filter *flt = strm->strm_flt.current[0];
+	if (HAS_FILTERS(strm) && strm->req.flt.current) {
+		const struct filter *flt = strm->req.flt.current;
 
-		chunk_appendf(buf, "%s      current_filter=%p (id=\"%s\" flags=0x%x pre=0x%x post=0x%x) \n", pfx,
-			      flt, flt->config->id, flt->flags, flt->pre_analyzers, flt->post_analyzers);
+		chunk_appendf(buf, "%s      current_filter=%p (id=\"%s\" flags=0x%x pre=0x%x post=0x%x %s) \n", pfx,
+			      flt, flt->config->id, flt->flags, flt->pre_analyzers, flt->post_analyzers,
+			      (flt == strm->waiting_entity.ptr) ? "YIELDING" : "RUNNING");
 	}
 
 	chunk_appendf(buf,
@@ -3804,16 +3835,19 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 			      (htx->tail >= htx->head) ? "NO" : "YES");
 	}
 
-	if (HAS_FILTERS(strm) && strm->strm_flt.current[1]) {
-		const struct filter *flt = strm->strm_flt.current[1];
+	if (HAS_FILTERS(strm) && strm->res.flt.current) {
+		const struct filter *flt = strm->res.flt.current;
 
-		chunk_appendf(buf, "%s      current_filter=%p (id=\"%s\" flags=0x%x pre=0x%x post=0x%x) \n", pfx,
-			      flt, flt->config->id, flt->flags, flt->pre_analyzers, flt->post_analyzers);
+		chunk_appendf(buf, "%s      current_filter=%p (id=\"%s\" flags=0x%x pre=0x%x post=0x%x %s) \n", pfx,
+			      flt, flt->config->id, flt->flags, flt->pre_analyzers, flt->post_analyzers,
+			      (flt == strm->waiting_entity.ptr) ? "YIELDING" : "RUNNING");
 	}
 
 	if (strm->current_rule_list && strm->current_rule) {
 		const struct act_rule *rule = strm->current_rule;
-		chunk_appendf(buf, "%s  current_rule=\"%s\" [%s:%d]\n", pfx, rule->kw->kw, rule->conf.file, rule->conf.line);
+		chunk_appendf(buf, "%s  current_rule=\"%s\" [%s:%d] (%s)\n",
+			      pfx, rule->kw ? rule->kw->kw : "?", rule->conf.file, rule->conf.line,
+			      (rule == strm->waiting_entity.ptr) ? "YIELDING" : "RUNNING");
 	}
 }
 
@@ -4204,8 +4238,11 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		if (task_in_rq(curr_strm->task))
 			chunk_appendf(&trash, " run(nice=%d)", curr_strm->task->nice);
 
-		if ((ctx->flags & CLI_SHOWSESS_F_DUMP_URI) && curr_strm->txn && curr_strm->txn->uri)
-			chunk_appendf(&trash, " uri=\"%s\"", HA_ANON_CLI(curr_strm->txn->uri));
+		if ((ctx->flags & CLI_SHOWSESS_F_DUMP_URI) &&
+		    (curr_strm->flags & SF_TXN_MASK) == SF_TXN_HTTP &&
+		    curr_strm->txn.http->uri)
+			chunk_appendf(&trash, " uri=\"%s\"",
+				      HA_ANON_CLI(curr_strm->txn.http->uri));
 
 		chunk_appendf(&trash, "\n");
 
@@ -4372,6 +4409,17 @@ static struct action_kw_list stream_http_after_res_actions =  { ILH, {
 
 INITCALL1(STG_REGISTER, http_after_res_keywords_register, &stream_http_after_res_actions);
 
+static int smp_fetch_cur_connect_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	if (!smp->strm)
+		return 0;
+
+	smp->data.u.sint = TICKS_TO_MS(smp->strm->connect_timeout);
+	return 1;
+}
+
 static int smp_fetch_cur_client_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
 {
 	smp->flags = SMP_F_VOL_TXN;
@@ -4391,6 +4439,34 @@ static int smp_fetch_cur_server_timeout(const struct arg *args, struct sample *s
 		return 0;
 
 	smp->data.u.sint = TICKS_TO_MS(smp->strm->scb->ioto);
+	return 1;
+}
+
+static int smp_fetch_cur_queue_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	if (!smp->strm)
+		return 0;
+
+	smp->data.u.sint = TICKS_TO_MS(smp->strm->queue_timeout);
+	return 1;
+}
+
+static int smp_fetch_cur_tarpit_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	if (!smp->strm)
+		return 0;
+
+	if (smp->strm->tarpit_timeout)
+		smp->data.u.sint = TICKS_TO_MS(smp->strm->tarpit_timeout);
+	else if (smp->strm->be)
+		smp->data.u.sint = TICKS_TO_MS(smp->strm->be->timeout.tarpit);
+	else
+		smp->data.u.sint = TICKS_TO_MS(smp->sess->fe->timeout.tarpit);
+
 	return 1;
 }
 
@@ -4598,8 +4674,11 @@ static int smp_fetch_redispatched(const struct arg *args, struct sample *smp, co
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
+	{ "cur_connect_timeout",smp_fetch_cur_connect_timeout,0, NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "cur_client_timeout", smp_fetch_cur_client_timeout, 0, NULL, SMP_T_SINT, SMP_USE_FTEND, },
 	{ "cur_server_timeout", smp_fetch_cur_server_timeout, 0, NULL, SMP_T_SINT, SMP_USE_BKEND, },
+	{ "cur_queue_timeout",  smp_fetch_cur_queue_timeout,  0, NULL, SMP_T_SINT, SMP_USE_BKEND, },
+	{ "cur_tarpit_timeout", smp_fetch_cur_tarpit_timeout, 0, NULL, SMP_T_SINT, SMP_USE_FTEND | SMP_USE_BKEND, },
 	{ "cur_tunnel_timeout", smp_fetch_cur_tunnel_timeout, 0, NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "last_entity",        smp_fetch_last_entity,        0, NULL, SMP_T_STR,  SMP_USE_INTRN, },
 	{ "last_rule_file",     smp_fetch_last_rule_file,     0, NULL, SMP_T_STR,  SMP_USE_INTRN, },

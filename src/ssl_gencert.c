@@ -92,14 +92,15 @@ static SSL_CTX *ssl_sock_do_create_cert(const char *servername, struct bind_conf
 	EVP_PKEY     *pkey    = NULL;
 	SSL          *tmp_ssl = NULL;
 	CONF         *ctmp    = NULL;
-	X509_NAME    *name;
+	__X509_NAME_CONST__ X509_NAME *name;
+	X509_NAME    *subject = NULL;
 	const EVP_MD *digest;
 	X509V3_CTX    ctx;
 	unsigned int  i;
 	int 	      key_type;
 	struct sni_ctx *sni_ctx;
 
-	sni_ctx = ssl_sock_chose_sni_ctx(bind_conf, NULL, "", 1, 1);
+	sni_ctx = ssl_sock_choose_sni_ctx(bind_conf, NULL, "", 1, 1);
 	if (!sni_ctx)
 		goto mkcert_error;
 
@@ -140,21 +141,21 @@ static SSL_CTX *ssl_sock_do_create_cert(const char *servername, struct bind_conf
 		goto mkcert_error;
 
 	/* Set the subject name using the same, but the CN */
-	name = X509_NAME_dup(name);
+	subject = X509_NAME_dup(name);
 
 	if (strlen(servername) <= 64) {
-		if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+		if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
 		                              (const unsigned char *)servername,
 		                              -1, -1, 0) != 1) {
-			X509_NAME_free(name);
+			X509_NAME_free(subject);
 			goto mkcert_error;
 		}
 	}
-	if (X509_set_subject_name(newcrt, name) != 1) {
-		X509_NAME_free(name);
+	if (X509_set_subject_name(newcrt, subject) != 1) {
+		X509_NAME_free(subject);
 		goto mkcert_error;
 	}
-	X509_NAME_free(name);
+	X509_NAME_free(subject);
 
 	/* Add x509v3 extensions as specified */
 	ctmp = NCONF_new(NULL);
@@ -475,5 +476,115 @@ static void __ssl_gencert_deinit(void)
 	}
 #endif
 }
+
+/* Return a new Generated private key of type <keytype> with <bits> and <curves> */
+EVP_PKEY *ssl_gen_EVP_PKEY(int keytype, int curves, int bits, char **errmsg)
+{
+
+	EVP_PKEY_CTX *pkey_ctx = NULL;
+	EVP_PKEY *pkey = NULL;
+
+	if ((pkey_ctx = EVP_PKEY_CTX_new_id(keytype, NULL)) == NULL) {
+		memprintf(errmsg, "%sCan't generate a private key.\n", errmsg && *errmsg ? *errmsg : "");
+		goto err;
+	}
+
+	if (EVP_PKEY_keygen_init(pkey_ctx) <= 0) {
+		memprintf(errmsg, "%sCan't generate a private key.\n", errmsg && *errmsg ? *errmsg : "");
+		goto err;
+	}
+
+	if (keytype == EVP_PKEY_EC) {
+		if (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pkey_ctx, curves) <= 0) {
+			memprintf(errmsg, "%sCan't set the curves on the new private key.\n", errmsg && *errmsg ? *errmsg : "");
+			goto err;
+		}
+	} else if (keytype == EVP_PKEY_RSA) {
+		if (EVP_PKEY_CTX_set_rsa_keygen_bits(pkey_ctx, bits) <= 0) {
+			memprintf(errmsg, "%sCan't set the bits on the new private key.\n", errmsg && *errmsg ? *errmsg : "");
+			goto err;
+		}
+	}
+
+	if (EVP_PKEY_keygen(pkey_ctx, &pkey) <= 0) {
+		memprintf(errmsg, "%sCan't generate a private key.\n", errmsg && *errmsg ? *errmsg : "");
+		goto err;
+	}
+
+err:
+	EVP_PKEY_CTX_free(pkey_ctx);
+	return pkey;
+}
+
+/*
+ * Generate an expired X509 from <pkey> private key which must be initialized.
+ * Return a pointer to the created X509 object if succeeded, NULL if not.
+ */
+X509 *ssl_gen_x509(EVP_PKEY *pkey)
+{
+	X509         *newcrt  = NULL;
+	X509_NAME    *name;
+	const EVP_MD *digest = NULL;
+	int 	      key_type;
+
+	/* Create the certificate */
+	if (!(newcrt = X509_new()))
+		goto mkcert_error;
+
+	/* Set version number for the certificate (X509v3) and the serial
+	 * number */
+	if (X509_set_version(newcrt, 2L) != 1)
+		goto mkcert_error;
+
+	/* Generate an expired certificate */
+	if (!X509_gmtime_adj(X509_getm_notBefore(newcrt), (long)-60*60*48) ||
+	    !X509_gmtime_adj(X509_getm_notAfter(newcrt),(long)-60*60*24))
+		goto mkcert_error;
+
+	/* set public key in the certificate */
+	if (X509_set_pubkey(newcrt, pkey) != 1)
+		goto mkcert_error;
+
+	if ((name = X509_NAME_new()) == NULL)
+		goto mkcert_error;
+
+	/* Set the subject name using the servername but the CN */
+	if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"expired",
+				       -1, -1, 0) != 1) {
+		X509_NAME_free(name);
+		goto mkcert_error;
+	}
+	if (X509_set_subject_name(newcrt, name) != 1) {
+		X509_NAME_free(name);
+		goto mkcert_error;
+	}
+	/* Set issuer name as itself */
+	if (X509_set_issuer_name(newcrt, name) != 1) {
+		X509_NAME_free(name);
+		goto mkcert_error;
+	}
+	X509_NAME_free(name);
+
+	/* Autosign the certificate with the private key */
+	key_type = EVP_PKEY_base_id(pkey);
+
+	if (key_type == EVP_PKEY_RSA)
+		digest = EVP_sha256();
+	else if (key_type == EVP_PKEY_EC)
+		digest = EVP_sha256();
+	else
+		goto mkcert_error;
+
+	if (!(X509_sign(newcrt, pkey, digest)))
+		goto mkcert_error;
+
+	return newcrt;
+
+mkcert_error:
+	if (newcrt)  X509_free(newcrt);
+	return NULL;
+
+}
+
 REGISTER_POST_DEINIT(__ssl_gencert_deinit);
 

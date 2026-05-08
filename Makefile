@@ -60,6 +60,7 @@
 #   USE_OBSOLETE_LINKER     : use when the linker fails to emit __start_init/__stop_init
 #   USE_THREAD_DUMP         : use the more advanced thread state dump system. Automatic.
 #   USE_OT                  : enable the OpenTracing filter
+#   EXTRA_MAKE              : space-separated list of external addons using a Makefile.inc
 #   USE_MEMORY_PROFILING    : enable the memory profiler. Linux-glibc only.
 #   USE_LIBATOMIC           : force to link with/without libatomic. Automatic.
 #   USE_PTHREAD_EMULATION   : replace pthread's rwlocks with ours
@@ -643,7 +644,7 @@ ifneq ($(USE_OPENSSL:0=),)
   OPTIONS_OBJS += src/ssl_sock.o src/ssl_ckch.o src/ssl_ocsp.o src/ssl_crtlist.o       \
                   src/ssl_sample.o src/cfgparse-ssl.o src/ssl_gencert.o                \
                   src/ssl_utils.o src/jwt.o src/ssl_clienthello.o src/jws.o src/acme.o \
-                  src/ssl_trace.o src/jwe.o
+                  src/acme_resolvers.o src/ssl_trace.o src/jwe.o
 endif
 
 ifneq ($(USE_ENGINE:0=),)
@@ -670,7 +671,8 @@ OPTIONS_OBJS += src/mux_quic.o src/h3.o src/quic_rx.o src/quic_tx.o	\
                 src/quic_cc_nocc.o src/quic_cc.o src/quic_pacing.o	\
                 src/h3_stats.o src/quic_stats.o src/qpack-enc.o		\
                 src/qpack-tbl.o src/quic_cc_drs.o src/quic_fctl.o	\
-                src/quic_enc.o
+                src/quic_enc.o src/mux_quic_qstrm.o src/xprt_qstrm.o	\
+                src/mpring.o
 endif
 
 ifneq ($(USE_QUIC_OPENSSL_COMPAT:0=),)
@@ -859,7 +861,12 @@ ifneq ($(USE_LINUX_CAP:0=),)
 endif
 
 ifneq ($(USE_OT:0=),)
+  $(call warning, The opentracing filter was deprecated in haproxy 3.3 and will be removed in 3.5.)
   include addons/ot/Makefile
+endif
+
+ifneq ($(EXTRA_MAKE),)
+  include $(addsuffix /Makefile.mk,$(EXTRA_MAKE))
 endif
 
 # better keep this one close to the end, as several libs above may need it
@@ -956,6 +963,7 @@ endif # obsolete targets
 endif # TARGET
 
 OBJS =
+HATERM_OBJS =
 
 ifneq ($(EXTRA_OBJS),)
   OBJS += $(EXTRA_OBJS)
@@ -1003,11 +1011,13 @@ OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
         src/http_acl.o src/dict.o src/dgram.o src/pipe.o		\
         src/hpack-huff.o src/hpack-enc.o src/ebtree.o src/hash.o	\
         src/httpclient_cli.o src/version.o src/ncbmbuf.o src/ech.o	\
-        src/cfgparse-peers.o
+        src/cfgparse-peers.o src/haterm.o
 
 ifneq ($(TRACE),)
   OBJS += src/calltrace.o
 endif
+
+HATERM_OBJS += $(OBJS) src/haterm_init.o
 
 # Used only for forced dependency checking. May be cleared during development.
 INCLUDES = $(wildcard include/*/*.h)
@@ -1040,7 +1050,7 @@ IGNORE_OPTS=help install install-man install-doc install-bin \
 	uninstall clean tags cscope tar git-tar version update-version \
 	opts reg-tests reg-tests-help unit-tests admin/halog/halog dev/flags/flags \
 	dev/haring/haring dev/ncpu/ncpu dev/poll/poll dev/tcploop/tcploop \
-	dev/term_events/term_events
+	dev/term_events/term_events dev/gdb/pm-from-core dev/gdb/libs-from-core
 
 ifneq ($(TARGET),)
 ifeq ($(filter $(firstword $(MAKECMDGOALS)),$(IGNORE_OPTS)),)
@@ -1056,6 +1066,9 @@ endif # non-empty target
 haproxy: $(OPTIONS_OBJS) $(OBJS)
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
+haterm: $(OPTIONS_OBJS) $(HATERM_OBJS)
+	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
 objsize: haproxy
 	$(Q)objdump -t $^|grep ' g '|grep -F '.text'|awk '{print $$5 FS $$6}'|sort
 
@@ -1069,6 +1082,12 @@ admin/dyncookie/dyncookie: admin/dyncookie/dyncookie.o
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 dev/flags/flags: dev/flags/flags.o
+	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+dev/gdb/libs-from-core: dev/gdb/libs-from-core.o
+	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
+dev/gdb/pm-from-core: dev/gdb/pm-from-core.o
 	$(cmd_LD) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 dev/haring/haring: dev/haring/haring.o
@@ -1150,7 +1169,7 @@ uninstall:
 	$(Q)rm -f "$(DESTDIR)$(SBINDIR)"/haproxy
 
 clean:
-	$(Q)rm -f *.[oas] src/*.[oas] haproxy test .build_opts .build_opts.new
+	$(Q)rm -f *.[oas] src/*.[oas] haproxy haterm test .build_opts .build_opts.new
 	$(Q)for dir in . src dev/* admin/* addons/* include/* doc; do rm -f $$dir/*~ $$dir/*.rej $$dir/core; done
 	$(Q)rm -f haproxy-$(VERSION).tar.gz haproxy-$(VERSION)$(SUBVERS)$(EXTRAVERSION).tar.gz
 	$(Q)rm -f haproxy-$(VERSION) haproxy-$(VERSION)$(SUBVERS)$(EXTRAVERSION) nohup.out gmon.out
@@ -1169,7 +1188,7 @@ distclean: clean
 	$(Q)rm -f admin/dyncookie/dyncookie
 	$(Q)rm -f dev/haring/haring dev/ncpu/ncpu{,.so} dev/poll/poll dev/tcploop/tcploop
 	$(Q)rm -f dev/hpack/decode dev/hpack/gen-enc dev/hpack/gen-rht
-	$(Q)rm -f dev/qpack/decode
+	$(Q)rm -f dev/qpack/decode dev/gdb/pm-from-core dev/gdb/libs-from-core
 
 tags:
 	$(Q)find src include \( -name '*.c' -o -name '*.h' \) -print0 | \
@@ -1323,7 +1342,8 @@ range:
 			echo "[ $$index/$$count ]   $$commit #############################"; \
 			git checkout -q $$commit || die 1; \
 			$(MAKE) all || die 1; \
-			[ -z "$(TEST_CMD)" ] || $(TEST_CMD) || die 1; \
+			set -- $(TEST_CMD); \
+			[ "$$#" -eq 0 ] || "$$@" || die 1; \
 			index=$$((index + 1)); \
 		done; \
 		echo;echo "Done! $${count} commit(s) built successfully for RANGE $${RANGE}" ; \

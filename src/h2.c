@@ -92,7 +92,7 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 	size_t i;
 
 	if ((fields & H2_PHDR_FND_METH) && isteq(phdr[H2_PHDR_IDX_METH], ist("CONNECT"))) {
-		if (fields & H2_PHDR_FND_PROT) {
+		if ((fields & H2_PHDR_FND_PROT) && (*msgf & H2_MSGF_EXT_CONN_OK)) {
 			/* rfc 8441 Extended Connect Protocol
 			 * #4 :scheme and :path must be present, as well as
 			 * :authority like all h2 requests
@@ -130,6 +130,11 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 			 * MUST be omitted ; ":authority" contains the host and port
 			 * to connect to.
 			 */
+			if (fields & H2_PHDR_FND_PROT) {
+				/* protocol not allowed without RFC8441 support */
+				goto fail;
+			}
+
 			if (fields & H2_PHDR_FND_SCHM) {
 				/* scheme not allowed */
 				goto fail;
@@ -148,11 +153,11 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 
 		*msgf |= H2_MSGF_BODY_TUNNEL;
 	}
-	else if ((fields & (H2_PHDR_FND_METH|H2_PHDR_FND_SCHM|H2_PHDR_FND_PATH)) !=
+	else if ((fields & (H2_PHDR_FND_METH|H2_PHDR_FND_SCHM|H2_PHDR_FND_PATH|H2_PHDR_FND_PROT)) !=
 	         (H2_PHDR_FND_METH|H2_PHDR_FND_SCHM|H2_PHDR_FND_PATH)) {
 		/* RFC 7540 #8.1.2.3 : all requests MUST include exactly one
 		 * valid value for the ":method", ":scheme" and ":path" phdr
-		 * unless it is a CONNECT request.
+		 * and no ":protocol" phdr unless it is a CONNECT request..
 		 */
 		if (!(fields & H2_PHDR_FND_METH)) {
 			/* missing method */
@@ -163,7 +168,7 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 			goto fail;
 		}
 		else {
-			/* missing path */
+			/* missing path or extra protocol */
 			goto fail;
 		}
 	}
@@ -299,7 +304,7 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
  * negative error code is returned.
  *
  * Upon success, <msgf> is filled with a few H2_MSGF_* flags indicating what
- * was found while parsing. The caller must set it to zero in or H2_MSGF_BODY
+ * was found while parsing. The caller must set it to zero or to H2_MSGF_BODY
  * if a body is detected (!ES).
  *
  * The headers list <list> must be composed of :
@@ -319,6 +324,7 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
  */
 int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len, int relaxed)
 {
+	struct htx_blk *tailblk = htx_get_tail_blk(htx);
 	struct ist phdr_val[H2_PHDR_NUM_ENTRIES];
 	uint32_t fields; /* bit mask of H2_PHDR_FND_* */
 	uint32_t idx;
@@ -533,6 +539,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 	return ret;
 
  fail:
+	htx_truncate_blk(htx, tailblk);
 	return -1;
 }
 
@@ -621,7 +628,7 @@ static struct htx_sl *h2_prepare_htx_stsline(uint32_t fields, struct ist *phdr, 
  * negative error code is returned.
  *
  * Upon success, <msgf> is filled with a few H2_MSGF_* flags indicating what
- * was found while parsing. The caller must set it to zero in or H2_MSGF_BODY
+ * was found while parsing. The caller must set it to zero or to H2_MSGF_BODY
  * if a body is detected (!ES).
  *
  * The headers list <list> must be composed of :
@@ -637,6 +644,7 @@ static struct htx_sl *h2_prepare_htx_stsline(uint32_t fields, struct ist *phdr, 
  */
 int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len, char *upgrade_protocol)
 {
+	struct htx_blk *tailblk = htx_get_tail_blk(htx);
 	struct ist phdr_val[H2_PHDR_NUM_ENTRIES];
 	uint32_t fields; /* bit mask of H2_PHDR_FND_* */
 	uint32_t idx;
@@ -742,7 +750,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 	if (fields & (H2_PHDR_FND_AUTH|H2_PHDR_FND_METH|H2_PHDR_FND_PATH|H2_PHDR_FND_SCHM))
 		goto fail;
 
-	/* Let's dump the request now if not yet emitted. */
+	/* Let's dump the response now if not yet emitted. */
 	if (!(fields & H2_PHDR_FND_NONE)) {
 		sl = h2_prepare_htx_stsline(fields, phdr_val, htx, msgf);
 		if (!sl)
@@ -793,6 +801,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 	return ret;
 
  fail:
+	htx_truncate_blk(htx, tailblk);
 	return -1;
 }
 
@@ -812,6 +821,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
  */
 int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
 {
+	struct htx_blk *tailblk = htx_get_tail_blk(htx);
 	const char *ctl;
 	struct ist v;
 	uint32_t idx;
@@ -861,8 +871,8 @@ int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
 			goto fail;
 	}
 
-	/* Check the number of blocks against "tune.http.maxhdr" value before adding EOT block */
-	if (htx_nbblks(htx) > global.tune.max_http_hdr)
+	/* Check the number of trailers against "tune.http.maxhdr" value before adding EOT block */
+	if (idx > global.tune.max_http_hdr)
 		goto fail;
 
 	if (!htx_add_endof(htx, HTX_BLK_EOT))
@@ -871,5 +881,6 @@ int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
 	return 1;
 
  fail:
+	htx_truncate_blk(htx, tailblk);
 	return -1;
 }

@@ -39,6 +39,7 @@
 #include <haproxy/peers-t.h>
 #include <haproxy/port_range.h>
 #include <haproxy/protocol.h>
+#include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
 #include <haproxy/queue.h>
 #include <haproxy/quic_tp.h>
@@ -192,9 +193,9 @@ static void _srv_set_inetaddr_port(struct server *srv,
 	else
 		srv->flags &= ~SRV_F_MAPPORTS;
 
-	if (srv->proxy->lbprm.update_server_eweight) {
+	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->update_server_eweight) {
 		/* some balancers (chash in particular) may use the addr in their routing decisions */
-		srv->proxy->lbprm.update_server_eweight(srv);
+		srv->proxy->lbprm.ops->update_server_eweight(srv);
 	}
 
 	if (srv->log_target && srv->log_target->type == LOG_TARGET_DGRAM) {
@@ -1454,6 +1455,15 @@ static int srv_parse_proto(char **args, int *cur_arg,
 		memprintf(err, "'%s' :  unknown MUX protocol '%s'", args[*cur_arg], args[*cur_arg+1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
+
+	if (newsrv->mux_proto->mux->flags & MX_FL_EXPERIMENTAL) {
+		if (!experimental_directives_allowed) {
+			memprintf(err, "'%s' : '%s' protocol is experimental, must be allowed via a global 'expose-experimental-directives'",
+			          args[*cur_arg], args[*cur_arg + 1]);
+			return ERR_ALERT | ERR_FATAL;
+		}
+		mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
+	}
 	return 0;
 }
 
@@ -2522,8 +2532,8 @@ struct task *server_requeue(struct task *t, void *context, unsigned int state)
 	/* let's call the LB's requeue function. If it fails, it will itself
 	 * wake us up.
 	 */
-	if (srv->proxy->lbprm.server_requeue)
-		srv->proxy->lbprm.server_requeue(srv);
+	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->server_requeue)
+		srv->proxy->lbprm.ops->server_requeue(srv);
 	return t;
 }
 
@@ -2940,7 +2950,11 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	}
 	srv->use_ssl                  = src->use_ssl;
 	srv->check.addr               = src->check.addr;
+	srv->check.addr_type          = src->check.addr_type;
+	srv->check.alt_proto          = src->check.alt_proto;
 	srv->agent.addr               = src->agent.addr;
+	srv->agent.addr_type          = src->agent.addr_type;
+	srv->agent.alt_proto          = src->agent.alt_proto;
 	srv->check.use_ssl            = src->check.use_ssl;
 	srv->check.port               = src->check.port;
 	if (src->check.sni != NULL)
@@ -2968,14 +2982,14 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->agent.use_ssl            = src->agent.use_ssl;
 	srv->agent.port               = src->agent.port;
 
-	if (src->agent.tcpcheck_rules) {
-		srv->agent.tcpcheck_rules = calloc(1, sizeof(*srv->agent.tcpcheck_rules));
-		if (srv->agent.tcpcheck_rules) {
-			srv->agent.tcpcheck_rules->flags = src->agent.tcpcheck_rules->flags;
-			srv->agent.tcpcheck_rules->list  = src->agent.tcpcheck_rules->list;
-			LIST_INIT(&srv->agent.tcpcheck_rules->preset_vars);
-			dup_tcpcheck_vars(&srv->agent.tcpcheck_rules->preset_vars,
-					  &src->agent.tcpcheck_rules->preset_vars);
+	if (src->agent.tcpcheck) {
+		srv->agent.tcpcheck = calloc(1, sizeof(*srv->agent.tcpcheck));
+		if (srv->agent.tcpcheck) {
+			srv->agent.tcpcheck->flags = (src->agent.tcpcheck->flags & ~TCPCHK_FL_UNUSED_RS);
+			srv->agent.tcpcheck->rs = src->agent.tcpcheck->rs;
+			LIST_INIT(&srv->agent.tcpcheck->preset_vars);
+			dup_tcpcheck_vars(&srv->agent.tcpcheck->preset_vars,
+					  &src->agent.tcpcheck->preset_vars);
 		}
 	}
 
@@ -3122,7 +3136,7 @@ struct server *new_server(struct proxy *proxy)
 	srv->check.status = HCHK_STATUS_INI;
 	srv->check.server = srv;
 	srv->check.proxy = proxy;
-	srv->check.tcpcheck_rules = &proxy->tcpcheck_rules;
+	srv->check.tcpcheck = &proxy->tcpcheck;
 
 	srv->agent.obj_type = OBJ_TYPE_CHECK;
 	srv->agent.status = HCHK_STATUS_INI;
@@ -3220,12 +3234,17 @@ void srv_free_params(struct server *srv)
 struct server *srv_drop(struct server *srv)
 {
 	struct server *next = NULL;
+	struct proxy *px = NULL;
 	int i __maybe_unused;
 
 	if (!srv)
 		goto end;
 
 	next = srv->next;
+
+	/* If srv was deleted, a proxy refcount must be dropped. */
+	if (srv->flags & SRV_F_DELETED)
+		px = srv->proxy;
 
 	/* For dynamic servers, decrement the reference counter. Only free the
 	 * server when reaching zero.
@@ -3255,6 +3274,8 @@ struct server *srv_drop(struct server *srv)
 			istfree(&srv->per_thr[i].quic_retry_token);
 	}
 #endif
+	EXTRA_COUNTERS_FREE(srv->extra_counters);
+
 	srv_free_params(srv);
 
 	HA_SPIN_DESTROY(&srv->lock);
@@ -3262,9 +3283,9 @@ struct server *srv_drop(struct server *srv)
 	MT_LIST_DELETE(&srv->global_list);
 	event_hdl_sub_list_destroy(&srv->e_subs);
 
-	EXTRA_COUNTERS_FREE(srv->extra_counters);
-
 	srv_free(&srv);
+
+	proxy_drop(px);
 
  end:
 	return next;
@@ -3377,6 +3398,29 @@ int server_parse_exprs(struct server *srv, struct proxy *px, char **errmsg)
 
   out:
 	return ret;
+}
+
+/* Fill <srv> SNI expression to reuse the host header on outgoing requests.
+ *
+ * Returns 0 on success else non-zero. On error, <err_code> and <err> message
+ * are both set.
+ */
+int srv_configure_auto_sni(struct server *srv, int *err_code, char **err)
+{
+	srv->sni_expr = strdup("req.hdr(host),field(1,:)");
+	if (!srv->sni_expr) {
+		memprintf(err, "out of memory while generating server auto SNI expression");
+		*err_code |= ERR_ALERT | ERR_ABORT;
+		return 1;
+	}
+
+	if (server_parse_exprs(srv, srv->proxy, err)) {
+		memprintf(err, "failed to parse auto SNI expression: %s", *err);
+		*err_code |= ERR_ALERT | ERR_FATAL;
+		return 1;
+	}
+
+	return 0;
 }
 
 /* Initialize as much as possible servers from <srv> server template.
@@ -3713,6 +3757,10 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 #ifdef USE_QUIC
 #ifdef HAVE_OPENSSL_QUIC_CLIENT_SUPPORT
 		if (srv_is_quic(newsrv)) {
+			/* TODO QUIC is currently incompatible with dynamic
+			 * backends deletion. Please fix this before removing
+			 * QUIC BE experimental status.
+			 */
 			if (!experimental_directives_allowed) {
 				ha_alert("QUIC is experimental for server '%s',"
 				         " must be allowed via a global 'expose-experimental-directives'\n",
@@ -3963,6 +4011,16 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 			}
 			srv->ssl_ctx.alpn_len = strlen(srv->ssl_ctx.alpn_str);
 		}
+
+		/* Deletion of backend when QUIC servers were used is currently
+		 * not implemented. This is because quic_conn instances
+		 * directly references its parent proxy via <prx_counters>
+		 * member.
+		 *
+		 * TODO lift this restriction by ensuring safe access on proxy
+		 * counters or via refcount.
+		 */
+		srv->proxy->flags |= PR_FL_NON_PURGEABLE;
 #else
 		ha_alert("QUIC protocol selected but support not compiled in (check build options).\n");
 		return ERR_ALERT | ERR_FATAL;
@@ -4593,6 +4651,10 @@ out:
 			set_srv_agent_addr(s, &sk);
 		if (port)
 			set_srv_agent_port(s, new_port);
+		/* Agent currently only uses TCP */
+		s->agent.addr_type.proto_type = PROTO_TYPE_STREAM;
+		s->agent.addr_type.xprt_type = PROTO_TYPE_STREAM;
+		s->agent.alt_proto = 0;
 	}
 	return NULL;
 }
@@ -4604,9 +4666,11 @@ out:
  */
 const char *srv_update_check_addr_port(struct server *s, const char *addr, const char *port)
 {
-	struct sockaddr_storage sk;
+	struct sockaddr_storage *sk = NULL;
+	struct net_addr_type addr_type;
 	struct buffer *msg;
 	int new_port;
+	int alt = 0;
 
 	msg = get_trash_chunk();
 	chunk_reset(msg);
@@ -4616,8 +4680,8 @@ const char *srv_update_check_addr_port(struct server *s, const char *addr, const
 		goto out;
 	}
 	if (addr) {
-		memset(&sk, 0, sizeof(struct sockaddr_storage));
-		if (str2ip2(addr, &sk, 0) == NULL) {
+		sk = str2sa_range(addr, NULL, NULL, NULL, NULL, NULL, &addr_type, NULL, NULL, NULL, &alt, 0);
+		if (sk == NULL) {
 			chunk_appendf(msg, "invalid addr '%s'", addr);
 			goto out;
 		}
@@ -4641,8 +4705,11 @@ out:
 	if (msg->data)
 		return msg->area;
 	else {
-		if (addr)
-			s->check.addr = sk;
+		if (sk) {
+			s->check.addr = *sk;
+			s->check.addr_type = addr_type;
+			s->check.alt_proto = alt;
+		}
 		if (port)
 			s->check.port = new_port;
 
@@ -6022,7 +6089,7 @@ static int srv_alloc_lb(struct server *sv, struct proxy *be)
 	sv->lb_nodes_tot = sv->uweight * BE_WEIGHT_SCALE;
 	sv->lb_nodes_now = 0;
 
-	if (be->lbprm.server_init && be->lbprm.server_init(sv) < 0)
+	if (be->lbprm.ops && be->lbprm.ops->server_init && be->lbprm.ops->server_init(sv) < 0)
 		return 0; // typically out of memory
 
 	return 1;
@@ -6315,7 +6382,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		int proto_mode = conn_pr_mode_to_proto_mode(be->mode);
 		const struct mux_proto_list *mux_ent;
 
-		mux_ent = conn_get_best_mux_entry(srv->mux_proto->token, PROTO_SIDE_BE, proto_mode);
+		mux_ent = conn_get_best_mux_entry(srv->mux_proto->token, PROTO_SIDE_BE, srv_is_quic(srv), proto_mode);
 
 		if (!mux_ent || !isteq(mux_ent->token, srv->mux_proto->token)) {
 			ha_alert("MUX protocol is not usable for server.\n");
@@ -6333,22 +6400,15 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		}
 	}
 
-	if (!srv_alloc_lb(srv, be)) {
-		ha_alert("Failed to initialize load-balancing data.\n");
-		goto out;
-	}
-
-	if (!stats_allocate_proxy_counters_internal(&srv->extra_counters,
-	                                            COUNTERS_SV,
-	                                            STATS_PX_CAP_SRV)) {
-		ha_alert("failed to allocate extra counters for server.\n");
-		goto out;
-	}
-
 	/* ensure minconn/maxconn consistency */
 	srv_minmax_conn_apply(srv);
 
-	if (srv->use_ssl == 1 || (srv->proxy->options & PR_O_TCPCHK_SSL) ||
+	errcode |= check_server_tcpcheck(srv);
+	if (errcode & (ERR_ABORT|ERR_FATAL))
+		goto out;
+
+
+	if (srv->use_ssl == 1 || (srv->check.tcpcheck->flags & TCPCHK_FL_USE_SSL) ||
 	    srv->check.use_ssl == 1) {
 		if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv) {
 			if (xprt_get(XPRT_SSL)->prepare_srv(srv))
@@ -6357,6 +6417,16 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->prepare_srv) {
 			if (xprt_get(XPRT_QUIC)->prepare_srv(srv))
 				goto out;
+		}
+	}
+
+	/* Define default SNI from host header if needed. */
+	if (srv->proxy->mode == PR_MODE_HTTP && srv->use_ssl == 1 &&
+	    !srv->sni_expr && !(srv->ssl_ctx.options & SRV_SSL_O_NO_AUTO_SNI)) {
+		if (srv_configure_auto_sni(srv, &errcode, &errmsg)) {
+			ha_alert("%s.\n", errmsg);
+			ha_free(&errmsg);
+			goto out;
 		}
 	}
 
@@ -6386,6 +6456,22 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	errcode = srv_preinit(srv);
 	if (errcode)
 		goto out;
+
+	if (!srv_alloc_lb(srv, be)) {
+		ha_alert("Failed to initialize load-balancing data.\n");
+		goto out;
+	}
+
+	if (!stats_allocate_proxy_counters_internal(&srv->extra_counters,
+	                                            COUNTERS_SV,
+	                                            STATS_PX_CAP_SRV,
+	                                            &srv->per_tgrp->extra_counters_storage,
+	                                            &srv->per_tgrp[1].extra_counters_storage -
+	                                            &srv->per_tgrp[0].extra_counters_storage)) {
+		ha_alert("failed to allocate extra counters for server.\n");
+		goto out;
+	}
+
 	errcode = srv_postinit(srv);
 	if (errcode)
 		goto out;
@@ -6519,7 +6605,7 @@ int srv_check_for_deletion(const char *bename, const char *svname, struct proxy 
 
 	/* Only servers in maintenance can be deleted. This ensures that the
 	 * server is not present anymore in the lb structures (through
-	 * lbprm.set_server_status_down).
+	 * lbprm.ops->set_server_status_down).
 	 */
 	if (!(srv->cur_admin & SRV_ADMF_MAINT)) {
 		msg = "Only servers in maintenance mode can be deleted.";
@@ -6605,8 +6691,8 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	if (srv->agent.state & CHK_ST_CONFIGURED)
 		check_purge(&srv->agent);
 
-	if (srv->proxy->lbprm.server_deinit)
-		srv->proxy->lbprm.server_deinit(srv);
+	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->server_deinit)
+		srv->proxy->lbprm.ops->server_deinit(srv);
 
 	while (!MT_LIST_ISEMPTY(&srv->watcher_list)) {
 		srv_watch = MT_LIST_NEXT(&srv->watcher_list, struct watcher *, el);
@@ -6620,6 +6706,16 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	 */
 	srv_detach(srv);
 
+	/* Mark the server as being deleted (ie removed from its proxy list)
+	 * but not yet purged from memory. Any module still referencing this
+	 * server must manipulate it with precaution and are expected to
+	 * release its refcount as soon as possible.
+	 */
+	srv->flags |= SRV_F_DELETED;
+
+	/* Inc proxy refcount until the server is finally freed. */
+	proxy_take(srv->proxy);
+
 	/* remove srv from addr_node tree */
 	ceb32_item_delete(&be->conf.used_server_id, conf.puid_node, puid, srv);
 	cebis_item_delete(&be->conf.used_server_name, conf.name_node, id, srv);
@@ -6627,15 +6723,6 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 	/* remove srv from idle_node tree for idle conn cleanup */
 	eb32_delete(&srv->idle_node);
-
-	/* flag the server as deleted
-	 * (despite the server being removed from primary server list,
-	 * one could still access the server data from a valid ptr)
-	 * Deleted flag helps detecting when a server is in transient removal
-	 * state.
-	 * ie: removed from the list but not yet freed/purged from memory.
-	 */
-	srv->flags |= SRV_F_DELETED;
 
 	/* set LSB bit (odd bit) for reuse_cnt */
 	srv_id_reuse_cnt |= 1;
@@ -6746,12 +6833,16 @@ int srv_apply_track(struct server *srv, struct proxy *curproxy)
 		return 1;
 	}
 
-	if (curproxy != px &&
-	    (curproxy->options & PR_O_DISABLE404) != (px->options & PR_O_DISABLE404)) {
-		ha_alert("unable to use %s/%s for"
-		         "tracking: disable-on-404 option inconsistency.\n",
-		         px->id, strack->id);
-		return 1;
+	if (curproxy != px) {
+		int val1 = curproxy->tcpcheck.rs && (curproxy->tcpcheck.rs->flags & TCPCHK_RULES_DISABLE404);
+		int val2 = px->tcpcheck.rs && (px->tcpcheck.rs->flags & TCPCHK_RULES_DISABLE404);
+
+		if (val1 != val2) {
+			ha_alert("unable to use %s/%s for"
+				 "tracking: disable-on-404 option inconsistency.\n",
+				 px->id, strack->id);
+			return 1;
+		}
 	}
 
 	srv->track = strack;
@@ -6769,15 +6860,18 @@ static void srv_lb_propagate(struct server *s)
 {
 	struct proxy *px = s->proxy;
 
-	if (px->lbprm.update_server_eweight)
-		px->lbprm.update_server_eweight(s);
+	if (!px->lbprm.ops)
+		return;
+
+	if (px->lbprm.ops->update_server_eweight)
+		px->lbprm.ops->update_server_eweight(s);
 	else if (srv_willbe_usable(s)) {
-		if (px->lbprm.set_server_status_up)
-			px->lbprm.set_server_status_up(s);
+		if (px->lbprm.ops->set_server_status_up)
+			px->lbprm.ops->set_server_status_up(s);
 	}
 	else {
-		if (px->lbprm.set_server_status_down)
-			px->lbprm.set_server_status_down(s);
+		if (px->lbprm.ops->set_server_status_down)
+			px->lbprm.ops->set_server_status_down(s);
 	}
 }
 
@@ -7318,7 +7412,7 @@ struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsign
 
 	while ((conn = MT_LIST_POP(&idle_conns[tid].toremove_conns,
 	                               struct connection *, toremove_list)) != NULL) {
-		conn->mux->destroy(conn->ctx);
+		CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 	}
 
 	return task;
@@ -7683,7 +7777,7 @@ static void srv_close_idle_conns(struct server *srv)
 
 REGISTER_SERVER_DEINIT(srv_close_idle_conns);
 
-/* config parser for global "tune.idle-pool.shared", accepts "on" or "off" */
+/* config parser for global "tune.idle-pool.shared", accepts "full", "on" or "off" */
 static int cfg_parse_idle_pool_shared(char **args, int section_type, struct proxy *curpx,
                                       const struct proxy *defpx, const char *file, int line,
                                       char **err)
@@ -7691,12 +7785,17 @@ static int cfg_parse_idle_pool_shared(char **args, int section_type, struct prox
 	if (too_many_args(1, args, err, NULL))
 		return -1;
 
-	if (strcmp(args[1], "on") == 0)
+	if (strcmp(args[1], "full") == 0) {
 		global.tune.options |= GTUNE_IDLE_POOL_SHARED;
-	else if (strcmp(args[1], "off") == 0)
+		global.tune.tg_takeover = FULL_THREADGROUP_TAKEOVER;
+	} else if (strcmp(args[1], "on") == 0) {
+		global.tune.options |= GTUNE_IDLE_POOL_SHARED;
+		global.tune.tg_takeover = RESTRICTED_THREADGROUP_TAKEOVER;
+	} else if (strcmp(args[1], "off") == 0) {
 		global.tune.options &= ~GTUNE_IDLE_POOL_SHARED;
-	else {
-		memprintf(err, "'%s' expects either 'on' or 'off' but got '%s'.", args[0], args[1]);
+		global.tune.tg_takeover = NO_THREADGROUP_TAKEOVER;
+	} else {
+		memprintf(err, "'%s' expects 'full', 'on' or 'off' but got '%s'.", args[0], args[1]);
 		return -1;
 	}
 	return 0;

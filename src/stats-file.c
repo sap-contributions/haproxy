@@ -492,7 +492,7 @@ static int shm_stats_file_check_ver(struct shm_stats_file_hdr *hdr)
 	return 1;
 }
 
-static inline int shm_hb_is_stale(int hb)
+static inline int shm_hb_is_stale(uint hb)
 {
 	return (hb == TICK_ETERNITY || tick_is_expired(hb, now_ms));
 }
@@ -501,7 +501,7 @@ static inline int shm_hb_is_stale(int hb)
  */
 static int shm_stats_file_slot_isfree(struct shm_stats_file_hdr *hdr, int id)
 {
-	int hb;
+	uint hb;
 
 	hb = HA_ATOMIC_LOAD(&hdr->slots[id].heartbeat);
 	return shm_hb_is_stale(hb);
@@ -513,7 +513,7 @@ static int shm_stats_file_slot_isfree(struct shm_stats_file_hdr *hdr, int id)
 int shm_stats_file_get_free_slot(struct shm_stats_file_hdr *hdr)
 {
 	int it = 0;
-	int hb;
+	uint hb;
 
 	while (it < sizeof(hdr->slots) / sizeof(hdr->slots[0])) {
 		hb = HA_ATOMIC_LOAD(&hdr->slots[it].heartbeat);
@@ -840,6 +840,8 @@ next:
 int shm_stats_file_prepare(void)
 {
 	struct task *heartbeat_task;
+	volatile ullong *local_global_now_ns;
+	volatile uint *local_global_now_ms;
 	int first = 0; // process responsible for initializing the shm memory
 	int slot;
 	int objects;
@@ -896,23 +898,37 @@ int shm_stats_file_prepare(void)
 		/* set global clock for the first time */
 		shm_stats_file_hdr->global_now_ms = *global_now_ms;
 		shm_stats_file_hdr->global_now_ns = *global_now_ns;
-		shm_stats_file_hdr->now_offset = clock_get_now_offset();
 	}
 	else if (!shm_stats_file_check_ver(shm_stats_file_hdr))
 		goto err_version;
 
-	/* from now on use the shared global time */
+	/* from now on use the shared global time, but save local global time
+	 * in case reverting is required
+	 */
+	local_global_now_ms = global_now_ms;
+	local_global_now_ns = global_now_ns;
 	global_now_ms = &shm_stats_file_hdr->global_now_ms;
 	global_now_ns = &shm_stats_file_hdr->global_now_ns;
 
 	if (!first) {
-		llong adjt_offset;
+		llong new_offset, adjt_offset;
+
+		/* Given the clock from the shared map and our current clock which is considered
+		 * up-to-date, we can now compute the now_offset that we will be using instead
+		 * of the default one in order to make our clock consistent with the shared one
+		 *
+		 * First we remove the original offset from now_ns to get pure now_ns
+		 * then we compare now_ns with the shared clock, which gives us the
+		 * relative offset we should be using to make our monotonic clock
+		 * coincide with the shared one.
+		 */
+		new_offset = HA_ATOMIC_LOAD(global_now_ns) - (now_ns - clock_get_now_offset());
 
 		/* set adjusted offset which corresponds to the corrected offset
-		 * relative to the initial offset stored in the shared memory instead
-		 * of our process-local one
+		 * relative to the new offset we calculated instead or the default
+		 * one
 		 */
-		adjt_offset = -clock_get_now_offset() + shm_stats_file_hdr->now_offset;
+		adjt_offset = -clock_get_now_offset() + new_offset;
 
 		/* we now rely on global_now_* from the shm, so the boot
 		 * offset that was initially applied in clock_init_process_date()
@@ -921,17 +937,11 @@ int shm_stats_file_prepare(void)
 		 */
 		now_ns = now_ns + adjt_offset;
 		start_time_ns = start_time_ns + adjt_offset;
-		clock_set_now_offset(shm_stats_file_hdr->now_offset);
+		clock_set_now_offset(new_offset);
 
 		/* ensure global_now_* is consistent before continuing */
 		clock_update_global_date();
 	}
-
-	/* now that global_now_ns is accurate, recompute precise now_offset
-	 * if needed (in case it is dynamic when monotonic clock not available)
-	 */
-	if (!th_ctx->curr_mono_time)
-		clock_set_now_offset(HA_ATOMIC_LOAD(global_now_ns) - tv_to_ns(&date));
 
 	/* sync local and global clocks, so all clocks are consistent */
 	clock_update_date(0, 1);
@@ -968,7 +978,18 @@ int shm_stats_file_prepare(void)
 	slot = shm_stats_file_get_free_slot(shm_stats_file_hdr);
 	if (slot == -1) {
 		ha_warning("config: failed to get shm stats file slot for '%s', all slots are occupied\n", global.shm_stats_file);
+		/* stop using shared clock since we withdraw from the shared memory,
+		 * simply update the local clock and switch to using it instead
+		 */
+		*local_global_now_ms = HA_ATOMIC_LOAD(global_now_ms);
+		*local_global_now_ns = HA_ATOMIC_LOAD(global_now_ns);
+
+		/* shared memory mapping no longer needed */
 		munmap(shm_stats_file_hdr, sizeof(*shm_stats_file_hdr));
+		shm_stats_file_hdr = NULL;
+
+		global_now_ms = local_global_now_ms;
+		global_now_ns = local_global_now_ns;
 		return ERR_WARN;
 	}
 

@@ -21,12 +21,14 @@
 #include <import/cebis_tree.h>
 
 #include <haproxy/action.h>
+#include <haproxy/acme_resolvers.h>
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
+#include <haproxy/counters.h>
 #include <haproxy/dns.h>
 #include <haproxy/dns_ring.h>
 #include <haproxy/errors.h>
@@ -121,13 +123,19 @@ static struct stat_col resolv_stats[] = {
 
 static struct dns_counters dns_counters;
 
-static int resolv_fill_stats(void *d, struct field *stats, unsigned int *selected_field)
+static int resolv_fill_stats(struct stats_module *mod, struct extra_counters *ctr,
+                             struct field *stats, unsigned int *selected_field)
 {
-	struct dns_counters *counters = d;
 	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
 
 	for (; current_field < RSLV_STAT_END; current_field++) {
 		struct field metric = { 0 };
+		struct dns_counters *counters;
+
+		if (!ctr)
+			goto store_metric;
+
+		counters = EXTRA_COUNTERS_BASE(ctr, mod);
 
 		switch (current_field) {
 		case RSLV_STAT_ID:
@@ -189,6 +197,7 @@ static int resolv_fill_stats(void *d, struct field *stats, unsigned int *selecte
 				return 0;
 			continue;
 		}
+	store_metric:
 		stats[current_field] = metric;
 		if (selected_field != NULL)
 			break;
@@ -648,8 +657,9 @@ int resolv_read_name(unsigned char *buffer, unsigned char *bufend,
 
 		/* +1 to take label len + label string */
 		label_len++;
-
-		for (n = 0; n < label_len; n++) {
+		*dest = *reader; /* copy label len */
+		/* copy lowered label string */
+		for (n = 1; n < label_len; n++) {
 			dest[n] = tolower(reader[n]);
 		}
 
@@ -854,7 +864,7 @@ static void resolv_check_response(struct resolv_resolution *res)
 			/* If not empty we try to match a server
 			 * in server state file tree with the same hostname
 			 */
-			if (!srvrq->named_servers) {
+			if (srvrq->named_servers) {
 				srv = NULL;
 
 				/* convert the key to lookup in lower case */
@@ -1317,15 +1327,33 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 				key = XXH32(reader, answer_record->data_len, answer_record->type);
 				break;
 
+			case DNS_RTYPE_TXT: {
+				/* TXT: sequence of [1-byte length | string bytes] *.
+				 * Only the first string is kept, further data is ignored.
+				 */
+				int slen = (unsigned char)reader[0];
+
+				if (answer_record->data_len < 1 || 1 + slen > answer_record->data_len)
+					goto invalid_resp;
+				offset = answer_record->data_len;
+				memcpy(answer_record->data.target, reader + 1, slen);
+				answer_record->data.target[slen] = 0;
+				answer_record->data_len = slen;
+				key = XXH32(answer_record->data.target, slen, answer_record->type);
+				break;
+			}
+
 		} /* switch (record type) */
 
 		/* Increment the counter for number of records saved into our
 		 * local response */
 		nb_saved_records++;
 
-		/* Move forward answer_record->data_len for analyzing next
-		 * record in the response */
-		reader += ((answer_record->type == DNS_RTYPE_SRV)
+		/* Move forward past the record data. For SRV and TXT, offset holds
+		 * the wire data length
+		 */
+		reader += ((answer_record->type == DNS_RTYPE_SRV ||
+		            answer_record->type == DNS_RTYPE_TXT)
 			   ? offset
 			   : answer_record->data_len);
 
@@ -1360,6 +1388,12 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
                                         found = 1;
 				}
                                 break;
+
+			case DNS_RTYPE_TXT:
+				if (answer_record->data_len == tmp_record->data_len &&
+				    memcmp(answer_record->data.target, tmp_record->data.target, answer_record->data_len) == 0)
+					found = 1;
+				break;
 
 			default:
 				break;
@@ -1493,7 +1527,6 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 				goto invalid_resp;
 			answer_record->data.in6.sin6_family = AF_INET6;
 			memcpy(&answer_record->data.in6.sin6_addr, reader, answer_record->data_len);
-			break;
 		}
 		else {
 			pool_free(resolv_answer_item_pool, answer_record);
@@ -2070,6 +2103,7 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 	struct stream         *stream = NULL;
 	char **hostname_dn;
 	int   hostname_dn_len, query_type;
+	int req_was_new = 0;
 
 	enter_resolver_code();
 	switch (requester_type) {
@@ -2079,6 +2113,7 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 			if (!requester_locked)
 				HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 
+			req_was_new = !srv->resolv_requester;
 			req = resolv_get_requester(&srv->resolv_requester,
 			                           &srv->obj_type,
 				                   snr_resolution_cb,
@@ -2104,6 +2139,7 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 		case OBJ_TYPE_SRVRQ:
 			srvrq           = (struct resolv_srvrq *)requester;
 
+			req_was_new = !srvrq->requester;
 			req = resolv_get_requester(&srvrq->requester,
 			                           &srvrq->obj_type,
 			                           snr_resolution_cb,
@@ -2120,6 +2156,7 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 		case OBJ_TYPE_STREAM:
 			stream          = (struct stream *)requester;
 
+			req_was_new = !stream->resolv_ctx.requester;
 			req = resolv_get_requester(&stream->resolv_ctx.requester,
 			                           &stream->obj_type,
 			                           act_resolution_cb,
@@ -2137,6 +2174,26 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 					   ? DNS_RTYPE_A
 					   : DNS_RTYPE_AAAA;
 			break;
+#if defined(HAVE_ACME)
+		case OBJ_TYPE_ACME_RSLV: {
+			struct acme_rslv *acme_rslv = (struct acme_rslv *)requester;
+
+			req_was_new = !acme_rslv->requester;
+			req = resolv_get_requester(&acme_rslv->requester,
+			                           &acme_rslv->obj_type,
+			                           acme_rslv->success_cb,
+			                           acme_rslv->error_cb);
+			if (!req)
+				goto err;
+
+			hostname_dn     = &acme_rslv->hostname_dn;
+			hostname_dn_len = acme_rslv->hostname_dn_len;
+			resolvers       = acme_rslv->resolvers;
+
+			query_type      = DNS_RTYPE_TXT;
+			break;
+		}
+#endif
 		default:
 			goto err;
 	}
@@ -2151,9 +2208,36 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 	leave_resolver_code();
 	return 0;
 
-  err:
+err:
 	if (res && LIST_ISEMPTY(&res->requesters))
 		resolv_free_resolution(res);
+	if (req_was_new) {
+		switch (requester_type) {
+			case OBJ_TYPE_SERVER:
+				srv->resolv_requester = NULL;
+				pool_free(resolv_requester_pool, req);
+				break;
+			case OBJ_TYPE_SRVRQ:
+				srvrq->requester = NULL;
+				pool_free(resolv_requester_pool, req);
+				break;
+			case OBJ_TYPE_STREAM:
+				stream->resolv_ctx.requester = NULL;
+				pool_free(resolv_requester_pool, req);
+				break;
+#if defined(HAVE_ACME)
+			case OBJ_TYPE_ACME_RSLV: {
+				struct acme_rslv *acme_rslv = (struct acme_rslv *)requester;
+				acme_rslv->requester = NULL;
+				pool_free(resolv_requester_pool, req);
+				break;
+			}
+#endif
+			default:
+				break;
+		}
+	}
+
 	leave_resolver_code();
 	return -1;
 }
@@ -2502,7 +2586,7 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 	list_for_each_entry_safe(res, resback, &resolvers->resolutions.wait, list) {
 
 		if (unlikely(stopping)) {
-			/* If haproxy is stopping, check if the resolution to know if it must be run or not.
+			/* If haproxy is stopping, check if the resolution must be run or not.
 			 * If at least a requester is a stream (because of a do-resolv action) or if there
 			 * is a requester attached to a running proxy, the resolution is performed.
 			 * Otherwise, it is skipped for now.
@@ -2524,6 +2608,11 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 						/* Always perform the resolution */
 						must_run = 1;
 						break;
+					case OBJ_TYPE_ACME_RSLV:
+						/* Always perform the resolution */
+						must_run = 1;
+						break;
+
 					default:
 						break;
 				}
@@ -2536,7 +2625,7 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 			}
 
 			if (!must_run) {
-				/* Skip the reolsution. reset it and wait for the next wakeup */
+				/* Skip the resolution. reset it and wait for the next wakeup */
 				resolv_reset_resolution(res);
 				continue;
 			}
@@ -2629,7 +2718,7 @@ static void resolvers_destroy(struct resolvers *resolvers)
 		resolv_free_resolution(res);
 	}
 
-	free_proxy(resolvers->px);
+	proxy_drop(resolvers->px);
 	free(resolvers->id);
 	free((char *)resolvers->conf.file);
 	task_destroy(resolvers->t);
@@ -2803,9 +2892,7 @@ static int stats_dump_resolv_to_buffer(struct stconn *sc,
 	memset(stats, 0, sizeof(struct field) * stats_count);
 
 	list_for_each_entry(mod, stat_modules, list) {
-		struct counters_node *counters = EXTRA_COUNTERS_GET(ns->extra_counters, mod);
-
-		if (!mod->fill_stats(counters, stats + idx, NULL))
+		if (!mod->fill_stats(mod, ns->extra_counters, stats + idx, NULL))
 			continue;
 		idx += mod->stats_count;
 	}
@@ -2900,7 +2987,7 @@ int resolv_allocate_counters(struct list *stat_modules)
 	list_for_each_entry(resolvers, &sec_resolvers, list) {
 		list_for_each_entry(ns, &resolvers->nameservers, list) {
 			EXTRA_COUNTERS_REGISTER(&ns->extra_counters, COUNTERS_RSLV,
-			                        alloc_failed);
+			                        alloc_failed, &ns->extra_counters_storage, 0);
 
 			list_for_each_entry(mod, stat_modules, list) {
 				EXTRA_COUNTERS_ADD(mod,
@@ -2909,15 +2996,15 @@ int resolv_allocate_counters(struct list *stat_modules)
 				                   mod->counters_size);
 			}
 
-			EXTRA_COUNTERS_ALLOC(ns->extra_counters, alloc_failed);
+			EXTRA_COUNTERS_ALLOC(ns->extra_counters, alloc_failed, 1);
 
 			list_for_each_entry(mod, stat_modules, list) {
-				memcpy(ns->extra_counters->data + mod->counters_off[ns->extra_counters->type],
+				memcpy(*ns->extra_counters->datap + mod->counters_off[ns->extra_counters->type],
 				       mod->counters, mod->counters_size);
 
 				/* Store the ns counters pointer */
 				if (strcmp(mod->name, "resolvers") == 0) {
-					ns->counters = (struct dns_counters *)ns->extra_counters->data + mod->counters_off[COUNTERS_RSLV];
+					ns->counters = (struct dns_counters *)(*ns->extra_counters->datap) + mod->counters_off[COUNTERS_RSLV];
 					ns->counters->id = ns->id;
 					ns->counters->ns_puid = ns->puid;
 					ns->counters->pid = resolvers->id;
@@ -3316,6 +3403,7 @@ enum act_parse_ret resolv_parse_do_resolve(const char **args, int *orig_arg, str
  do_resolve_parse_error:
 	ha_free(&rule->arg.resolv.varname);
 	ha_free(&rule->arg.resolv.resolvers_id);
+	ha_free(&rule->arg.resolv.opts);
 	memprintf(err, "Can't parse '%s'. Expects 'do-resolve(<varname>,<resolvers>[,<options>]) <expr>'. Available options are 'ipv4' and 'ipv6'",
 			args[cur_arg]);
 	return ACT_RET_PRS_ERR;
@@ -3362,7 +3450,6 @@ int check_action_do_resolve(struct act_rule *rule, struct proxy *px, char **err)
 void resolvers_setup_proxy(struct proxy *px)
 {
 	px->maxconn = 0;
-	px->conn_retries = 1;
 	px->conn_retries = 1; /* FIXME ignored since 91e785ed
 	                       * ("MINOR: stream: Rely on a per-stream max connection retries value")
 	                       * If this is really expected this should be set on the stream directly
@@ -3580,7 +3667,7 @@ out:
 err_free_conf_file:
 	ha_free((void **)&r->conf.file);
 err_free_p:
-	free_proxy(p);
+	proxy_drop(p);
 err_free_r:
 	ha_free(&r);
 	return err_code;
@@ -4079,7 +4166,7 @@ static int rslv_promex_fill_ts(void *unused, void *metric_ctx, unsigned int id, 
 	labels[1].name  = ist("nameserver");
 	labels[1].value = ist(ns->id);
 
-	ret = resolv_fill_stats(ns->counters, stats, &id);
+	ret = resolv_fill_stats(&rslv_stats_module, ns->extra_counters, stats, &id);
 	if (ret == 1)
 		*field = stats[id];
 	return ret;

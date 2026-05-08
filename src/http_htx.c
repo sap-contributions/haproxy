@@ -41,17 +41,18 @@ struct list http_replies_list = LIST_HEAD_INIT(http_replies_list);
 /* The declaration of an errorfiles/errorfile directives. Used during config
  * parsing only. */
 struct conf_errors {
-	char type;                                  /* directive type (0: errorfiles, 1: errorfile) */
+	enum http_err_directive directive;          /* directive type: inline (errorfile <code> <file>) / section (errorfiles <section>) */
 	union {
 		struct {
 			int status;                 /* the status code associated to this error */
 			struct http_reply *reply;   /* the http reply for the errorfile */
-		} errorfile;                        /* describe an "errorfile" directive */
+		} inl;                              /* for HTTP_ERR_DIRECTIVE_INLINE only */
 		struct {
 			char *name;                 /* the http-errors section name */
-			char status[HTTP_ERR_SIZE]; /* list of status to import (0: ignore, 1: implicit import, 2: explicit import) */
-		} errorfiles;                       /* describe an "errorfiles" directive */
-	} info;
+			struct http_errors *resolved; /* resolved section pointer set via proxy_check_http_errors() */
+			enum http_err_import status[HTTP_ERR_SIZE]; /* list of status to import */
+		} section;                          /* for HTTP_ERR_DIRECTIVE_SECTION only */
+	} type;
 
 	char *file;                                 /* file where the directive appears */
 	int line;                                   /* line where the directive appears */
@@ -59,7 +60,7 @@ struct conf_errors {
 	struct list list;                           /* next conf_errors */
 };
 
-/* Returns the next unporocessed start line in the HTX message. It returns NULL
+/* Returns the next unprocessed start line in the HTX message. It returns NULL
  * if the start-line is undefined (first == -1). Otherwise, it returns the
  * pointer on the htx_sl structure.
  */
@@ -282,7 +283,7 @@ int http_match_header(const struct htx *htx, const struct my_regex *re, struct h
 /* Adds a header block int the HTX message <htx>, just before the EOH block. It
  * returns 1 on success, otherwise it returns 0.
  */
-int http_add_header(struct htx *htx, const struct ist n, const struct ist v)
+int http_add_header(struct htx *htx, const struct ist n, const struct ist v, int update_authority)
 {
 	struct htx_blk *blk;
 	struct htx_sl *sl;
@@ -317,10 +318,12 @@ int http_add_header(struct htx *htx, const struct ist n, const struct ist v)
 	}
 
   end:
-	sl = http_get_stline(htx);
-	if (sl && (sl->flags & HTX_SL_F_HAS_AUTHORITY) && isteqi(n, ist("host"))) {
-		if (!http_update_authority(htx, sl, v))
-			goto fail;
+	if (update_authority) {
+		sl = http_get_stline(htx);
+		if (sl && (sl->flags & HTX_SL_F_HAS_AUTHORITY) && isteqi(n, ist("host"))) {
+			if (!http_update_authority(htx, sl, v))
+				goto fail;
+		}
 	}
 	return 1;
 
@@ -649,7 +652,8 @@ int http_prepend_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const s
  * <data>. It returns 1 on success, otherwise it returns 0. The context is
  * updated if necessary.
  */
-int http_replace_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const struct ist data)
+int http_replace_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const struct ist data,
+			      int update_authority)
 {
 	struct htx_blk *blk = ctx->blk;
 	struct htx_sl *sl;
@@ -668,15 +672,17 @@ int http_replace_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const s
 	blk = htx_replace_blk_value(htx, blk, ist2(start, len), data);
 	if (!blk)
 		goto fail;
-
 	v = htx_get_blk_value(htx, blk);
+
+	if (!update_authority)
+		goto out;
 
 	sl = http_get_stline(htx);
 	if (sl && (sl->flags & HTX_SL_F_HAS_AUTHORITY)) {
 		struct ist n = htx_get_blk_name(htx, blk);
 
 		if (isteq(n, ist("host"))) {
-			if (!http_update_authority(htx, sl, v))
+			if (!http_update_authority(htx, sl, data))
 				goto fail;
 			ctx->blk = NULL;
 			http_find_header(htx, ist("host"), ctx, 1);
@@ -684,7 +690,7 @@ int http_replace_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const s
 			v = htx_get_blk_value(htx, blk);
 		}
 	}
-
+  out:
 	ctx->blk = blk;
 	ctx->value = ist2(v.ptr + off, data.len);
 	ctx->lws_before = ctx->lws_after = 0;
@@ -699,7 +705,8 @@ int http_replace_header_value(struct htx *htx, struct http_hdr_ctx *ctx, const s
  * context is updated if necessary.
  */
 int http_replace_header(struct htx *htx, struct http_hdr_ctx *ctx,
-			const struct ist name, const struct ist value)
+			const struct ist name, const struct ist value,
+			int update_authority)
 {
 	struct htx_blk *blk = ctx->blk;
 	struct htx_sl *sl;
@@ -711,6 +718,9 @@ int http_replace_header(struct htx *htx, struct http_hdr_ctx *ctx,
 	if (!blk)
 		goto fail;
 
+	if (!update_authority)
+		goto out;
+
 	sl = http_get_stline(htx);
 	if (sl && (sl->flags & HTX_SL_F_HAS_AUTHORITY) && isteqi(name, ist("host"))) {
 		if (!http_update_authority(htx, sl, value))
@@ -720,6 +730,7 @@ int http_replace_header(struct htx *htx, struct http_hdr_ctx *ctx,
 		blk = ctx->blk;
 	}
 
+  out:
 	ctx->blk = blk;
 	ctx->value = ist(NULL);
 	ctx->lws_before = ctx->lws_after = 0;
@@ -867,7 +878,7 @@ int http_update_host(struct htx *htx, struct htx_sl *sl, const struct ist uri)
 		/* Replace header host value */
 		ctx.blk = NULL;
 		while (http_find_header(htx, ist("host"), &ctx, 1)) {
-			if (!http_replace_header_value(htx, &ctx, authority))
+			if (!http_replace_header_value(htx, &ctx, authority, 0))
 				goto fail;
 		}
 
@@ -1856,14 +1867,14 @@ int http_scheme_based_normalize(struct htx *htx)
 		normalize = 1;
 	}
 
-	if (!isttest(path)) {
+	if (!isttest(path) && sl->info.req.meth != HTTP_METH_OPTIONS) {
 		path = ist("/");
 		normalize = 1;
 	}
 
 	if (normalize) {
 		/* reconstruct the uri with removal of the port */
-		struct buffer *temp = get_trash_chunk();
+		struct buffer *temp = alloc_trash_chunk();
 		struct ist meth, vsn;
 
 		/* meth */
@@ -1878,16 +1889,23 @@ int http_scheme_based_normalize(struct htx *htx)
 		chunk_memcat(temp, uri.ptr, authority.ptr - uri.ptr);
 		chunk_istcat(temp, host);
 		chunk_istcat(temp, path);
-		uri = ist2(temp->area + meth.len + vsn.len, host.len + path.len + authority.ptr - uri.ptr); /* uri */
+
+		/* update host and uri to point on temp chunk*/
+		host = ist2(temp->area + meth.len + vsn.len + (authority.ptr - uri.ptr), host.len);
+		uri  = ist2(temp->area + meth.len + vsn.len, host.len + path.len + authority.ptr - uri.ptr);
+
 
 		http_replace_stline(htx, meth, uri, vsn);
 
-		/* replace every host headers values by the normalized host */
+		/* replace every host headers by the normalized host */
 		ctx.blk = NULL;
-		while (http_find_header(htx, ist("host"), &ctx, 0)) {
-			if (!http_replace_header_value(htx, &ctx, host))
+		while (http_find_header(htx, ist("host"), &ctx, 1)) {
+			if (!http_replace_header_value(htx, &ctx, host, 0)) {
+				free_trash_chunk(temp);
 				goto fail;
+			}
 		}
+		free_trash_chunk(temp);
 	}
 
 	return 0;
@@ -2034,9 +2052,9 @@ static int proxy_parse_errorloc(char **args, int section, struct proxy *curpx,
 		ret = -1;
 		goto out;
 	}
-	conf_err->type = 1;
-	conf_err->info.errorfile.status = status;
-	conf_err->info.errorfile.reply = reply;
+	conf_err->directive = HTTP_ERR_DIRECTIVE_INLINE;
+	conf_err->type.inl.status = status;
+	conf_err->type.inl.reply = reply;
 
 	conf_err->file = strdup(file);
 	conf_err->line = line;
@@ -2105,9 +2123,9 @@ static int proxy_parse_errorfile(char **args, int section, struct proxy *curpx,
 		ret = -1;
 		goto out;
 	}
-	conf_err->type = 1;
-	conf_err->info.errorfile.status = status;
-	conf_err->info.errorfile.reply = reply;
+	conf_err->directive = HTTP_ERR_DIRECTIVE_INLINE;
+	conf_err->type.inl.status = status;
+	conf_err->type.inl.reply = reply;
 	conf_err->file = strdup(file);
 	conf_err->line = line;
 	LIST_APPEND(&curpx->conf.errors, &conf_err->list);
@@ -2146,12 +2164,12 @@ static int proxy_parse_errorfiles(char **args, int section, struct proxy *curpx,
 		memprintf(err, "%s : out of memory.", args[0]);
 		goto error;
 	}
-	conf_err->type = 0;
 
-	conf_err->info.errorfiles.name = name;
+	conf_err->directive = HTTP_ERR_DIRECTIVE_SECTION;
+	conf_err->type.section.name = name;
 	if (!*(args[2])) {
 		for (rc = 0; rc < HTTP_ERR_SIZE; rc++)
-			conf_err->info.errorfiles.status[rc] = 1;
+			conf_err->type.section.status[rc] = HTTP_ERR_IMPORT_IMPLICIT;
 	}
 	else {
 		int cur_arg, status;
@@ -2160,7 +2178,7 @@ static int proxy_parse_errorfiles(char **args, int section, struct proxy *curpx,
 
 			for (rc = 0; rc < HTTP_ERR_SIZE; rc++) {
 				if (http_err_codes[rc] == status) {
-					conf_err->info.errorfiles.status[rc] = 2;
+					conf_err->type.section.status[rc] = HTTP_ERR_IMPORT_EXPLICIT;
 					break;
 				}
 			}
@@ -2231,16 +2249,16 @@ static int proxy_parse_http_error(char **args, int section, struct proxy *curpx,
 	if (reply->type == HTTP_REPLY_ERRFILES) {
 		int rc = http_get_status_idx(reply->status);
 
-		conf_err->type = 2;
-		conf_err->info.errorfiles.name = reply->body.http_errors;
-		conf_err->info.errorfiles.status[rc] = 2;
+		conf_err->directive = HTTP_ERR_DIRECTIVE_SECTION;
+		conf_err->type.section.name = reply->body.http_errors;
+		conf_err->type.section.status[rc] = HTTP_ERR_IMPORT_EXPLICIT;
 		reply->body.http_errors = NULL;
 		release_http_reply(reply);
 	}
 	else {
-		conf_err->type = 1;
-		conf_err->info.errorfile.status = reply->status;
-		conf_err->info.errorfile.reply = reply;
+		conf_err->directive = HTTP_ERR_DIRECTIVE_INLINE;
+		conf_err->type.inl.status = reply->status;
+		conf_err->type.inl.reply = reply;
 		LIST_APPEND(&http_replies_list, &reply->list);
 	}
 	conf_err->file = strdup(file);
@@ -2260,60 +2278,46 @@ static int proxy_parse_http_error(char **args, int section, struct proxy *curpx,
 
 }
 
-/* Check "errorfiles" proxy keyword */
-static int proxy_check_errors(struct proxy *px)
+/* Converts <conf_errors> initialized during config parsing for <px> proxy.
+ * Each one of them is transformed in a http_reply type, stored in proxy
+ * replies array member. The original <conf_errors> becomes unneeded and is
+ * thus removed and freed.
+ */
+static int proxy_finalize_http_errors(struct proxy *px)
 {
 	struct conf_errors *conf_err, *conf_err_back;
 	struct http_errors *http_errs;
-	int rc, err = ERR_NONE;
+	int rc;
 
 	list_for_each_entry_safe(conf_err, conf_err_back, &px->conf.errors, list) {
-		if (conf_err->type == 1) {
-			/* errorfile */
-			rc = http_get_status_idx(conf_err->info.errorfile.status);
-			px->replies[rc] = conf_err->info.errorfile.reply;
+		switch (conf_err->directive) {
+		case HTTP_ERR_DIRECTIVE_INLINE:
+			rc = http_get_status_idx(conf_err->type.inl.status);
+			px->replies[rc] = conf_err->type.inl.reply;
 
 			/* For proxy, to rely on default replies, just don't reference a reply */
 			if (px->replies[rc]->type == HTTP_REPLY_ERRMSG && !px->replies[rc]->body.errmsg)
 				px->replies[rc] = NULL;
-		}
-		else {
-			/* errorfiles */
-			list_for_each_entry(http_errs, &http_errors_list, list) {
-				if (strcmp(http_errs->id, conf_err->info.errorfiles.name) == 0)
-					break;
-			}
+			break;
 
-			/* unknown http-errors section */
-			if (&http_errs->list == &http_errors_list) {
-				ha_alert("proxy '%s': unknown http-errors section '%s' (at %s:%d).\n",
-					 px->id, conf_err->info.errorfiles.name, conf_err->file, conf_err->line);
-				err |= ERR_ALERT | ERR_FATAL;
-				free(conf_err->info.errorfiles.name);
-				goto next;
-			}
-
-			free(conf_err->info.errorfiles.name);
-			for (rc = 0; rc < HTTP_ERR_SIZE; rc++) {
-				if (conf_err->info.errorfiles.status[rc] > 0) {
+		case HTTP_ERR_DIRECTIVE_SECTION:
+			http_errs = conf_err->type.section.resolved;
+			if (http_errs) {
+				for (rc = 0; rc < HTTP_ERR_SIZE; rc++) {
+					if (conf_err->type.section.status[rc] == HTTP_ERR_IMPORT_NO)
+						continue;
 					if (http_errs->replies[rc])
 						px->replies[rc] = http_errs->replies[rc];
-					else if (conf_err->info.errorfiles.status[rc] == 2)
-						ha_warning("config: proxy '%s' : status '%d' not declared in"
-							   " http-errors section '%s' (at %s:%d).\n",
-							   px->id, http_err_codes[rc], http_errs->id,
-							   conf_err->file, conf_err->line);
 				}
 			}
 		}
-	  next:
+
 		LIST_DELETE(&conf_err->list);
 		free(conf_err->file);
 		free(conf_err);
 	}
 
-  out:
-	return err;
+	return ERR_NONE;
 }
 
 static int post_check_errors()
@@ -2343,6 +2347,55 @@ static int post_check_errors()
 	return err_code;
 }
 
+/* Checks the validity of conf_errors stored in <px> proxy after the
+ * configuration is completely parsed.
+ *
+ * Returns ERR_NONE on success and a combination of ERR_CODE on failure.
+ */
+int proxy_check_http_errors(struct proxy *px)
+{
+	struct http_errors *http_errs;
+	struct conf_errors *conf_err;
+	int section_found;
+	int rc, err = ERR_NONE;
+
+	list_for_each_entry(conf_err, &px->conf.errors, list) {
+		if (conf_err->directive == HTTP_ERR_DIRECTIVE_SECTION) {
+			section_found = 0;
+			list_for_each_entry(http_errs, &http_errors_list, list) {
+				if (strcmp(http_errs->id, conf_err->type.section.name) == 0) {
+					section_found = 1;
+					break;
+				}
+			}
+
+			if (!section_found) {
+				ha_alert("proxy '%s': unknown http-errors section '%s' (at %s:%d).\n",
+				         px->id, conf_err->type.section.name, conf_err->file, conf_err->line);
+				ha_free(&conf_err->type.section.name);
+				err |= ERR_ALERT | ERR_FATAL;
+				continue;
+			}
+
+			conf_err->type.section.resolved = http_errs;
+			ha_free(&conf_err->type.section.name);
+
+			for (rc = 0; rc < HTTP_ERR_SIZE; rc++) {
+				if (conf_err->type.section.status[rc] == HTTP_ERR_IMPORT_EXPLICIT &&
+				    !http_errs->replies[rc]) {
+					ha_warning("config: proxy '%s' : status '%d' not declared in"
+					           " http-errors section '%s' (at %s:%d).\n",
+					           px->id, http_err_codes[rc], http_errs->id,
+					           conf_err->file, conf_err->line);
+					err |= ERR_WARN;
+				}
+			}
+		}
+	}
+
+	return err;
+}
+
 int proxy_dup_default_conf_errors(struct proxy *curpx, const struct proxy *defpx, char **errmsg)
 {
 	struct conf_errors *conf_err, *new_conf_err = NULL;
@@ -2354,19 +2407,22 @@ int proxy_dup_default_conf_errors(struct proxy *curpx, const struct proxy *defpx
 			memprintf(errmsg, "unable to duplicate default errors (out of memory).");
 			goto out;
 		}
-		new_conf_err->type = conf_err->type;
-		if (conf_err->type == 1) {
-			new_conf_err->info.errorfile.status = conf_err->info.errorfile.status;
-			new_conf_err->info.errorfile.reply  = conf_err->info.errorfile.reply;
-		}
-		else {
-			new_conf_err->info.errorfiles.name = strdup(conf_err->info.errorfiles.name);
-			if (!new_conf_err->info.errorfiles.name) {
+		new_conf_err->directive = conf_err->directive;
+		switch (conf_err->directive) {
+		case HTTP_ERR_DIRECTIVE_INLINE:
+			new_conf_err->type.inl.status = conf_err->type.inl.status;
+			new_conf_err->type.inl.reply  = conf_err->type.inl.reply;
+			break;
+
+		case HTTP_ERR_DIRECTIVE_SECTION:
+			new_conf_err->type.section.name = strdup(conf_err->type.section.name);
+			if (!new_conf_err->type.section.name) {
 				memprintf(errmsg, "unable to duplicate default errors (out of memory).");
 				goto out;
 			}
-			memcpy(&new_conf_err->info.errorfiles.status, &conf_err->info.errorfiles.status,
-			       sizeof(conf_err->info.errorfiles.status));
+			memcpy(&new_conf_err->type.section.status, &conf_err->type.section.status,
+			       sizeof(conf_err->type.section.status));
+			break;
 		}
 		new_conf_err->file = strdup(conf_err->file);
 		new_conf_err->line = conf_err->line;
@@ -2385,8 +2441,8 @@ void proxy_release_conf_errors(struct proxy *px)
 	struct conf_errors *conf_err, *conf_err_back;
 
 	list_for_each_entry_safe(conf_err, conf_err_back, &px->conf.errors, list) {
-		if (conf_err->type == 0)
-			free(conf_err->info.errorfiles.name);
+		if (conf_err->directive == HTTP_ERR_DIRECTIVE_SECTION)
+			free(conf_err->type.section.name);
 		LIST_DELETE(&conf_err->list);
 		free(conf_err->file);
 		free(conf_err);
@@ -2505,7 +2561,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 }};
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
-REGISTER_POST_PROXY_CHECK(proxy_check_errors);
+REGISTER_POST_PROXY_CHECK(proxy_finalize_http_errors);
 REGISTER_POST_CHECK(post_check_errors);
 
 REGISTER_CONFIG_SECTION("http-errors", cfg_parse_http_errors, NULL);

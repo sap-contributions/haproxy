@@ -585,8 +585,8 @@ struct server *get_server_rnd(struct stream *s, const struct server *avoid)
 				curr = prev;
 			else if (wcurr == wprev && curr->counters.shared.tg && prev->counters.shared.tg) {
 				/* same load: pick the lowest weighted request rate */
-				wcurr = read_freq_ctr_period_estimate(&curr->counters._sess_per_sec, MS_TO_TICKS(1000));
-				wprev = read_freq_ctr_period_estimate(&prev->counters._sess_per_sec, MS_TO_TICKS(1000));
+				wcurr = read_freq_ctr_period_estimate(&curr->counters.shared.tg[tgid - 1]->sess_per_sec, MS_TO_TICKS(1000));
+				wprev = read_freq_ctr_period_estimate(&prev->counters.shared.tg[tgid - 1]->sess_per_sec, MS_TO_TICKS(1000));
 				if (wprev * curr->cur_eweight < wcurr * prev->cur_eweight)
 					curr = prev;
 			}
@@ -750,7 +750,7 @@ int assign_server(struct stream *s)
 
 			case BE_LB_HASH_URI:
 				/* URI hashing */
-				if (IS_HTX_STRM(s) && s->txn->req.msg_state >= HTTP_MSG_BODY) {
+				if (IS_HTX_STRM(s) && s->txn.http->req.msg_state >= HTTP_MSG_BODY) {
 					struct ist uri;
 
 					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
@@ -768,20 +768,20 @@ int assign_server(struct stream *s)
 
 			case BE_LB_HASH_PRM:
 				/* URL Parameter hashing */
-				if (IS_HTX_STRM(s) && s->txn->req.msg_state >= HTTP_MSG_BODY) {
+				if (IS_HTX_STRM(s) && s->txn.http->req.msg_state >= HTTP_MSG_BODY) {
 					struct ist uri;
 
 					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
 					srv = get_server_ph(s->be, uri.ptr, uri.len, prev_srv);
 
-					if (!srv && s->txn->meth == HTTP_METH_POST)
+					if (!srv && s->txn.http->meth == HTTP_METH_POST)
 						srv = get_server_ph_post(s, prev_srv);
 				}
 				break;
 
 			case BE_LB_HASH_HDR:
 				/* Header Parameter hashing */
-				if (IS_HTX_STRM(s) && s->txn->req.msg_state >= HTTP_MSG_BODY)
+				if (IS_HTX_STRM(s) && s->txn.http->req.msg_state >= HTTP_MSG_BODY)
 					srv = get_server_hh(s, prev_srv);
 				break;
 
@@ -1005,9 +1005,9 @@ int assign_server_and_queue(struct stream *s)
 			 */
 
 			if (prev_srv != objt_server(s->target)) {
-				if (s->txn && (s->txn->flags & TX_CK_MASK) == TX_CK_VALID) {
-					s->txn->flags &= ~TX_CK_MASK;
-					s->txn->flags |= TX_CK_DOWN;
+				if (s->txn.http && (s->txn.http->flags & TX_CK_MASK) == TX_CK_VALID) {
+					s->txn.http->flags &= ~TX_CK_MASK;
+					s->txn.http->flags |= TX_CK_DOWN;
 				}
 				s->flags |= SF_REDISP;
 				if (prev_srv->counters.shared.tg)
@@ -1115,8 +1115,8 @@ int assign_server_and_queue(struct stream *s)
 			 * To work around that, when a server is getting idle,
 			 * it will set the ready_srv field of the proxy.
 			 * Here, if ready_srv is non-NULL, we get that server,
-			 * and we attempt to switch its served from 0 to 1.
-			 * If it works, then we can just run, otherwise,
+			 * and we attempt to increment its served counter up to
+			 * maxconn. If it works, then we can just run, otherwise,
 			 * it means another stream will be running, and will
 			 * dequeue us eventually, so we can just do nothing.
 			 */
@@ -1396,7 +1396,7 @@ check_tgid:
 			tree = search_tree ? &srv->per_thr[i].safe_conns : &srv->per_thr[i].idle_conns;
 			conn = srv_lookup_conn(tree, hash);
 			while (conn) {
-				if (conn->mux->takeover && conn->mux->takeover(conn, i, 0) == 0) {
+				if (conn->mux->takeover && CALL_MUX_WITH_RET(conn->mux, takeover(conn, i, 0)) == 0) {
 					conn_delete_from_tree(conn, i);
 					_HA_ATOMIC_INC(&activity[tid].fd_takeover);
 					found = 1;
@@ -1438,7 +1438,6 @@ check_tgid:
 
 		if (reuse_mode == PR_O_REUSE_SAFE && conn->mux->flags & MX_FL_HOL_RISK) {
 			/* attach the connection to the session private list */
-			conn->owner = sess;
 			session_add_conn(sess, conn);
 		}
 		else {
@@ -1498,7 +1497,7 @@ takeover_random_idle_conn(struct ceb_root **root, int curtid)
 
 	conn = ceb64_item_first(root, hash_node.node, hash_node.key, struct connection);
 	while (conn) {
-		if (conn->mux->takeover && conn->mux->takeover(conn, curtid, 1) == 0) {
+		if (conn->mux->takeover && CALL_MUX_WITH_RET(conn->mux, takeover(conn, curtid, 1)) == 0) {
 			conn_delete_from_tree(conn, curtid);
 			return conn;
 		}
@@ -1555,7 +1554,7 @@ kill_random_idle_conn(struct server *srv)
 			 */
 			_HA_ATOMIC_INC(&srv->curr_used_conns);
 		}
-		conn->mux->destroy(conn->ctx);
+		CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
 		return 1;
 	}
 	return 0;
@@ -1765,7 +1764,7 @@ int be_reuse_connection(int64_t hash, struct session *sess,
 			}
 
 			if (avail >= 1) {
-				if (srv_conn->mux->attach(srv_conn, sc->sedesc, sess) == -1) {
+				if (CALL_MUX_WITH_RET(srv_conn->mux, attach(srv_conn, sc->sedesc, sess)) == -1) {
 					if (sc_reset_endp(sc) < 0)
 						goto err;
 					sc_ep_clr(sc, ~SE_FL_DETACHED);
@@ -1837,7 +1836,7 @@ int connect_server(struct stream *s)
 		DBG_TRACE_STATE("skip idle connections reuse: websocket stream", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 	}
 	else {
-		const int not_first_req = s->txn && s->txn->flags & TX_NOT_FIRST;
+		const int not_first_req = s->txn.http && s->txn.http->flags & TX_NOT_FIRST;
 		struct ist name = IST_NULL;
 		struct sample *name_smp;
 
@@ -1879,7 +1878,7 @@ int connect_server(struct stream *s)
 			 * It will in turn call srv_release_conn through
 			 * conn_free which also uses it.
 			 */
-			tokill_conn->mux->destroy(tokill_conn->ctx);
+			CALL_MUX_NO_RET(tokill_conn->mux, destroy(tokill_conn->ctx));
 		}
 		else {
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
@@ -2059,6 +2058,26 @@ int connect_server(struct stream *s)
 					srv_conn->sni_hash = ssl_sock_sni_hash(sni);
 				}
 			}
+
+#if defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
+			/* Delay mux initialization if SSL and ALPN/NPN is set
+			 * and server cache is not yet populated. Note that in
+			 * TCP mode this check is ignored as only mux-pt is
+			 * available.
+			 *
+			 * This check must be performed before conn_prepare()
+			 * to ensure consistency across the whole stack, in
+			 * particular for QUIC between quic-conn and mux layer.
+			 */
+			if (IS_HTX_STRM(s) && srv->use_ssl &&
+			    (srv->ssl_ctx.alpn_str || srv->ssl_ctx.npn_str)) {
+				HA_RWLOCK_RDLOCK(SERVER_LOCK, &srv->path_params.param_lock);
+				if (srv->path_params.nego_alpn[0] == 0)
+					may_start_mux_now = 0;
+				HA_RWLOCK_RDUNLOCK(SERVER_LOCK, &srv->path_params.param_lock);
+			}
+#endif /* TLSEXT_TYPE_application_layer_protocol_negotiation */
+
 #endif /* USE_OPENSSL */
 
 			if (conn_prepare(srv_conn, proto, srv->xprt)) {
@@ -2091,21 +2110,6 @@ int connect_server(struct stream *s)
 		}
 		srv_conn->ctx = s->scb;
 
-#if defined(USE_OPENSSL) && defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
-		/* Delay mux initialization if SSL and ALPN/NPN is set. Note
-		 * that this is skipped in TCP mode as we only want mux-pt
-		 * anyway.
-		 */
-		if (srv) {
-			HA_RWLOCK_RDLOCK(SERVER_LOCK, &srv->path_params.param_lock);
-			if (IS_HTX_STRM(s) && srv->use_ssl &&
-			    (srv->ssl_ctx.alpn_str || srv->ssl_ctx.npn_str) &&
-			    srv->path_params.nego_alpn[0] == 0)
-				may_start_mux_now = 0;
-			HA_RWLOCK_RDUNLOCK(SERVER_LOCK, &srv->path_params.param_lock);
-		}
-#endif
-
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;
 
@@ -2117,6 +2121,11 @@ int connect_server(struct stream *s)
 		if (srv && (srv->flags & SRV_F_SOCKS4_PROXY)) {
 			srv_conn->send_proxy_ofs = 1;
 			srv_conn->flags |= CO_FL_SOCKS4;
+		}
+
+		if (srv && srv->mux_proto && isteq(srv->mux_proto->token, ist("qmux"))) {
+			srv_conn->flags |= (CO_FL_QSTRM_RECV|CO_FL_QSTRM_SEND);
+			may_start_mux_now = 0;
 		}
 
 #if defined(USE_OPENSSL) && defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
@@ -2199,7 +2208,7 @@ int connect_server(struct stream *s)
 	 */
 	if (may_start_mux_now) {
 		const struct mux_ops *alt_mux =
-		  likely(!(s->flags & SF_WEBSOCKET)) ? NULL : srv_get_ws_proto(srv);
+		  likely(!(s->flags & SF_WEBSOCKET) || !srv) ? NULL : srv_get_ws_proto(srv);
 		if (conn_install_mux_be(srv_conn, s->scb, s->sess, alt_mux) < 0) {
 			conn_full_close(srv_conn);
 			return SF_ERR_INTERNAL;
@@ -2254,16 +2263,16 @@ int connect_server(struct stream *s)
 #endif
 
 	/* set connect timeout */
-	s->conn_exp = tick_add_ifset(now_ms, s->be->timeout.connect);
+	s->conn_exp = tick_add_ifset(now_ms, s->connect_timeout);
 
 	if (srv) {
 		int count;
 
 		s->flags |= SF_CURR_SESS;
 		count = _HA_ATOMIC_ADD_FETCH(&srv->cur_sess, 1);
-		HA_ATOMIC_UPDATE_MAX(&srv->counters.cur_sess_max, count);
-		if (s->be->lbprm.server_take_conn)
-			s->be->lbprm.server_take_conn(srv);
+		COUNTERS_UPDATE_MAX(&srv->counters.cur_sess_max, count);
+		if (s->be->lbprm.ops && s->be->lbprm.ops->server_take_conn)
+			s->be->lbprm.ops->server_take_conn(srv);
 	}
 
 	/* Now handle synchronously connected sockets. We know the stream connector
@@ -2377,7 +2386,7 @@ int srv_redispatch_connect(struct stream *s)
 		return 1;
 
 	case SRV_STATUS_QUEUED:
-		s->conn_exp = tick_add_ifset(now_ms, s->be->timeout.queue);
+		s->conn_exp = tick_add_ifset(now_ms, s->queue_timeout);
 		s->scb->state = SC_ST_QUE;
 
 		/* handle the unlikely event where we added to the server's
@@ -3058,7 +3067,7 @@ int be_downtime(struct proxy *px) {
 
 /* Checks if <px> backend supports the addition of servers at runtime. Either a
  * backend or a defaults proxy are supported. If proxy is incompatible, <msg>
- * will be allocated to contain a textual explaination.
+ * will be allocated to contain a textual explanation.
  */
 int be_supports_dynamic_srv(struct proxy *px, char **msg)
 {
@@ -3742,6 +3751,42 @@ smp_fetch_srv_uweight(const struct arg *args, struct sample *smp, const char *kw
 }
 
 static int
+smp_fetch_be_connect_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	struct proxy *px = NULL;
+
+	if (smp->strm)
+		px = smp->strm->be;
+	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
+		px = __objt_check(smp->sess->origin)->proxy;
+	if (!px)
+		return 0;
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = TICKS_TO_MS(px->timeout.connect);
+	return 1;
+}
+
+static int
+smp_fetch_be_queue_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	struct proxy *px = NULL;
+
+	if (smp->strm)
+		px = smp->strm->be;
+	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
+		px = __objt_check(smp->sess->origin)->proxy;
+	if (!px)
+		return 0;
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = TICKS_TO_MS(px->timeout.queue);
+	return 1;
+}
+
+static int
 smp_fetch_be_server_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
 {
 	struct proxy *px = NULL;
@@ -3756,6 +3801,24 @@ smp_fetch_be_server_timeout(const struct arg *args, struct sample *smp, const ch
 	smp->flags = SMP_F_VOL_TXN;
 	smp->data.type = SMP_T_SINT;
 	smp->data.u.sint = TICKS_TO_MS(px->timeout.server);
+	return 1;
+}
+
+static int
+smp_fetch_be_tarpit_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	struct proxy *px = NULL;
+
+	if (smp->strm)
+		px = smp->strm->be;
+	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
+		px = __objt_check(smp->sess->origin)->proxy;
+	if (!px)
+		return 0;
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = TICKS_TO_MS(px->timeout.tarpit);
 	return 1;
 }
 
@@ -3859,8 +3922,11 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "be_conn_free",      smp_fetch_be_conn_free,      ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "be_id",             smp_fetch_be_id,             0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_name",           smp_fetch_be_name,           0,           NULL, SMP_T_STR,  SMP_USE_BKEND, },
+	{ "be_connect_timeout",smp_fetch_be_connect_timeout,0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
+	{ "be_queue_timeout",  smp_fetch_be_queue_timeout,  0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_server_timeout", smp_fetch_be_server_timeout, 0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_sess_rate",      smp_fetch_be_sess_rate,      ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "be_tarpit_timeout", smp_fetch_be_tarpit_timeout, 0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "be_tunnel_timeout", smp_fetch_be_tunnel_timeout, 0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "connslots",         smp_fetch_connslots,         ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "nbsrv",             smp_fetch_nbsrv,             ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },

@@ -37,6 +37,7 @@ struct htx_blk *htx_add_blk(struct htx *htx, enum htx_blk_type type, uint32_t bl
 struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk);
 struct htx_ret htx_find_offset(struct htx *htx, uint32_t offset);
 void htx_truncate(struct htx *htx, uint32_t offset);
+void htx_truncate_blk(struct htx *htx, struct htx_blk *blk);
 struct htx_ret htx_drain(struct htx *htx, uint32_t max);
 
 struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
@@ -56,6 +57,16 @@ size_t htx_add_data(struct htx *htx, const struct ist data);
 struct htx_blk *htx_add_last_data(struct htx *htx, struct ist data);
 void htx_move_blk_before(struct htx *htx, struct htx_blk **blk, struct htx_blk **ref);
 int htx_append_msg(struct htx *dst, const struct htx *src);
+struct buffer *htx_move_to_small_buffer(struct buffer *dst, struct buffer *src);
+struct buffer *htx_move_to_large_buffer(struct buffer *dst, struct buffer *src);
+struct buffer *htx_copy_to_small_buffer(struct buffer *dst, struct buffer *src);
+struct buffer *htx_copy_to_large_buffer(struct buffer *dst, struct buffer *src);
+
+#define HTX_XFER_DEFAULT           0x00000000 /* Default XFER: no partial xfer / remove blocks from source */
+#define HTX_XFER_KEEP_SRC_BLKS     0x00000001 /* Don't remove xfer blocks from source messages during xfer */
+#define HTX_XFER_PARTIAL_HDRS_COPY 0x00000002 /* Allow partial copy of headers and trailers part */
+#define HTX_XFER_HDRS_ONLY         0x00000003 /* Only Transfer header blocks (start-line, header and EOH) */
+size_t htx_xfer(struct htx *dst, struct htx *src, size_t count, unsigned int flags);
 
 /* Functions and macros to get parts of the start-line or length of these
  * parts. Request and response start-lines are both composed of 3 parts.
@@ -96,6 +107,11 @@ static inline struct ist htx_sl_p2(const struct htx_sl *sl)
 static inline struct ist htx_sl_p3(const struct htx_sl *sl)
 {
 	return ist2(HTX_SL_P3_PTR(sl), HTX_SL_P3_LEN(sl));
+}
+
+static inline struct ist htx_sl_vsn(const struct htx_sl *sl)
+{
+	return ((sl->flags & HTX_SL_F_IS_RESP) ? htx_sl_p1(sl) : htx_sl_p3(sl));
 }
 
 static inline struct ist htx_sl_req_meth(const struct htx_sl *sl)
@@ -149,26 +165,36 @@ static inline struct htx_blk *htx_get_blk(const struct htx *htx, uint32_t pos)
 	return (struct htx_blk *)(htx->blocks + htx_pos_to_addr(htx, pos));
 }
 
+static inline enum htx_blk_type __htx_blkinfo_type(uint32_t info)
+{
+	return (info >> 28);
+}
+
 /* Returns the type of the block <blk> */
 static inline enum htx_blk_type htx_get_blk_type(const struct htx_blk *blk)
 {
-	return (blk->info >> 28);
+	return __htx_blkinfo_type(blk->info);
 }
 
-/* Returns the size of the block <blk>, depending of its type */
-static inline uint32_t htx_get_blksz(const struct htx_blk *blk)
+static inline enum htx_blk_type __htx_blkinfo_size(uint32_t info)
 {
-	enum htx_blk_type type = htx_get_blk_type(blk);
+	enum htx_blk_type type = __htx_blkinfo_type(info);
 
 	switch (type) {
 		case HTX_BLK_HDR:
 		case HTX_BLK_TLR:
 			/*       name.length       +        value.length        */
-			return ((blk->info & 0xff) + ((blk->info >> 8) & 0xfffff));
+			return ((info & 0xff) + ((info >> 8) & 0xfffff));
 		default:
 			/*         value.length      */
-			return (blk->info & 0xfffffff);
+			return (info & 0xfffffff);
 	}
+}
+
+/* Returns the size of the block <blk>, depending of its type */
+static inline uint32_t htx_get_blksz(const struct htx_blk *blk)
+{
+	return __htx_blkinfo_size(blk->info);
 }
 
 /* Returns the position of the oldest entry (head). It returns a signed 32-bits
@@ -474,11 +500,12 @@ static inline struct htx_sl *htx_add_stline(struct htx *htx, enum htx_blk_type t
 static inline struct htx_blk *htx_add_header(struct htx *htx, const struct ist name,
 					     const struct ist value)
 {
-	struct htx_blk *blk;
+	struct htx_blk *blk, *tailblk;
 
 	if (name.len > 255 || value.len > 1048575)
 		return NULL;
 
+	tailblk = htx_get_tail_blk(htx);
 	blk = htx_add_blk(htx, HTX_BLK_HDR, name.len + value.len);
 	if (!blk)
 		return NULL;
@@ -486,6 +513,8 @@ static inline struct htx_blk *htx_add_header(struct htx *htx, const struct ist n
 	blk->info += (value.len << 8) + name.len;
 	ist2bin_lc(htx_get_blk_ptr(htx, blk), name);
 	memcpy(htx_get_blk_ptr(htx, blk)  + name.len, value.ptr, value.len);
+	if (tailblk && htx_get_blk_type(tailblk) >= HTX_BLK_EOH)
+		htx->flags |= HTX_FL_UNORDERED;
 	return blk;
 }
 
@@ -495,11 +524,12 @@ static inline struct htx_blk *htx_add_header(struct htx *htx, const struct ist n
 static inline struct htx_blk *htx_add_trailer(struct htx *htx, const struct ist name,
 					      const struct ist value)
 {
-	struct htx_blk *blk;
+	struct htx_blk *blk, *tailblk;
 
 	if (name.len > 255 || value.len > 1048575)
 		return NULL;
 
+	tailblk = htx_get_tail_blk(htx);
 	blk = htx_add_blk(htx, HTX_BLK_TLR, name.len + value.len);
 	if (!blk)
 		return NULL;
@@ -507,6 +537,8 @@ static inline struct htx_blk *htx_add_trailer(struct htx *htx, const struct ist 
 	blk->info += (value.len << 8) + name.len;
 	ist2bin_lc(htx_get_blk_ptr(htx, blk), name);
 	memcpy(htx_get_blk_ptr(htx, blk)  + name.len, value.ptr, value.len);
+	if (tailblk && htx_get_blk_type(tailblk) >= HTX_BLK_EOT)
+		htx->flags |= HTX_FL_UNORDERED;
 	return blk;
 }
 

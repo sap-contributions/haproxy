@@ -2,10 +2,22 @@
 #ifndef _ACME_T_H_
 #define _ACME_T_H_
 
+#include <haproxy/acme_resolvers-t.h>
 #include <haproxy/istbuf.h>
+#include <haproxy/buf-t.h>
+#include <haproxy/jwt-t.h>
 #include <haproxy/openssl-compat.h>
 
+#if defined(HAVE_ACME)
+
 #define ACME_RETRY 5
+
+/* Readiness requirements for challenge */
+#define ACME_RDY_NONE         0x00
+#define ACME_RDY_CLI          0x01
+#define ACME_RDY_DNS          0x02
+#define ACME_RDY_DELAY        0x04
+#define ACME_RDY_INITIAL_DNS  0x08
 
 /* acme section configuration */
 struct acme_cfg {
@@ -13,6 +25,9 @@ struct acme_cfg {
 	int linenum;                /* config linenum */
 	char *name;                 /* section name */
 	int reuse_key;              /* do we need to renew the private key */
+	int cond_ready;             /* ready condition */
+	unsigned int dns_delay;     /* delay in seconds before re-triggering DNS resolution (default: 300) */
+	unsigned int dns_timeout;   /* time after which the DNS check shouldn't be retried  (default: 600) */
 	char *directory;            /* directory URL */
 	char *map;                  /* storage for tokens + thumbprint */
 	struct {
@@ -27,7 +42,15 @@ struct acme_cfg {
 		int bits;                   /* bits for RSA */
 		int curves;                 /* NID of curves */
 	} key;
+	struct {
+		char *kid_file;        /* EAB key id filename */
+		char *mac_key_file;    /* base64url encoded EAB hmac key filename */
+		char *kid;             /* EAB key id */
+		struct buffer mac_key; /* raw EAB hmac key */
+		enum jwt_alg mac_alg;  /* MAC algorithm for EAB signature */
+	} eab;
 	char *challenge;            /* HTTP-01, DNS-01, etc */
+	char *profile;              /* ACME profile */
 	char *vars;                 /* variables put in the dpapi sink */
 	char *provider;             /* DNS provider put in the dpapi sink */
 	struct acme_cfg *next;
@@ -40,6 +63,13 @@ enum acme_st {
 	ACME_NEWACCOUNT,
 	ACME_NEWORDER,
 	ACME_AUTH,
+	ACME_INITIAL_RSLV_TRIGGER,   /* opportunistic DNS check to avoid cond_ready steps */
+	ACME_INITIAL_RSLV_READY,
+	ACME_CLI_WAIT,               /* wait for the ACME_RDY_CLI */
+	ACME_INITIAL_DELAY,
+	ACME_RSLV_RETRY_DELAY,
+	ACME_RSLV_TRIGGER,
+	ACME_RSLV_READY,
 	ACME_CHALLENGE,
 	ACME_CHKCHALLENGE,
 	ACME_FINALIZE,
@@ -58,6 +88,8 @@ struct acme_auth {
        struct ist auth;   /* auth URI */
        struct ist chall;  /* challenge URI */
        struct ist token;  /* token */
+       int validated;     /* already validated */
+       struct acme_rslv *rslv; /* acme dns-01 resolver */
        int ready;         /* is the challenge ready ? */
        void *next;
 };
@@ -84,6 +116,8 @@ struct acme_ctx {
 	X509_REQ *req;
 	struct ist finalize;
 	struct ist certificate;
+	unsigned int dnstasks;      /* number of DNS tasks running for this ctx */
+	unsigned int dnsstarttime;  /* time at which we started the DNS checks */
 	struct task *task;
 	struct ebmb_node node;
 	char name[VAR_ARRAY];
@@ -100,5 +134,7 @@ struct acme_ctx {
 #define ACME_VERB_SIMPLE   3
 #define ACME_VERB_ADVANCED 4
 #define ACME_VERB_COMPLETE 5
+
+#endif /* ! HAVE_ACME */
 
 #endif

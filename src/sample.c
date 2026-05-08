@@ -266,39 +266,39 @@ const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
 	                   SMP_VAL___________ | SMP_VAL_BE_CHK_RUL | SMP_VAL___________ |
 	                   SMP_VAL___________ ),
 
-	[SMP_SRC_RQFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	[SMP_SRC_RQFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
 	                   SMP_VAL_FE_LOG_END | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ ),
 
 	[SMP_SRC_RSFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
 	                   SMP_VAL_FE_LOG_END | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ ),
 
-	[SMP_SRC_TXFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	[SMP_SRC_TXFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
 	                   SMP_VAL_FE_LOG_END | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ ),
 
-	[SMP_SRC_SSFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
-	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	[SMP_SRC_SSFIN] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
 	                   SMP_VAL_FE_LOG_END | SMP_VAL___________ | SMP_VAL___________ |
 	                   SMP_VAL___________ ),
 };
@@ -451,6 +451,17 @@ void sample_register_fetches(struct sample_fetch_kw_list *kwl)
 		for (bit = 0; bit < SMP_SRC_ENTRIES; bit++)
 			if (sf->use & (1 << bit))
 				sf->val |= fetch_cap[bit];
+		/* store declaration file/line if known */
+		if (sf->exec_ctx.type)
+			continue;
+
+		if (caller_initcall) {
+			sf->exec_ctx.type = TH_EX_CTX_INITCALL;
+			sf->exec_ctx.initcall = caller_initcall;
+		} else {
+			sf->exec_ctx.type = TH_EX_CTX_SMPF;
+			sf->exec_ctx.smpf_kwl = kwl;
+		}
 	}
 	LIST_APPEND(&sample_fetches.list, &kwl->list);
 }
@@ -461,6 +472,21 @@ void sample_register_fetches(struct sample_fetch_kw_list *kwl)
  */
 void sample_register_convs(struct sample_conv_kw_list *pckl)
 {
+	struct sample_conv *sc;
+
+	/* store declaration file/line if known */
+	for (sc = pckl->kw; sc->kw != NULL; sc++) {
+		if (sc->exec_ctx.type)
+			continue;
+
+		if (caller_initcall) {
+			sc->exec_ctx.type = TH_EX_CTX_INITCALL;
+			sc->exec_ctx.initcall = caller_initcall;
+		} else {
+			sc->exec_ctx.type = TH_EX_CTX_CONV;
+			sc->exec_ctx.conv_kwl = pckl;
+		}
+	}
 	LIST_APPEND(&sample_convs.list, &pckl->list);
 }
 
@@ -859,7 +885,7 @@ static int c_int2str(struct sample *smp)
  */
 int smp_dup(struct sample *smp)
 {
-	struct buffer *trash;
+	struct buffer *trash, *buf;
 
 	switch (smp->data.type) {
 	case SMP_T_BOOL:
@@ -876,21 +902,23 @@ int smp_dup(struct sample *smp)
 		__fallthrough;
 
 	case SMP_T_STR:
-		trash = get_trash_chunk();
-		trash->data = smp->data.type == SMP_T_STR ?
-		    smp->data.u.str.data : smp->data.u.meth.str.data;
+		buf = (smp->data.type == SMP_T_STR ? &smp->data.u.str : &smp->data.u.meth.str);
+		trash = get_trash_chunk_sz(buf->data+1);
+		if (!trash)
+			return 0;
+		trash->data = buf->data;
 		if (trash->data > trash->size - 1)
 			trash->data = trash->size - 1;
 
-		memcpy(trash->area, smp->data.type == SMP_T_STR ?
-		    smp->data.u.str.area : smp->data.u.meth.str.area,
-		    trash->data);
+		memcpy(trash->area, buf->area, trash->data);
 		trash->area[trash->data] = 0;
-		smp->data.u.str = *trash;
+		*buf = *trash;
 		break;
 
 	case SMP_T_BIN:
-		trash = get_trash_chunk();
+		trash = get_trash_chunk_sz(smp->data.u.str.data);
+		if (!trash)
+			return 0;
 		trash->data = smp->data.u.str.data;
 		if (trash->data > trash->size)
 			trash->data = trash->size;
@@ -1333,8 +1361,8 @@ int sample_process_cnv(struct sample_expr *expr, struct sample *p)
 		}
 
 		/* OK cast succeeded */
-
-		if (!conv_expr->conv->process(conv_expr->arg_p, p, conv_expr->conv->private))
+		if (!EXEC_CTX_WITH_RET(conv_expr->conv->exec_ctx,
+		                       conv_expr->conv->process(conv_expr->arg_p, p, conv_expr->conv->private)))
 			return 0;
 	}
 	return 1;
@@ -1374,7 +1402,8 @@ struct sample *sample_process(struct proxy *px, struct session *sess,
 	}
 
 	smp_set_owner(p, px, sess, strm, opt);
-	if (!expr->fetch->process(expr->arg_p, p, expr->fetch->kw, expr->fetch->private))
+	if (!EXEC_CTX_WITH_RET(expr->fetch->exec_ctx,
+	                       expr->fetch->process(expr->arg_p, p, expr->fetch->kw, expr->fetch->private)))
 		return NULL;
 
 	if (!sample_process_cnv(expr, p))
@@ -1442,6 +1471,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 		case ARGC_TCK:   where = "in tcp-check expression in"; break;
 		case ARGC_CFG:   where = "in configuration expression in"; break;
 		case ARGC_CLI:   where = "in CLI expression in"; break;
+		case ARGC_OTEL:  where = "in otel-scope directive in"; break;
 		}
 
 		/* set a few default settings */
@@ -1459,7 +1489,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err2);
 				ha_free(&err2);
 				cfgerr++;
-				continue;
+				break;
 			}
 			break;
 
@@ -1469,7 +1499,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 					 *err ? *err : "", cur->file, cur->line,
 					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
-				continue;
+				break;
 			}
 
 			/* we support two formats : "bck/srv" and "srv" */
@@ -1508,6 +1538,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 				break;
 			}
 
+			/* TODO CLI set-var should not prevent server deletion as var value is instantly resolved. */
 			srv->flags |= SRV_F_NON_PURGEABLE;
 
 			chunk_destroy(&arg->data.str);
@@ -1537,6 +1568,9 @@ int smp_resolve_args(struct proxy *p, char **err)
 				break;
 			}
 
+			/* TODO CLI set-var should not prevent proxy deletion as var value is instantly resolved. */
+			px->flags |= PR_FL_NON_PURGEABLE;
+
 			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
 			arg->data.prx = px;
@@ -1563,6 +1597,9 @@ int smp_resolve_args(struct proxy *p, char **err)
 				cfgerr++;
 				break;
 			}
+
+			/* TODO CLI set-var should not prevent proxy deletion as var value is instantly resolved. */
+			px->flags |= PR_FL_NON_PURGEABLE;
 
 			chunk_destroy(&arg->data.str);
 			arg->unresolved = 0;
@@ -1645,7 +1682,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 					 *err ? *err : "", cur->file, cur->line,
 					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
 				cfgerr++;
-				continue;
+				break;
 			}
 
 			rflags = 0;
@@ -1659,7 +1696,7 @@ int smp_resolve_args(struct proxy *p, char **err)
 					 cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id, err2);
 				ha_free(&err2);
 				cfgerr++;
-				continue;
+				break;
 			}
 
 			chunk_destroy(&arg->data.str);
@@ -1857,9 +1894,11 @@ static int smp_check_debug(struct arg *args, struct sample_conv *conv,
 
 static int sample_conv_base642bin(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data);
 	int bin_len;
 
+	if (!trash)
+		return 0;
 	trash->data = 0;
 	bin_len = base64dec(smp->data.u.str.area, smp->data.u.str.data,
 			    trash->area, trash->size);
@@ -1875,9 +1914,11 @@ static int sample_conv_base642bin(const struct arg *arg_p, struct sample *smp, v
 
 static int sample_conv_base64url2bin(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data);
 	int bin_len;
 
+	if (!trash)
+		return 0;
 	trash->data = 0;
 	bin_len = base64urldec(smp->data.u.str.area, smp->data.u.str.data,
 			    trash->area, trash->size);
@@ -1893,9 +1934,11 @@ static int sample_conv_base64url2bin(const struct arg *arg_p, struct sample *smp
 
 static int sample_conv_bin2base64(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz((smp->data.u.str.data+2) * 4 / 3);
 	int b64_len;
 
+	if (!trash)
+		return 0;
 	trash->data = 0;
 	b64_len = a2base64(smp->data.u.str.area, smp->data.u.str.data,
 			   trash->area, trash->size);
@@ -1911,9 +1954,11 @@ static int sample_conv_bin2base64(const struct arg *arg_p, struct sample *smp, v
 
 static int sample_conv_bin2base64url(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz((smp->data.u.str.data+2) * 4 / 3);
 	int b64_len;
 
+	if (!trash)
+		return 0;
 	trash->data = 0;
 	b64_len = a2base64url(smp->data.u.str.area, smp->data.u.str.data,
 			   trash->area, trash->size);
@@ -2012,15 +2057,18 @@ static int sample_conv_2dec_check(struct arg *args, struct sample_conv *conv,
  */
 static int sample_conv_2dec(const struct arg *args, struct sample *smp, void *private, int be)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data);
 	const int last = args[2].data.sint ? smp->data.u.str.data - args[1].data.sint + 1 : smp->data.u.str.data;
-	int max_size = trash->size - 2;
+	int max_size;
 	int i;
 	int start;
 	int ptr = 0;
 	unsigned long long number;
 	char *pos;
 
+	if (!trash)
+		return 0;
+	max_size = trash->size - 2;
 	trash->data = 0;
 
 	while (ptr < last && trash->data <= max_size) {
@@ -2102,7 +2150,7 @@ static int sample_conv_be2hex_check(struct arg *args, struct sample_conv *conv,
  */
 static int sample_conv_be2hex(const struct arg *args, struct sample *smp, void *private)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data);
 	int chunk_size = args[1].data.sint;
 	const int last = args[2].data.sint ? smp->data.u.str.data - chunk_size + 1 : smp->data.u.str.data;
 	int i;
@@ -2110,6 +2158,8 @@ static int sample_conv_be2hex(const struct arg *args, struct sample *smp, void *
 	int ptr = 0;
 	unsigned char c;
 
+	if (!trash)
+		return 0;
 	trash->data = 0;
 	if (args[0].data.str.data == 0 && args[2].data.sint == 0)
 		chunk_size = smp->data.u.str.data;
@@ -2130,6 +2180,15 @@ static int sample_conv_be2hex(const struct arg *args, struct sample *smp, void *
 			trash->area[trash->data++] = hextab[(c >> 4) & 0xF];
 			trash->area[trash->data++] = hextab[c & 0xF];
 		}
+
+		if (trash->data >= max_size) {
+			struct buffer *trash2 = get_larger_trash_chunk(trash);
+
+			if (!trash2)
+				break;
+			max_size += trash2->size - trash->size;
+			trash = trash2;
+		}
 	}
 
 	smp->data.u.str = *trash;
@@ -2140,10 +2199,12 @@ static int sample_conv_be2hex(const struct arg *args, struct sample *smp, void *
 
 static int sample_conv_bin2hex(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data*2);
 	unsigned char c;
 	int ptr = 0;
 
+	if (!trash)
+		return 0;
 	trash->data = 0;
 	while (ptr < smp->data.u.str.data && trash->data <= trash->size - 2) {
 		c = smp->data.u.str.area[ptr++];
@@ -2158,16 +2219,26 @@ static int sample_conv_bin2hex(const struct arg *arg_p, struct sample *smp, void
 
 static int sample_conv_bin2base2(const struct arg *arg_p, struct sample *smp, void *private)
 {
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data);
 	unsigned char c;
 	int ptr = 0;
 	int bit = 0;
 
+	if (!trash)
+		return 0;
 	trash->data = 0;
 	while (ptr < smp->data.u.str.data && trash->data <= trash->size - 8) {
 		c = smp->data.u.str.area[ptr++];
                 for (bit = 7; bit >= 0; bit--)
                         trash->area[trash->data++] = c & (1 << bit) ? '1' : '0';
+
+		if (trash->data >= trash->size - 8) {
+			struct buffer *trash2 = get_larger_trash_chunk(trash);
+
+			if (!trash2)
+				break;
+			trash = trash2;
+		}
 	}
 	smp->data.u.str = *trash;
 	smp->data.type = SMP_T_STR;
@@ -2787,8 +2858,11 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
 		}
 
 		/* Check length */
-		if (temp->data + len > temp->size)
-			return 0;
+		if (temp->data + len > temp->size) {
+			temp = get_larger_trash_chunk(temp);
+			if (!temp)
+				return 0;
+		}
 
 		/* Copy string. */
 		memcpy(temp->area + temp->data, str, len);
@@ -3177,11 +3251,14 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 	char *start, *end;
 	struct my_regex *reg = arg_p[0].data.reg;
 	regmatch_t pmatch[MAX_MATCH];
-	struct buffer *trash = get_trash_chunk();
+	struct buffer *trash = get_trash_chunk_sz(smp->data.u.str.data);
+	struct buffer *tmp;
 	struct buffer *output;
 	int flag, max;
 	int found;
 
+	if (!trash)
+		return 0;
 	start = smp->data.u.str.area;
 	end = start + smp->data.u.str.data;
 
@@ -3199,6 +3276,13 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 		if (!found)
 			pmatch[0].rm_so = end - start;
 
+		/* If too many data to copy try to get a larger chunk */
+		if (pmatch[0].rm_so > b_room(trash)) {
+			tmp = get_larger_trash_chunk(trash);
+			if (tmp)
+				trash = tmp;
+		}
+
 		/* copy the heading non-matching part (which may also be the tail if nothing matches) */
 		max = trash->size - trash->data;
 		if (max && pmatch[0].rm_so > 0) {
@@ -3215,7 +3299,19 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 		if (!output)
 			break;
 
-		output->data = exp_replace(output->area, output->size, start, arg_p[1].data.str.area, pmatch);
+		max = exp_replace(output->area, output->size, start, arg_p[1].data.str.area, pmatch);
+		if ((int)max < 0) {
+			free_trash_chunk(output);
+			break;
+		}
+		output->data = max;
+
+		/* If too many data to copy try to get a larger chunk */
+		if (output->data > b_room(trash)) {
+			tmp = get_larger_trash_chunk(trash);
+			if (tmp)
+				trash = tmp;
+		}
 
 		/* replace the matching part */
 		max = trash->size - trash->data;
@@ -3232,6 +3328,13 @@ static int sample_conv_regsub(const struct arg *arg_p, struct sample *smp, void 
 		/* stop here if we're done with this string */
 		if (start >= end)
 			break;
+
+		/* If too many data to copy try to get a larger chunk */
+		if (!b_room(trash)) {
+			tmp = get_larger_trash_chunk(trash);
+			if (tmp)
+				trash = tmp;
+		}
 
 		/* We have a special case for matches of length 0 (eg: "x*y*").
 		 * These ones are considered to match in front of a character,
@@ -3591,9 +3694,18 @@ static int sample_conv_concat(const struct arg *arg_p, struct sample *smp, void 
 {
 	struct buffer *trash;
 	struct sample tmp;
+	struct ist var = IST_NULL;
 	int max;
 
-	trash = alloc_trash_chunk();
+
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[1].type == ARGT_VAR && vars_get_by_desc(&arg_p[1].data.var, &tmp, NULL) &&
+	    (sample_casts[tmp.data.type][SMP_T_STR] == c_none ||
+	     sample_casts[tmp.data.type][SMP_T_STR](&tmp))) {
+		var = ist2(b_orig(&tmp.data.u.str), b_data(&tmp.data.u.str));
+	}
+
+	trash = alloc_trash_chunk_sz(smp->data.u.str.data + arg_p[0].data.str.data + istlen(var) + arg_p[2].data.str.data);
 	if (!trash)
 		return 0;
 
@@ -3615,24 +3727,15 @@ static int sample_conv_concat(const struct arg *arg_p, struct sample *smp, void 
 		trash->area[trash->data] = 0;
 	}
 
-	/* append second string (variable) if it's found and we can turn it
-	 * into a string.
-	 */
-	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (arg_p[1].type == ARGT_VAR && vars_get_by_desc(&arg_p[1].data.var, &tmp, NULL) &&
-	    (sample_casts[tmp.data.type][SMP_T_STR] == c_none ||
-	     sample_casts[tmp.data.type][SMP_T_STR](&tmp))) {
+	/* append second string (variable) if it's found */
+	max = istlen(var);
+	if (max > trash->size - 1 - trash->data)
+		max = trash->size - 1 - trash->data;
 
-		max = tmp.data.u.str.data;
-		if (max > trash->size - 1 - trash->data)
-			max = trash->size - 1 - trash->data;
-
-		if (max) {
-			memcpy(trash->area + trash->data, tmp.data.u.str.area,
-			       max);
-			trash->data += max;
-			trash->area[trash->data] = 0;
-		}
+	if (max) {
+		memcpy(trash->area + trash->data, istptr(var), max);
+		trash->data += max;
+		trash->area[trash->data] = 0;
 	}
 
 	/* append third string */
@@ -3675,10 +3778,18 @@ static int sample_conv_add_item(const struct arg *arg_p, struct sample *smp, voi
 {
 	struct buffer *tmpbuf;
 	struct sample tmp;
+	struct ist var = IST_NULL;
 	size_t max;
-	int var_available;
 
-	tmpbuf = alloc_trash_chunk();
+	/* Check if variable is found and we can turn into a string. */
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[1].type == ARGT_VAR && vars_get_by_desc(&arg_p[1].data.var, &tmp, NULL) &&
+	    (sample_casts[tmp.data.type][SMP_T_STR] == c_none ||
+	     sample_casts[tmp.data.type][SMP_T_STR](&tmp))) {
+		var = ist2(b_orig(&tmp.data.u.str), b_data(&tmp.data.u.str));
+	}
+
+	tmpbuf = alloc_trash_chunk_sz(smp->data.u.str.data + arg_p[0].data.str.data + istlen(var) + arg_p[2].data.str.data);
 	if (!tmpbuf)
 		return 0;
 
@@ -3689,19 +3800,10 @@ static int sample_conv_add_item(const struct arg *arg_p, struct sample *smp, voi
 	memcpy(tmpbuf->area, smp->data.u.str.area, tmpbuf->data);
 	tmpbuf->area[tmpbuf->data] = 0;
 
-	/* Check if variable is found and we can turn into a string. */
-	var_available = 0;
-	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (arg_p[1].type == ARGT_VAR && vars_get_by_desc(&arg_p[1].data.var, &tmp, NULL) &&
-	    (sample_casts[tmp.data.type][SMP_T_STR] == c_none ||
-	     sample_casts[tmp.data.type][SMP_T_STR](&tmp)))
-		var_available = 1;
-
 	/* Append delimiter only if input is not empty and either
 	 * the variable or the suffix are not empty
 	 */
-	if (smp->data.u.str.data && ((var_available && tmp.data.u.str.data) ||
-	    arg_p[2].data.str.data)) {
+	if (smp->data.u.str.data && ((istlen(var) && tmp.data.u.str.data) || arg_p[2].data.str.data)) {
 		max = arg_p[0].data.str.data;
 		if (max > tmpbuf->size - 1 - tmpbuf->data)
 			max = tmpbuf->size - 1 - tmpbuf->data;
@@ -3714,13 +3816,13 @@ static int sample_conv_add_item(const struct arg *arg_p, struct sample *smp, voi
 	}
 
 	/* Append variable contents if variable is found and turned into string. */
-	if (var_available) {
-		max = tmp.data.u.str.data;
+	if (istlen(var)) {
+		max = istlen(var);
 		if (max > tmpbuf->size - 1 - tmpbuf->data)
 			max = tmpbuf->size - 1 - tmpbuf->data;
 
 		if (max) {
-			memcpy(tmpbuf->area + tmpbuf->data, tmp.data.u.str.area, max);
+			memcpy(tmpbuf->area + tmpbuf->data, istptr(var), max);
 			tmpbuf->data += max;
 			tmpbuf->area[tmpbuf->data] = 0;
 		}
@@ -3921,25 +4023,25 @@ static int sample_conv_when(const struct arg *arg_p, struct sample *smp, void *p
 		    ((strm->flags & SF_REDISP) ||
 		     ((strm->flags & SF_ERR_MASK) > SF_ERR_LOCAL) ||
 		     (((strm->flags & SF_ERR_MASK) == SF_ERR_NONE) && strm->conn_retries) ||
-		     ((sess->fe->mode == PR_MODE_HTTP) && strm->txn && strm->txn->status >= 500)))
+		     ((sess->fe->mode == PR_MODE_HTTP) && strm->txn.http && strm->txn.http->status >= 500)))
 			ret = 1;
 		break;
 
 	case WHEN_COND_FORWARDED: // true if forwarded to a connection
-		ret = !!sc_conn(smp->strm->scb);
+		ret = strm && !!sc_conn(strm->scb);
 		break;
 
 	case WHEN_COND_TOAPPLET:  // true if handled as an applet
-		ret = !!sc_appctx(smp->strm->scb);
+		ret = strm && !!sc_appctx(strm->scb);
 		break;
 
 	case WHEN_COND_PROCESSED: // true if forwarded or appctx
-		ret = sc_conn(smp->strm->scb) || sc_appctx(smp->strm->scb);
+		ret = strm && (sc_conn(strm->scb) || sc_appctx(strm->scb));
 		break;
 
 	case WHEN_COND_ACL: // true if the ACL pointed to by args[2] evaluates to true
 		acl_sample = arg_p[2].data.ptr;
-		ret = acl_exec_cond(&acl_sample->cond, smp->px, smp->sess, smp->strm, smp->opt) == ACL_TEST_PASS;
+		ret = acl_exec_cond(&acl_sample->cond, smp->px, smp->sess, strm, smp->opt) == ACL_TEST_PASS;
 		break;
 	}
 
@@ -4012,6 +4114,7 @@ static int check_when_cond(struct arg *args, struct sample_conv *conv,
 		if (!(acl_sample->terms[0].acl = find_acl_by_name(args[1].data.str.area, &curproxy->acl)) &&
 		    !(acl_sample->terms[0].acl = find_acl_default(args[1].data.str.area, &curproxy->acl, err, NULL, NULL, 0))) {
 			memprintf(err, "ACL '%s' not found", args[1].data.str.area);
+			free(acl_sample);
 			return 0;
 		}
 
@@ -4462,9 +4565,14 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
 		case MJSON_TOK_STRING: {
 			int len;
 
+		retry:
 			len = mjson_get_string(smp->data.u.str.area, smp->data.u.str.data, args[0].data.str.area, trash->area, trash->size);
 
 			if (len == -1) {
+				trash = get_larger_trash_chunk(trash);
+				if (trash)
+					goto retry;
+
 				/* invalid string */
 				return 0;
 			}
@@ -4478,6 +4586,11 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
                case MJSON_TOK_ARRAY: {
                        // We copy the complete array, including square brackets into the return buffer
                        // result looks like: ["manage-account","manage-account-links","view-profile"]
+		       if (token_size > trash->size) {
+			       trash = get_larger_trash_chunk(trash);
+			       if (!trash)
+				       return 0;
+		       }
                        trash->data = b_putblk(trash, token, token_size);
                        smp->data.u.str = *trash;
                        smp->data.type = SMP_T_STR;
@@ -4607,7 +4720,7 @@ static int sample_conv_jwt_verify(const struct arg *args, struct sample *smp, vo
 	 * smp_dup) which would end up erasing the contents of the 'smp' input
 	 * buffer.
 	 */
-	input = alloc_trash_chunk();
+	input = alloc_trash_chunk_sz(smp->data.u.str.data);
 	if (!input)
 		return 0;
 	alg = alloc_trash_chunk();
@@ -4660,7 +4773,7 @@ static int sample_conv_jwt_verify_cert(const struct arg *args, struct sample *sm
 	 * smp_dup) which would end up erasing the contents of the 'smp' input
 	 * buffer.
 	 */
-	input = alloc_trash_chunk();
+	input = alloc_trash_chunk_sz(smp->data.u.str.data);
 	if (!input)
 		return 0;
 	alg = alloc_trash_chunk();
@@ -4710,13 +4823,18 @@ static int sample_conv_jwt_member_query(const struct arg *args, struct sample *s
 {
 	struct jwt_item items[JWT_ELT_MAX] = { { 0 } };
 	unsigned int item_num = member + 1; /* We don't need to tokenize the full token */
-	struct buffer *decoded_header = get_trash_chunk();
+	struct buffer *decoded_header;
 	int retval = 0;
 	int ret;
 
-	jwt_tokenize(&smp->data.u.str, items, &item_num);
+	/* We don't need to extract all the parts from the token, we only need a
+	 * specific one.
+	 */
+	if (jwt_tokenize(&smp->data.u.str, items, item_num) < 0)
+		goto end;
 
-	if (item_num < member + 1)
+	decoded_header = get_trash_chunk_sz(items[member].length);
+	if (!decoded_header)
 		goto end;
 
 	ret = base64urldec(items[member].start, items[member].length,
@@ -4945,7 +5063,7 @@ smp_fetch_pid(const struct arg *args, struct sample *smp, const char *kw, void *
 }
 
 
-/* returns the number of the current process (between 1 and nbproc */
+/* returns the number of the current process (between 1 and nbproc) */
 static int
 smp_fetch_proc(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
@@ -4954,12 +5072,58 @@ smp_fetch_proc(const struct arg *args, struct sample *smp, const char *kw, void 
 	return 1;
 }
 
-/* returns the number of the current thread (between 1 and nbthread */
+/* returns the number of the current thread (between 0 and nbthread-1) */
 static int
 smp_fetch_thread(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->data.type = SMP_T_SINT;
 	smp->data.u.sint = tid;
+	return 1;
+}
+
+/* returns the number of the current thread group (between 0 and nbtgroups-1) */
+static int
+smp_fetch_tgroup(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = tgid - 1; // tgid starts at 1
+	return 1;
+}
+
+/* returns the last known CPU usage of the current thread */
+static int
+smp_fetch_cpu_usage_thr(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = 100 - th_ctx->idle_pct;
+	return 1;
+}
+
+/* returns the last known CPU usage of the current thread group */
+static int
+smp_fetch_cpu_usage_grp(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	uint thr, tot = 0;
+
+	for (thr = 0; thr < ha_tgroup_info[tgid - 1].count; thr++)
+		tot += 100 - ha_thread_ctx[ha_tgroup_info[tgid - 1].base + thr].idle_pct;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = (tot + thr / 2) / thr;
+	return 1;
+}
+
+/* returns the last known CPU usage of the whole process */
+static int
+smp_fetch_cpu_usage_proc(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	int thr, tot = 0;
+
+	for (thr = 0; thr < global.nbthread; thr++)
+		tot += 100 - ha_thread_ctx[thr].idle_pct;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = (tot + thr / 2) / thr;
 	return 1;
 }
 
@@ -5458,7 +5622,7 @@ static int smp_fetch_bytes(const struct arg *args, struct sample *smp, const cha
 
 	if (kw[2] == 'q') /* req.bytes_in or req.bytes_out */
 		smp->data.u.sint = (kw[10] == 'i') ? logs->req_in : logs->req_out;
-	if (kw[2] == 's') /* res.bytes_in or res.bytes_out */
+	else if (kw[2] == 's') /* res.bytes_in or res.bytes_out */
 		smp->data.u.sint = (kw[10] == 'i') ? logs->res_in : logs->res_out;
 	else /* bytes_in or bytes_out */
 		smp->data.u.sint = (kw[6] == 'i') ? logs->req_in : logs->res_in;
@@ -5496,8 +5660,8 @@ static int sample_conv_bytes_check(struct arg *args, struct sample_conv *conv,
 }
 
 static struct sample_fetch_kw_list smp_logs_kws = {ILH, {
-	{ "bytes_in",             smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
-	{ "bytes_out",            smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "bytes_in",             smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_RQFIN },
+	{ "bytes_out",            smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_RSFIN },
 
 	{ "txn.timer.total",      smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Ta" */
 	{ "txn.timer.user",       smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Tu" */
@@ -5509,14 +5673,14 @@ static struct sample_fetch_kw_list smp_logs_kws = {ILH, {
 	{ "fc.timer.handshake",   smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_L4CLI }, /* "Th" */
 	{ "fc.timer.total",       smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_SSFIN }, /* "Tt" */
 
-	{ "req.bytes_in",         smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
-	{ "req.bytes_out",        smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "req.bytes_in",         smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_RQFIN },
+	{ "req.bytes_out",        smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_RQFIN },
 	{ "req.timer.idle",       smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "Ti" */
 	{ "req.timer.tq",         smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "Tq" */
 	{ "req.timer.hdr",        smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "TR" */
 	{ "req.timer.queue",      smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_L4SRV }, /* "Tw" */
-	{ "res.bytes_in",         smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
-	{ "res.bytes_out",        smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "res.bytes_in",         smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_RSFIN },
+	{ "res.bytes_out",        smp_fetch_bytes,        0,         NULL, SMP_T_SINT, SMP_USE_RSFIN },
 	{ "res.timer.data",       smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_RSFIN }, /* "Td" */
 	{ "res.timer.hdr",        smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRSHV }, /* "Tr" */
 	{ /* END */ },
@@ -5542,6 +5706,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "proc",         smp_fetch_proc,  0,            NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "quic_enabled", smp_fetch_quic_enabled, 0,     NULL, SMP_T_BOOL, SMP_USE_CONST },
 	{ "thread",       smp_fetch_thread,  0,          NULL, SMP_T_SINT, SMP_USE_CONST },
+	{ "tgroup",       smp_fetch_tgroup,  0,          NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "rand",         smp_fetch_rand,  ARG1(0,SINT), NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "stopping",     smp_fetch_stopping, 0,         NULL, SMP_T_BOOL, SMP_USE_INTRN },
 	{ "uptime",       smp_fetch_uptime,   0,         NULL, SMP_T_SINT, SMP_USE_CONST },
@@ -5550,6 +5715,9 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "cpu_calls",    smp_fetch_cpu_calls,  0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "cpu_ns_avg",   smp_fetch_cpu_ns_avg, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "cpu_ns_tot",   smp_fetch_cpu_ns_tot, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "cpu_usage_grp", smp_fetch_cpu_usage_grp,  0,  NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "cpu_usage_proc",smp_fetch_cpu_usage_proc, 0,  NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "cpu_usage_thr", smp_fetch_cpu_usage_thr,  0,  NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "lat_ns_avg",   smp_fetch_lat_ns_avg, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "lat_ns_tot",   smp_fetch_lat_ns_tot, 0,       NULL, SMP_T_SINT, SMP_USE_INTRN },
 

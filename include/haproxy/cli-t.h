@@ -23,6 +23,7 @@
 #define _HAPROXY_CLI_T_H
 
 #include <haproxy/applet-t.h>
+#include <haproxy/tinfo-t.h>
 
 /* Access level for a stats socket (appctx->cli_ctx.level) */
 #define ACCESS_LVL_NONE     0x0000
@@ -48,6 +49,7 @@
 #define APPCTX_CLI_ST1_PROMPT  (1 << 4) /* display prompt */
 #define APPCTX_CLI_ST1_TIMED   (1 << 5) /* display timer in prompt */
 #define APPCTX_CLI_ST1_YIELD   (1 << 6) /* forced yield between commands */
+#define APPCTX_CLI_ST1_DYN_PAYLOAD (1 << 7) /* the payload was dynamically allocated  */
 
 #define CLI_PREFIX_KW_NB 5
 #define CLI_MAX_MATCHES 5
@@ -100,6 +102,7 @@ enum cli_wait_err {
 enum cli_wait_cond {
 	CLI_WAIT_COND_NONE,      // no condition to wait on
 	CLI_WAIT_COND_SRV_UNUSED,// wait for server to become unused
+	CLI_WAIT_COND_BE_UNUSED, // wait for backend to become unused
 };
 
 struct cli_wait_ctx {
@@ -108,6 +111,13 @@ struct cli_wait_ctx {
 	enum cli_wait_err error; // CLI_WAIT_ERR_*
 	char *args[4];           // up to 4 args taken at parse time, all strduped
 	const char *msg;         // static error message for failures if not NULL
+};
+
+struct pcli_txn {
+	int next_pid;         /* next target PID to use for the CLI proxy */
+	int flags;            /* flags for CLI proxy */
+	char payload_pat[65]; /* payload pattern for the CLI proxy, including trailing \0 */
+
 };
 
 struct cli_kw {
@@ -119,6 +129,8 @@ struct cli_kw {
 	void (*io_release)(struct appctx *appctx);
 	void *private;
 	int level; /* this is the level needed to show the keyword usage and to use it */
+	/* 4-byte hole here */
+	struct thread_exec_ctx exec_ctx;          /* execution context */
 };
 
 struct cli_kw_list {

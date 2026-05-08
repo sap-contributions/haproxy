@@ -79,6 +79,16 @@ static int h1_process_req_vsn(struct h1m *h1m, union h1_sl *sl)
 		sl->rq.v = ist("HTTP/1.0");
 		return 1;
 	}
+	else {
+		if (sl->rq.v.len != 8 ||
+		    !istnmatch(sl->rq.v, ist("HTTP/"), 5) ||
+		    !isdigit((unsigned char)*(sl->rq.v.ptr + 5)) ||
+		    *(sl->rq.v.ptr + 6) != '.' ||
+		    !isdigit((unsigned char)*(sl->rq.v.ptr + 7))) {
+			h1m->flags |= H1_MF_NOT_HTTP;
+			return 1;
+		}
+	}
 
 	if ((sl->rq.v.len == 8) &&
 	    ((*(sl->rq.v.ptr + 5) > '1') ||
@@ -100,11 +110,21 @@ static int h1_process_res_vsn(struct h1m *h1m, union h1_sl *sl)
 		if (sl->st.v.len != 8)
 			return 0;
 
-		if (*(sl->st.v.ptr + 4) != '/' ||
+		if (!istnmatch(sl->st.v, ist("HTTP/"), 5) ||
 		    !isdigit((unsigned char)*(sl->st.v.ptr + 5)) ||
 		    *(sl->st.v.ptr + 6) != '.' ||
 		    !isdigit((unsigned char)*(sl->st.v.ptr + 7)))
 			return 0;
+	}
+	else {
+		if (sl->st.v.len != 8 ||
+		    !istnmatch(sl->st.v, ist("HTTP/"), 5) ||
+		    !isdigit((unsigned char)*(sl->st.v.ptr + 5)) ||
+		    *(sl->st.v.ptr + 6) != '.' ||
+		    !isdigit((unsigned char)*(sl->st.v.ptr + 7))) {
+			h1m->flags |= H1_MF_NOT_HTTP;
+			return 1;
+		}
 	}
 
 	if ((sl->st.v.len == 8) &&
@@ -124,6 +144,8 @@ static unsigned int h1m_htx_sl_flags(struct h1m *h1m)
 		flags |= HTX_SL_F_IS_RESP;
 	if (h1m->flags & H1_MF_VER_11)
 		flags |= HTX_SL_F_VER_11;
+	if (h1m->flags & H1_MF_NOT_HTTP)
+		flags |= HTX_SL_F_NOT_HTTP;
 	if (h1m->flags & H1_MF_XFER_ENC)
 		flags |= HTX_SL_F_XFER_ENC;
 	if (h1m->flags & H1_MF_XFER_LEN) {
@@ -464,9 +486,10 @@ static size_t h1_copy_msg_data(struct htx **dsthtx, struct buffer *srcbuf, size_
 	 *   - count == srcbuf->data
 	 *   - srcbuf->head == sizeof(struct htx)
 	 *   => we can swap the buffers and place an htx header into
-	 *      the target buffer instead
+	 *      the target buffer instead (for buffers of same size)
 	 */
-	if (unlikely(htx_is_empty(tmp_htx) && count == b_data(srcbuf) &&
+	if (unlikely(b_size(srcbuf) == b_size(htxbuf) &&
+		     htx_is_empty(tmp_htx) && count == b_data(srcbuf) &&
 		     !ofs && b_head_ofs(srcbuf) == sizeof(struct htx))) {
 		void *raw_area = srcbuf->area;
 		void *htx_area = htxbuf->area;
@@ -823,6 +846,7 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 
   parsing_error:
 	(*dsthtx)->flags |= HTX_FL_PARSING_ERROR;
+	htx_remove_blk(*dsthtx, htxret.blk);
 	h1m->err_state = h1m->state;
 	h1m->err_pos = ofs + end + ridx - start;
 	return 0;

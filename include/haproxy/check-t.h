@@ -24,6 +24,7 @@
 #include <haproxy/connection-t.h>
 #include <haproxy/dynbuf-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/tools-t.h>
 #include <haproxy/vars-t.h>
 
 /* Please note: this file tends to commonly be part of circular dependencies,
@@ -59,6 +60,7 @@ enum chk_result {
 #define CHK_ST_FASTINTER        0x0400  /* force fastinter check */
 #define CHK_ST_READY            0x0800  /* check ready to migrate or run, see below */
 #define CHK_ST_SLEEPING         0x1000  /* check was sleeping, i.e. not currently bound to a thread, see below */
+#define CHK_ST_USE_SMALL_BUFF   0x2000  /* Use small buffers if possible for the request */
 
 /* 4 possible states for CHK_ST_SLEEPING and CHK_ST_READY:
  *   SLP  RDY   State      Description
@@ -154,7 +156,7 @@ enum {
 };
 
 struct tcpcheck_rule;
-struct tcpcheck_rules;
+struct tcpcheck;
 
 struct check {
 	enum obj_type obj_type;                 /* object type == OBJ_TYPE_CHECK */
@@ -173,7 +175,7 @@ struct check {
 	signed char use_ssl;			/* use SSL for health checks (1: on, 0: server mode, -1: off) */
 	int send_proxy;				/* send a PROXY protocol header with checks */
 	int reuse_pool;				/* try to reuse idle connections */
-	struct tcpcheck_rules *tcpcheck_rules;	/* tcp-check send / expect rules */
+	struct tcpcheck *tcpcheck;               /* tcp-check to use to perform a health-check */
 	struct tcpcheck_rule *current_step;     /* current step when using tcpcheck */
 	int inter, fastinter, downinter;        /* checks: time in milliseconds */
 	enum chk_result result;                 /* health-check result : CHK_RES_* */
@@ -188,6 +190,8 @@ struct check {
 	char **envp;				/* the environment to use if running a process-based check */
 	struct pid_list *curpid;		/* entry in pid_list used for current process-based test, or -1 if not in test */
 	struct sockaddr_storage addr;   	/* the address to check */
+	struct net_addr_type addr_type;         /* Address type (dgram/stream for both protocol and XPRT) */
+	int alt_proto;                          /* Needed to know exactly which protocol we are after */
 	char *pool_conn_name;                   /* conn name used on reuse */
 	char *sni;				/* Server name */
 	char *alpn_str;                         /* ALPN to use for checks */
@@ -195,6 +199,7 @@ struct check {
 	const struct mux_proto_list *mux_proto; /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
 	struct list check_queue;                /* entry in the check queue. Not empty = in queue. */
 	int via_socks4;                         /* check the connection via socks4 proxy */
+	struct ist unique_id;                   /* custom unique ID, same as in struct stream */
 };
 
 #endif /* _HAPROXY_CHECKS_T_H */

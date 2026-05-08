@@ -4,6 +4,7 @@
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/quic_retry.h>
+#include <haproxy/quic_stats.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_trace-t.h>
 #include <haproxy/trace.h>
@@ -282,7 +283,8 @@ int quic_retry_token_check(struct quic_rx_packet *pkt,
 		goto err;
 	}
 
-	aadlen = quic_generate_retry_token_aad(aad, qv->num, &pkt->scid, &dgram->saddr);
+	aadlen = quic_generate_retry_token_aad(aad, qv->num, &pkt->scid,
+	                                       (struct sockaddr_storage *)&dgram->saddr);
 	salt = token + tokenlen - QUIC_RETRY_TOKEN_SALTLEN;
 	if (!quic_tls_derive_retry_token_secret(EVP_sha256(), key, sizeof key, iv, sizeof iv,
 	                                        salt, QUIC_RETRY_TOKEN_SALTLEN, sec, seclen)) {

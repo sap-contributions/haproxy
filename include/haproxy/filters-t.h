@@ -143,7 +143,7 @@ struct flt_kw_list {
  *                          otherwise.
  *  - http_reset          : Called when the HTTP message is reset. It happens
  *                          either when a 100-continue response is received.
- *                          that can be detected if s->txn->status is 10X, or
+ *                          that can be detected if s->txn.http->status is 10X, or
  *                          if we're attempting a L7 retry.
  *                          Returns nothing.
  *  - http_reply          : Called when, at any time, HAProxy decides to stop
@@ -207,11 +207,18 @@ struct flt_ops {
  * accessible from a filter when instantiated in a stream
  */
 struct flt_conf {
+	const char     *name; /* The filter name (same name used to select the filter from config) */
 	const char     *id;   /* The filter id */
 	struct flt_ops *ops;  /* The filter callbacks */
 	void           *conf; /* The filter configuration */
 	struct list     list; /* Next filter for the same proxy */
 	unsigned int    flags; /* FLT_CFG_FL_* */
+};
+
+struct filter_sequence_elt {
+	char *flt_name; /* filter name (set during parsing) */
+	struct flt_conf *flt_conf; /* associated filter conf (set after parsing) */
+	struct list list; /* list element */
 };
 
 /*
@@ -232,22 +239,28 @@ struct filter {
 	                                    * 0: request channel, 1: response channel */
 	unsigned int    pre_analyzers;     /* bit field indicating analyzers to pre-process */
 	unsigned int    post_analyzers;    /* bit field indicating analyzers to post-process */
-	struct list     list;              /* Next filter for the same proxy/stream */
+	struct list     list;              /* Filter list for the stream */
+	/* req_list and res_list are exactly equivalent, except the order may differ */
+	struct list     req_list;          /* Filter list for request channel */
+	struct list     res_list;          /* Filter list for response channel */
 };
 
 /*
  * Structure reprensenting the "global" state of filters attached to a stream.
+ * Doesn't hold much information, as the channel themselves hold chn_flt struct
+ * which contains the per-channel members.
  */
 struct strm_flt {
 	struct list    filters;               /* List of filters attached to a stream */
-	struct filter *current[2];            /* From which filter resume processing, for a specific channel.
-	                                       * This is used for resumable callbacks only,
-	                                       * If NULL, we start from the first filter.
-	                                       * 0: request channel, 1: response channel */
 	unsigned short flags;                 /* STRM_FL_* */
-	unsigned char  nb_req_data_filters;   /* Number of data filters registered on the request channel */
-	unsigned char  nb_rsp_data_filters;   /* Number of data filters registered on the response channel */
-	unsigned long long offset[2];
+};
+
+/* structure holding filter state for some members that are channel oriented */
+struct chn_flt {
+	struct list filters;                  /* List of filters attached to a channel */
+	struct filter *current;               /* From which filter resume processing, for a specific channel. */
+	unsigned char nb_data_filters;        /* Number of data filters registered on channel */
+	unsigned long long offset;
 };
 
 #endif /* _HAPROXY_FILTERS_T_H */

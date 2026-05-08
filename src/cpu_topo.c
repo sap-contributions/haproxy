@@ -1286,7 +1286,8 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 	int thr_per_grp;
 	int thr;
 	int same_core = 0;
-	int cpu_per_group;
+	int cpu_reminder;
+	int grp_generated = 0;
 
 	ha_cpuset_zero(&thrset);
 	ha_cpuset_assign(&saved_touse_ccx, &touse_ccx);
@@ -1297,7 +1298,8 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 	nb_grp = (thr_count + global.maxthrpertgroup - 1) / global.maxthrpertgroup;
 	if (nb_grp > MAX_TGROUPS - global.nbtgroups)
 		nb_grp = MAX_TGROUPS - global.nbtgroups;
-	cpu_per_group = (cpu_count + nb_grp - 1) / nb_grp;
+	cpu_reminder = cpu_count % nb_grp;
+
 	thr_per_grp = (thr_count + nb_grp - 1) / nb_grp;
 	if (thr_per_grp > global.maxthrpertgroup)
 		thr_per_grp = global.maxthrpertgroup;
@@ -1306,6 +1308,7 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 		struct hap_cpuset group_cpuset;
 		struct hap_cpuset current_tsid;
 		struct hap_cpuset current_ccx;
+		int cpu_for_group;
 
 		ha_cpuset_zero(&group_cpuset);
 		ha_cpuset_zero(&current_tsid);
@@ -1318,6 +1321,11 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 		if (thr_per_grp + global.nbthread > MAX_THREADS)
 			thr_per_grp = MAX_THREADS - global.nbthread;
 
+		cpu_for_group = cpu_count / nb_grp;
+		if (grp_generated < cpu_reminder)
+			cpu_for_group++;
+		grp_generated++;
+
 		if ((cpu_policy_conf.affinity & (CPU_AFFINITY_PER_GROUP | CPU_AFFINITY_PER_GROUP_LOOSE)) == CPU_AFFINITY_PER_GROUP) {
 			int i = 0;
 			int next_ccx;
@@ -1327,7 +1335,7 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 			 * Try to allocate them from the same CCX, and then
 			 * the same TSID
 			 */
-			while (i < cpu_per_group) {
+			while (i < cpu_for_group) {
 				int next_cpu = 0;
 				int got_cpu;
 
@@ -1336,7 +1344,7 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 				if (next_ccx == -1)
 					break;
 
-				while (i < cpu_per_group && (got_cpu = find_next_cpu_ccx(next_cpu, next_ccx)) != -1) {
+				while (i < cpu_for_group && (got_cpu = find_next_cpu_ccx(next_cpu, next_ccx)) != -1) {
 					int tsid;
 					int got_cpu_tsid;
 					int next_cpu_tsid = 0;
@@ -1345,7 +1353,7 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 						continue;
 					tsid = ha_cpu_topo[got_cpu].ts_id;
 
-					while (i < cpu_per_group && (got_cpu_tsid = find_next_cpu_tsid(next_cpu_tsid, tsid)) != -1) {
+					while (i < cpu_for_group && (got_cpu_tsid = find_next_cpu_tsid(next_cpu_tsid, tsid)) != -1) {
 						next_cpu_tsid = got_cpu_tsid + 1;
 						if (!ha_cpuset_isset(&node_cpu_set, ha_cpu_topo[got_cpu_tsid].idx))
 							continue;
@@ -1360,7 +1368,7 @@ cpu_policy_assign_threads(int cpu_count, int thr_count, struct hap_cpuset node_c
 				 * At this point there is nothing left
 				 * for us in that CCX, forget about it.
 				 */
-				if (i < cpu_per_group)
+				if (i < cpu_for_group)
 					ha_cpuset_clr(&saved_touse_ccx, next_ccx);
 
 			}
@@ -2156,14 +2164,14 @@ static int cfg_parse_cpu_affinity(char **args, int section_type, struct proxy *c
 		return -1;
 
 	for (i = 0; ha_cpu_affinity[i].name != NULL; i++) {
-		if (!strcmp(args[1], ha_cpu_affinity[i].name)) {
+		if (strcmp(args[1], ha_cpu_affinity[i].name) == 0) {
 			cpu_policy_conf.affinity |= ha_cpu_affinity[i].affinity_flags;
 			if (*args[2] != 0) {
 				struct cpu_affinity_optional *optional = ha_cpu_affinity[i].optional;
 
 				if (optional) {
 					for (i = 0; optional[i].name; i++) {
-						if (!strcmp(args[2], optional[i].name)) {
+						if (strcmp(args[2], optional[i].name) == 0) {
 							cpu_policy_conf.affinity |= optional[i].affinity_flag;
 							return 0;
 						}
@@ -2326,10 +2334,10 @@ static int cfg_parse_cpu_policy(char **args, int section_type, struct proxy *cur
 		return -1;
 
 	if (*args[2] != 0) {
-		if (!strcmp(args[2], "threads-per-core")) {
-			if (!strcmp(args[3], "1"))
+		if (strcmp(args[2], "threads-per-core") == 0) {
+			if (strcmp(args[3], "1") == 0)
 				cpu_policy_conf.flags |= CPU_POLICY_ONE_THREAD_PER_CORE;
-			else if (strcmp(args[3], "auto")) {
+			else if (strcmp(args[3], "auto") != 0) {
 				memprintf(err, "'%s' passed an unknown value '%s' to keyword '%s', known values are 1 or auto", args[0], args[3], args[2]);
 				return -1;
 			}

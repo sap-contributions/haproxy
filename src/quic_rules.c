@@ -24,12 +24,12 @@ int quic_init_exec_rules(struct listener *li, struct quic_dgram *dgram)
 	px = li->bind_conf->frontend;
 
 	/* Initialize session elements specific to the current datagram. All
-	 * others members are set to 0 thanks to static storage class.
+	 * other members are set to 0 thanks to the static storage class.
 	 */
 	rule_sess.fe = px;
 	rule_sess.listener = li;
-	rule_sess.src = &dgram->saddr;
-	rule_sess.dst = &dgram->daddr;
+	rule_sess.src = (struct sockaddr_storage *)&dgram->saddr;
+	rule_sess.dst = (struct sockaddr_storage *)&dgram->daddr;
 	rule_sess.origin = &dgram->obj_type;
 
 	list_for_each_entry(rule, &px->quic_init_rules, list) {
@@ -37,7 +37,8 @@ int quic_init_exec_rules(struct listener *li, struct quic_dgram *dgram)
 			continue;
 
 		if (rule->action_ptr) {
-			switch (rule->action_ptr(rule, px, &rule_sess, NULL, 0)) {
+			switch (EXEC_CTX_WITH_RET(rule->exec_ctx,
+			                          rule->action_ptr(rule, px, &rule_sess, NULL, 0))) {
 			case ACT_RET_CONT:
 				break;
 			case ACT_RET_DONE:
@@ -142,10 +143,12 @@ struct action_kw_list quic_init_actions_list = {
 
 void quic_init_actions_register(struct action_kw_list *kw_list)
 {
-	LIST_APPEND(&quic_init_actions_list.list, &kw_list->list);
+	act_add_list(&quic_init_actions_list.list, kw_list);
 }
 
-/* Return the struct quic-initial action associated to a keyword. */
+/* Return the action keyword associated with <kw> from the registered
+ * quic-initial action keywords, or NULL if not found.
+ */
 struct action_kw *action_quic_init_custom(const char *kw)
 {
 	return action_lookup(&quic_init_actions_list.list, kw);

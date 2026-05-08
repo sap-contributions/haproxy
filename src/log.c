@@ -334,6 +334,25 @@ char default_tcp_log_format[] = "%ci:%cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%
 char clf_tcp_log_format[] = "%{+Q}o %{-Q}ci - - [%T] \"TCP \" 000 %B \"\" \"\" %cp %ms %ft %b %s %Th %Tw %Tc %Tt %U %ts-- %ac %fc %bc %sc %rc %sq %bq \"\" \"\" ";
 char *log_format = NULL;
 
+char keylog_format_bc[] = "CLIENT_RANDOM %[ssl_bc_client_random,hex]  %[ssl_bc_session_key,hex]\n"
+                          "CLIENT_EARLY_TRAFFIC_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_client_early_traffic_secret]\n"
+                          "CLIENT_HANDSHAKE_TRAFFIC_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_client_handshake_traffic_secret]\n"
+                          "SERVER_HANDSHAKE_TRAFFIC_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_server_handshake_traffic_secret]\n"
+                          "CLIENT_TRAFFIC_SECRET_0 %[ssl_bc_client_random,hex] %[ssl_bc_client_traffic_secret_0]\n"
+                          "SERVER_TRAFFIC_SECRET_0 %[ssl_bc_client_random,hex] %[ssl_bc_server_traffic_secret_0]\n"
+                          "EXPORTER_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_exporter_secret]\n"
+                          "EARLY_EXPORTER_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_early_exporter_secret]";
+
+char keylog_format_fc[] = "CLIENT_RANDOM %[ssl_fc_client_random,hex] %[ssl_fc_session_key,hex]\n"
+                          "CLIENT_EARLY_TRAFFIC_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_client_early_traffic_secret]\n"
+                          "CLIENT_HANDSHAKE_TRAFFIC_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_client_handshake_traffic_secret]\n"
+                          "SERVER_HANDSHAKE_TRAFFIC_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_server_handshake_traffic_secret]\n"
+                          "CLIENT_TRAFFIC_SECRET_0 %[ssl_fc_client_random,hex] %[ssl_fc_client_traffic_secret_0]\n"
+                          "SERVER_TRAFFIC_SECRET_0 %[ssl_fc_client_random,hex] %[ssl_fc_server_traffic_secret_0]\n"
+                          "EXPORTER_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_exporter_secret]\n"
+                          "EARLY_EXPORTER_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_early_exporter_secret]";
+
+
 /* Default string used for structured-data part in RFC5424 formatted
  * syslog messages.
  */
@@ -351,7 +370,9 @@ static inline int logformat_str_isdefault(const char *str)
 	       str == clf_http_log_format ||
 	       str == default_tcp_log_format ||
 	       str == clf_tcp_log_format ||
-	       str == default_rfc5424_sd_log_format;
+	       str == default_rfc5424_sd_log_format ||
+	       str == keylog_format_bc ||
+	       str == keylog_format_fc;
 }
 
 /* free logformat str if it is not a default (static) one */
@@ -652,13 +673,13 @@ static int add_sample_to_logformat_list(char *text, char *name, int name_len, in
 
 	if (!(expr->fetch->val & cap)) {
 		memprintf(err, "sample fetch <%s> may not be reliably used here because it needs '%s' which is not available here",
-		          text, sample_src_names(expr->fetch->use));
+		          expr->fetch->kw, sample_src_names(expr->fetch->use));
 		goto error_free;
 	}
 
 	if ((options & LOG_OPT_HTTP) && (expr->fetch->use & (SMP_USE_L6REQ|SMP_USE_L6RES))) {
 		ha_warning("parsing [%s:%d] : L6 sample fetch <%s> ignored in HTTP log-format string.\n",
-			   lf_expr->conf.file, lf_expr->conf.line, text);
+			   lf_expr->conf.file, lf_expr->conf.line, expr->fetch->kw);
 	}
 
 	LIST_APPEND(list_format, &node->list);
@@ -1091,6 +1112,14 @@ int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 			px->to_log |= LW_XPRT;
 			if (px->http_needed)
 				px->to_log |= LW_REQ;
+
+			/* anything involving the response needs to happen at response time */
+			if (expr->fetch->use & (SMP_USE_HRSHP|SMP_USE_HRSHV|SMP_USE_HRSBO))
+				px->to_log |= LW_RESP;
+
+			/* anything involving the end of the response needs to happen after final bytes */
+			if (expr->fetch->use & (SMP_USE_HRSBO|SMP_USE_RQFIN|SMP_USE_RSFIN|SMP_USE_TXFIN|SMP_USE_SSFIN))
+				px->to_log |= LW_BYTES;
 		}
 		else if (lf->type == LOG_FMT_ALIAS) {
 			if (!default_px && !http_mode &&
@@ -2913,6 +2942,7 @@ static inline void __send_log_set_metadata_sd(struct ist *metadata, char *sd, si
 struct process_send_log_ctx {
 	struct session *sess;
 	struct stream *stream;
+	struct log_profile *profile;
 	struct log_orig origin;
 };
 
@@ -2941,6 +2971,10 @@ static inline void _process_send_log_override(struct process_send_log_ctx *ctx,
 	struct ist orig_sd = hdr.metadata[LOG_META_STDATA];
 	enum log_orig_id orig = (ctx) ? ctx->origin.id : LOG_ORIG_UNSPEC;
 	uint16_t orig_fl = (ctx) ? ctx->origin.flags : LOG_ORIG_FL_NONE;
+
+	/* ctx->profile gets priority over logger profile */
+	if (ctx && ctx->profile)
+		prof = ctx->profile;
 
 	BUG_ON(!prof);
 
@@ -3095,8 +3129,8 @@ static void process_send_log(struct process_send_log_ctx *ctx,
 
 			nblogger += 1;
 
-			/* logger may use a profile to override a few things */
-			if (unlikely(logger->prof))
+			/* caller or default logger may use a profile to override a few things */
+			if (unlikely(logger->prof || (ctx && ctx->profile)))
 				_process_send_log_override(ctx, logger, hdr, message, size, nblogger);
 			else
 				_process_send_log_final(logger, hdr, message, size, nblogger);
@@ -3739,7 +3773,7 @@ void deinit_log_forward()
 	while (p) {
 		p0 = p;
 		p = p->next;
-		free_proxy(p0);
+		proxy_drop(p0);
 	}
 }
 
@@ -3855,14 +3889,38 @@ int lf_expr_dup(const struct lf_expr *orig, struct lf_expr *dest)
 	return 0;
 }
 
+/* Generates a unique ID based on the given <format> and stores it
+ * in <dst>. <dst> must be IST_NULL when this function is called.
+ *
+ * If this function fails to allocate memory IST_NULL is stored.
+ */
+void generate_unique_id(struct ist *dst, struct session *sess, struct stream *strm, struct lf_expr *format)
+{
+	char *unique_id;
+
+	BUG_ON(isttest(*dst));
+
+	unique_id = pool_alloc(pool_head_uniqueid);
+	if (unique_id == NULL) {
+		*dst = IST_NULL;
+		return;
+	}
+
+	/* Initialize <dst> to an empty string to prevent infinite
+	 * recursion when the <format> references %[unique-id] or %ID.
+	 */
+	*dst = ist2(unique_id, 0);
+	dst->len = sess_build_logline(sess, strm, unique_id, UNIQUEID_LEN, format);
+}
+
 /* Builds a log line in <dst> based on <lf_expr>, and stops before reaching
  * <maxsize> characters. Returns the size of the output string in characters,
  * not counting the trailing zero which is always added if the resulting size
  * is not zero. It requires a valid session and optionally a stream. If the
  * stream is NULL, default values will be assumed for the stream part.
  */
-int sess_build_logline_orig(struct session *sess, struct stream *s,
-                            char *dst, size_t maxsize, struct lf_expr *lf_expr,
+size_t sess_build_logline_orig(struct session *sess, struct stream *s,
+                            char *dst, size_t maxsize, const struct lf_expr *lf_expr,
                             struct log_orig log_orig)
 {
 	struct lf_buildctx _ctx = {};
@@ -3872,7 +3930,7 @@ int sess_build_logline_orig(struct session *sess, struct stream *s,
 	struct http_txn *txn;
 	const struct strm_logs *logs;
 	struct connection *fe_conn, *be_conn;
-	struct list *list_format = &lf_expr->nodes.list;
+	const struct list *list_format = &lf_expr->nodes.list;
 	unsigned int s_flags;
 	unsigned int uniq_id;
 	struct buffer chunk;
@@ -3901,7 +3959,7 @@ int sess_build_logline_orig(struct session *sess, struct stream *s,
 
 	if (likely(s)) {
 		be = s->be;
-		txn = s->txn;
+		txn = (((s->flags & SF_TXN_MASK) == SF_TXN_HTTP) ? s->txn.http : NULL);
 		be_conn = sc_conn(s->scb);
 		status = (txn ? txn->status : 0);
 		s_flags = s->flags;
@@ -5123,20 +5181,18 @@ int sess_build_logline_orig(struct session *sess, struct stream *s,
 				break;
 
 			case LOG_FMT_UNIQUEID: // %ID
-				ret = NULL;
-				if (s) {
-					/* if unique-id was not generated */
-					if (!isttest(s->unique_id) && !lf_expr_isempty(&sess->fe->format_unique_id)) {
-						stream_generate_unique_id(s, &sess->fe->format_unique_id);
-					}
-					ret = lf_text_len(tmplog, s->unique_id.ptr, s->unique_id.len, maxsize - (tmplog - dst), ctx);
-				}
-				else
-					ret = lf_text_len(tmplog, NULL, 0, maxsize - (tmplog - dst), ctx);
+			{
+				struct ist unique_id = IST_NULL;
+
+				if (s && !lf_expr_isempty(&sess->fe->format_unique_id))
+					unique_id = stream_generate_unique_id(s, &sess->fe->format_unique_id);
+
+				ret = lf_text_len(tmplog, istptr(unique_id), istlen(unique_id), maxsize - (tmplog - dst), ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
+			}
 
 			case LOG_FMT_ORIGIN: // %OG
 				ret = lf_text(tmplog, log_orig_to_str(log_orig.id),
@@ -5200,19 +5256,13 @@ out:
 
 }
 
-/*
- * opportunistic log when at least the session is known to exist
- * <s> may be NULL
- *
- * Will not log if the frontend has no log defined. By default it will
- * try to emit the log as INFO, unless the stream already exists and
- * set-log-level was used.
- */
-void do_log(struct session *sess, struct stream *s, struct log_orig origin)
+static void do_log_ctx(struct process_send_log_ctx *ctx)
 {
-	struct process_send_log_ctx ctx;
-	int size;
-	int sd_size = 0;
+	struct stream *s = ctx->stream;
+	struct session *sess = ctx->sess;
+	struct log_orig origin = ctx->origin;
+	size_t size;
+	size_t sd_size = 0;
 	int level = -1;
 
 	if (LIST_ISEMPTY(&sess->fe->loggers))
@@ -5242,11 +5292,27 @@ void do_log(struct session *sess, struct stream *s, struct log_orig origin)
 
 	size = sess_build_logline_orig(sess, s, logline, global.max_syslog_len, &sess->fe->logformat, origin);
 
+	__send_log(ctx, &sess->fe->loggers, &sess->fe->log_tag, level,
+		   logline, size, logline_rfc5424, sd_size);
+}
+
+/*
+ * opportunistic log when at least the session is known to exist
+ * <s> may be NULL
+ *
+ * Will not log if the frontend has no log defined. By default it will
+ * try to emit the log as INFO, unless the stream already exists and
+ * set-log-level was used.
+ */
+void do_log(struct session *sess, struct stream *s, struct log_orig origin)
+{
+	struct process_send_log_ctx ctx;
+
 	ctx.origin = origin;
 	ctx.sess = sess;
 	ctx.stream = s;
-	__send_log(&ctx, &sess->fe->loggers, &sess->fe->log_tag, level,
-		   logline, size, logline_rfc5424, sd_size);
+	ctx.profile = NULL;
+	do_log_ctx(&ctx);
 }
 
 /*
@@ -5257,14 +5323,15 @@ void strm_log(struct stream *s, struct log_orig origin)
 {
 	struct process_send_log_ctx ctx;
 	struct session *sess = s->sess;
-	int size, err, level;
-	int sd_size = 0;
+	int err, level;
+	size_t size;
+	size_t sd_size = 0;
 
 	/* if we don't want to log normal traffic, return now */
 	err = (s->flags & SF_REDISP) ||
               ((s->flags & SF_ERR_MASK) > SF_ERR_LOCAL) ||
 	      (((s->flags & SF_ERR_MASK) == SF_ERR_NONE) && s->conn_retries) ||
-	      ((sess->fe->mode == PR_MODE_HTTP) && s->txn && s->txn->status >= 500) ||
+	      ((sess->fe->mode == PR_MODE_HTTP) && s->txn.http && s->txn.http->status >= 500) ||
 	      (origin.flags & LOG_ORIG_FL_ERROR);
 
 	if (!err && (sess->fe->options2 & PR_O2_NOLOGNORM))
@@ -5297,6 +5364,7 @@ void strm_log(struct stream *s, struct log_orig origin)
 	ctx.origin = origin;
 	ctx.sess = sess;
 	ctx.stream = s;
+	ctx.profile = NULL;
 	__send_log(&ctx, &sess->fe->loggers, &sess->fe->log_tag, level,
 		   logline, size, logline_rfc5424, sd_size);
 	s->logs.logwait = 0;
@@ -5318,8 +5386,9 @@ void strm_log(struct stream *s, struct log_orig origin)
 void _sess_log(struct session *sess, int embryonic)
 {
 	struct process_send_log_ctx ctx;
-	int size, level;
-	int sd_size = 0;
+	int level;
+	size_t size;
+	size_t sd_size = 0;
 	struct log_orig orig;
 
 	if (!sess)
@@ -5364,6 +5433,7 @@ void _sess_log(struct session *sess, int embryonic)
 	ctx.origin = orig;
 	ctx.sess = sess;
 	ctx.stream = NULL;
+	ctx.profile = NULL;
 	__send_log(&ctx, &sess->fe->loggers,
 	           &sess->fe->log_tag, level,
 		   logline, size, logline_rfc5424, sd_size);
@@ -6136,7 +6206,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		bind_conf->accept = session_accept_fd;
 
 		if (!str2listener(args[1], cfg_log_forward, bind_conf, file, linenum, &errmsg)) {
-			if (errmsg && *errmsg) {
+			if (errmsg) {
 				indent_msg(&errmsg, 2);
 				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
 			}
@@ -6178,7 +6248,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		bind_conf->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
 
 		if (!str2receiver(args[1], cfg_log_forward, bind_conf, file, linenum, &errmsg)) {
-			if (errmsg && *errmsg) {
+			if (errmsg) {
 				indent_msg(&errmsg, 2);
 				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
 			}
@@ -6202,7 +6272,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			ret = kw->parse(args, cur_arg, cfg_log_forward, bind_conf, &errmsg);
 			err_code |= ret;
 			if (ret) {
-				if (errmsg && *errmsg) {
+				if (errmsg) {
 					indent_msg(&errmsg, 2);
 					ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
 				}
@@ -6910,24 +6980,87 @@ static int px_parse_log_steps(char **args, int section_type, struct proxy *curpx
 static enum act_return do_log_action(struct act_rule *rule, struct proxy *px,
                                      struct session *sess, struct stream *s, int flags)
 {
+	struct process_send_log_ctx ctx;
+
 	/* do_log() expects valid session pointer */
 	BUG_ON(sess == NULL);
 
-	do_log(sess, s, log_orig(rule->arg.expr_int.value, LOG_ORIG_FL_NONE));
+	ctx.origin = log_orig(rule->arg.do_log.orig, LOG_ORIG_FL_NONE);
+	ctx.sess = sess;
+	ctx.stream = s;
+	ctx.profile = rule->arg.do_log.profile;
+
+	do_log_ctx(&ctx);
 	return ACT_RET_CONT;
 }
 
-/* Parse a "do_log" action. It doesn't take any argument
+static int do_log_action_check(struct act_rule *rule, struct proxy *px, char **err)
+{
+	if (rule->arg.do_log.profile_name) {
+		struct log_profile *prof;
+
+		prof = log_profile_find_by_name(rule->arg.do_log.profile_name);
+		if (!prof) {
+			memprintf(err, "do-log action: profile '%s' is invalid", rule->arg.do_log.profile_name);
+			ha_free(&rule->arg.do_log.profile_name);
+			return 0;
+		}
+
+		ha_free(&rule->arg.do_log.profile_name);
+
+		if (!log_profile_postcheck(px, prof, err)) {
+			memprintf(err, "do-log action on %s %s uses incompatible log-profile '%s': %s",  proxy_type_str(px), px->id, prof->id, *err);
+			return 0;
+		}
+		rule->arg.do_log.profile = prof;
+	}
+	return 1; // success
+}
+
+static void do_log_action_release(struct act_rule *rule)
+{
+	ha_free(&rule->arg.do_log.profile_name);
+}
+
+
+/* Parse a "do_log" action. It takes optional "log-profile" argument to
+ * specifically use a given log-profile when generating the log message
+ *
  * May be used from places where per-context actions are usually registered
  */
 enum act_parse_ret do_log_parse_act(enum log_orig_id id,
                                     const char **args, int *orig_arg, struct proxy *px,
                                     struct act_rule *rule, char **err)
 {
+	int cur_arg = *orig_arg;
+
 	rule->action_ptr = do_log_action;
 	rule->action = ACT_CUSTOM;
-	rule->release_ptr = NULL;
-	rule->arg.expr_int.value = id;
+	rule->check_ptr = do_log_action_check;
+	rule->release_ptr = do_log_action_release;
+	rule->arg.do_log.orig = id;
+
+	while (*args[*orig_arg]) {
+		if (strcmp(args[*orig_arg], "profile") == 0) {
+			if (!*args[*orig_arg + 1]) {
+				memprintf(err,
+					  "action '%s': 'profile' expects argument.",
+					  args[cur_arg-1]);
+				return ACT_RET_PRS_ERR;
+			}
+			rule->arg.do_log.profile_name = strdup(args[*orig_arg + 1]);
+			if (!rule->arg.do_log.profile_name) {
+				memprintf(err,
+					  "action '%s': memory error when setting 'profile'",
+				           args[cur_arg-1]);
+				return ACT_RET_PRS_ERR;
+			}
+			*orig_arg += 2;
+		}
+		else
+			break;
+	}
+
 	return ACT_RET_PRS_OK;
 }
 

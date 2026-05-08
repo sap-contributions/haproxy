@@ -22,6 +22,7 @@
 #include <haproxy/base64.h>
 #include <haproxy/channel.h>
 #include <haproxy/chunk.h>
+#include <haproxy/check.h>
 #include <haproxy/connection.h>
 #include <haproxy/global.h>
 #include <haproxy/h1.h>
@@ -44,6 +45,7 @@
 /* this struct is used between calls to smp_fetch_hdr() or smp_fetch_cookie() */
 static THREAD_LOCAL struct http_hdr_ctx static_http_hdr_ctx;
 /* this is used to convert raw connection buffers to htx */
+/* NOTE: For now, raw buffers cannot exceeds the standard size */
 static THREAD_LOCAL struct buffer static_raw_htx_chunk;
 static THREAD_LOCAL char *static_raw_htx_buf;
 
@@ -93,7 +95,7 @@ REGISTER_PER_THREAD_FREE(free_raw_htx_chunk_per_thread);
 static int get_http_auth(struct sample *smp, struct htx *htx)
 {
 	struct stream *s = smp->strm;
-	struct http_txn *txn = s->txn;
+	struct http_txn *txn = s->txn.http;
 	struct http_hdr_ctx ctx = { .blk = NULL };
 	struct ist hdr;
 	struct buffer auth_method;
@@ -138,7 +140,7 @@ static int get_http_auth(struct sample *smp, struct htx *htx)
 
 		len = base64dec(txn->auth.method_data.area,
 				txn->auth.method_data.data,
-				http_auth->area, global.tune.bufsize - 1);
+				http_auth->area, http_auth->size -1);
 
 		if (len < 0)
 			return 0;
@@ -222,9 +224,9 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 		return NULL;
 	}
 
-	if (!s->txn && !http_create_txn(s))
+	if (!s->txn.http && !http_create_txn(s))
 		return NULL;
-	txn = s->txn;
+	txn = s->txn.http;
 	msg = (!(chn->flags & CF_ISRESP) ? &txn->req : &txn->rsp);
 
 	if (IS_HTX_STRM(s)) {
@@ -310,25 +312,70 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 	 * that further checks can rely on HTTP tests.
 	 */
 	if (sl && msg->msg_state < HTTP_MSG_BODY) {
+		struct ist vsn;
+
 		if (!(chn->flags & CF_ISRESP)) {
+			vsn = htx_sl_req_vsn(sl);
 			txn->meth = sl->info.req.meth;
 			if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 				s->flags |= SF_REDIRECTABLE;
 		}
 		else {
+			vsn = htx_sl_res_vsn(sl);
 			if (txn->status == -1)
 				txn->status = sl->info.res.status;
 			if (txn->server_status == -1)
 				txn->server_status = sl->info.res.status;
 		}
-		if (sl->flags & HTX_SL_F_VER_11)
-			msg->flags |= HTTP_MSGF_VER_11;
+
+		if ((sl->flags & HTX_SL_F_NOT_HTTP) || istlen(vsn) != 8) {
+			/* Not an HTTP message */
+			msg->vsn = 0;
+		}
+		else {
+			char *ptr = istptr(vsn);
+
+			msg->vsn = ((ptr[5] - '0') << 4) + (ptr[7] - '0');
+			if (sl->flags & HTX_SL_F_VER_11)
+				msg->flags |= HTTP_MSGF_VER_11;
+		}
 	}
 
 	/* everything's OK */
   end:
 	return htx;
 }
+
+/* Get the HTTP version from <msg> or <htx> and append it into the chunk <chk>
+ * with the format "<major>.<minor>".
+ * It returns 0 if <msg> and <htx> are both NULL or if the version
+ * is not a valid HTTP version. Otherwise, it returns 1 (success).
+ *
+ * The version is retrieved from <msg>, if not NULL. Otherwise, it is retrieved
+ * from <htx>.
+ */
+static int get_msg_version(const struct http_msg *msg, const struct htx *htx, struct buffer *chk)
+{
+	if (msg) {
+		if (msg->vsn) {
+			chunk_appendf(chk, "%d.%d", (msg->vsn & 0xf0) >> 4, msg->vsn & 0xf);
+			return 1;
+		}
+	}
+	else if (htx) {
+		struct htx_sl *sl = http_get_stline(htx);
+		struct ist vsn = htx_sl_vsn(sl);
+
+		if (!(sl->flags & HTX_SL_F_NOT_HTTP) && istlen(vsn) == 8) {
+			chunk_appendf(chk, "%d.%d", istptr(vsn)[5] - '0',  istptr(vsn)[7] - '0');
+			return 1;
+		}
+	}
+
+	/* <msg> and <htx> are both NULL or not a valid HTTP version */
+	return 0;
+}
+
 
 /* This function fetches the method of current HTTP request and stores
  * it in the global pattern struct as a chunk. There are two possibilities :
@@ -345,7 +392,7 @@ static int smp_fetch_meth(const struct arg *args, struct sample *smp, const char
 	struct htx *htx = NULL;
 	int meth;
 
-	txn = (smp->strm ? smp->strm->txn : NULL);
+	txn = (smp->strm ? smp->strm->txn.http : NULL);
 	if (!txn)
 		return 0;
 
@@ -373,56 +420,32 @@ static int smp_fetch_meth(const struct arg *args, struct sample *smp, const char
 
 static int smp_fetch_rqver(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
+	struct stream *s = smp->strm;
 	struct channel *chn = SMP_REQ_CHN(smp);
 	struct htx *htx = smp_prefetch_htx(smp, chn, NULL, 1);
-	struct htx_sl *sl;
-	char *ptr;
-	int len;
+	struct buffer *vsn = get_trash_chunk();
 
-	if (!htx)
-		return 0;
-
-	sl = http_get_stline(htx);
-	len = HTX_SL_REQ_VLEN(sl);
-	ptr = HTX_SL_REQ_VPTR(sl);
-
-	while ((len-- > 0) && (*ptr++ != '/'));
-	if (len <= 0)
+	if (!get_msg_version((s && s->txn.http) ? &s->txn.http->req : NULL, htx, vsn))
 		return 0;
 
 	smp->data.type = SMP_T_STR;
-	smp->data.u.str.area = ptr;
-	smp->data.u.str.data = len;
-
-	smp->flags = SMP_F_VOL_1ST | SMP_F_CONST;
+	smp->data.u.str = *vsn;
 	return 1;
 }
 
 static int smp_fetch_stver(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
+	struct stream *s = smp->strm;
 	struct channel *chn = SMP_RES_CHN(smp);
 	struct check *check = objt_check(smp->sess->origin);
 	struct htx *htx = smp_prefetch_htx(smp, chn, check, 1);
-	struct htx_sl *sl;
-	char *ptr;
-	int len;
+	struct buffer *vsn = get_trash_chunk();
 
-	if (!htx)
-		return 0;
-
-	sl = http_get_stline(htx);
-	len = HTX_SL_RES_VLEN(sl);
-	ptr = HTX_SL_RES_VPTR(sl);
-
-	while ((len-- > 0) && (*ptr++ != '/'));
-	if (len <= 0)
+	if (!get_msg_version((s && s->txn.http) ? &s->txn.http->rsp : NULL, htx, vsn))
 		return 0;
 
 	smp->data.type = SMP_T_STR;
-	smp->data.u.str.area = ptr;
-	smp->data.u.str.data = len;
-
-	smp->flags = SMP_F_VOL_1ST | SMP_F_CONST;
+	smp->data.u.str = *vsn;
 	return 1;
 }
 
@@ -455,7 +478,7 @@ static int smp_fetch_srv_status(const struct arg *args, struct sample *smp, cons
 	struct http_txn *txn;
 	short status;
 
-	txn = (smp->strm ? smp->strm->txn : NULL);
+	txn = (smp->strm ? smp->strm->txn.http : NULL);
 	if (!txn)
 		return 0;
 
@@ -480,19 +503,27 @@ static int smp_fetch_srv_status(const struct arg *args, struct sample *smp, cons
 static int smp_fetch_uniqueid(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct ist unique_id;
+	struct check *check;
 
-	if (lf_expr_isempty(&smp->sess->fe->format_unique_id))
+	if (smp->strm) {
+		if (lf_expr_isempty(&smp->sess->fe->format_unique_id))
+			return 0;
+
+		unique_id = stream_generate_unique_id(smp->strm, &smp->sess->fe->format_unique_id);
+	} else if ((check = objt_check(smp->sess->origin)) != NULL) {
+		if (lf_expr_isempty(&check->proxy->format_unique_id))
+			return 0;
+
+		unique_id = check_generate_unique_id(check, &check->proxy->format_unique_id);
+	} else {
 		return 0;
+	}
 
-	if (!smp->strm)
-		return 0;
-
-	unique_id = stream_generate_unique_id(smp->strm, &smp->sess->fe->format_unique_id);
 	if (!isttest(unique_id))
 		return 0;
 
-	smp->data.u.str.area = smp->strm->unique_id.ptr;
-	smp->data.u.str.data = smp->strm->unique_id.len;
+	smp->data.u.str.area = istptr(unique_id);
+	smp->data.u.str.data = istlen(unique_id);
 	smp->data.type = SMP_T_STR;
 	smp->flags = SMP_F_CONST;
 	return 1;
@@ -624,14 +655,17 @@ static int smp_fetch_body(const struct arg *args, struct sample *smp, const char
 	struct channel *chn = ((kw[2] == 'q') ? SMP_REQ_CHN(smp) : SMP_RES_CHN(smp));
 	struct check *check = ((kw[2] == 's') ? objt_check(smp->sess->origin) : NULL);
 	struct htx *htx = smp_prefetch_htx(smp, chn, check, 1);
-	struct buffer *temp;
+	struct buffer *chk = NULL;
+	struct ist body = IST_NULL;
 	int32_t pos;
 	int finished = 0;
 
 	if (!htx)
 		return 0;
 
-	temp = get_trash_chunk();
+	if ((htx->flags & (HTX_FL_FRAGMENTED|HTX_FL_UNORDERED)) || htx_space_wraps(htx))
+		htx_defrag(htx, NULL, 0);
+
 	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 		struct htx_blk *blk = htx_get_blk(htx, pos);
 		enum htx_blk_type type = htx_get_blk_type(blk);
@@ -641,14 +675,29 @@ static int smp_fetch_body(const struct arg *args, struct sample *smp, const char
 			break;
 		}
 		if (type == HTX_BLK_DATA) {
-			if (!h1_format_htx_data(htx_get_blk_value(htx, blk), temp, 0))
-				return 0;
+			if (isttest(body)) {
+				/* More than one DATA block we must use a trash */
+				if (!chk) {
+					smp->flags &= ~SMP_F_CONST;
+					chk = get_trash_chunk_sz(htx->data);
+					if (!chunk_istcat(chk, body))
+						return 0;
+				}
+				if (!chunk_istcat(chk, htx_get_blk_value(htx, blk)))
+					return 0;
+				body = ist2(b_orig(chk), b_data(chk));
+			}
+			else {
+				body = htx_get_blk_value(htx, blk);
+				smp->flags |= SMP_F_CONST;
+			}
 		}
 	}
 
 	smp->data.type = SMP_T_BIN;
-	smp->data.u.str = *temp;
-	smp->flags = SMP_F_VOL_TEST;
+	smp->data.u.str.area = istptr(body);
+	smp->data.u.str.data = istlen(body);
+	smp->flags |= SMP_F_VOL_TEST;
 
 	if (!finished && (check || (chn && !channel_full(chn, global.tune.maxrewrite) &&
 				    !(chn_prod(chn)->flags & (SC_FL_EOI|SC_FL_EOS|SC_FL_ABRT_DONE)))))
@@ -894,9 +943,12 @@ static int smp_fetch_hdr_names(const struct arg *args, struct sample *smp, const
 			continue;
 		n = htx_get_blk_name(htx, blk);
 
-		if (temp->data)
-			temp->area[temp->data++] = del;
-		chunk_istcat(temp, n);
+		if (temp->data) {
+			if (!chunk_memcat(temp, &del, 1))
+				return 0;
+		}
+		if (!chunk_istcat(temp, n))
+			return 0;
 	}
 
 	smp->data.type = SMP_T_STR;
@@ -1129,7 +1181,8 @@ static int smp_fetch_base(const struct arg *args, struct sample *smp, const char
 
 	/* OK we have the header value in ctx.value */
 	temp = get_trash_chunk();
-	chunk_istcat(temp, ctx.value);
+	if (!chunk_istcat(temp, ctx.value))
+		return 0;
 
 	/* now retrieve the path */
 	sl = http_get_stline(htx);
@@ -1145,8 +1198,10 @@ static int smp_fetch_base(const struct arg *args, struct sample *smp, const char
 				;
 		}
 
-		if (len && *(path.ptr) == '/')
-			chunk_memcat(temp, path.ptr, len);
+		if (len && *(path.ptr) == '/') {
+			if (!chunk_memcat(temp, path.ptr, len))
+				return 0;
+		}
 	}
 
 	smp->data.type = SMP_T_STR;
@@ -1304,7 +1359,7 @@ static int smp_fetch_http_first_req(const struct arg *args, struct sample *smp, 
 		return 0;
 
 	smp->data.type = SMP_T_BOOL;
-	smp->data.u.sint = !(smp->strm->txn->flags & TX_NOT_FIRST);
+	smp->data.u.sint = !(smp->strm->txn.http->flags & TX_NOT_FIRST);
 	return 1;
 }
 
@@ -1320,7 +1375,7 @@ static int smp_fetch_http_auth_type(const struct arg *args, struct sample *smp, 
 	if (!htx)
 		return 0;
 
-	txn = smp->strm->txn;
+	txn = smp->strm->txn.http;
 	if (!get_http_auth(smp, htx))
 		return 0;
 
@@ -1359,7 +1414,7 @@ static int smp_fetch_http_auth_user(const struct arg *args, struct sample *smp, 
 	if (!htx)
 		return 0;
 
-	txn = smp->strm->txn;
+	txn = smp->strm->txn.http;
 	if (!get_http_auth(smp, htx) || txn->auth.method != HTTP_AUTH_BASIC)
 		return 0;
 
@@ -1382,7 +1437,7 @@ static int smp_fetch_http_auth_pass(const struct arg *args, struct sample *smp, 
 	if (!htx)
 		return 0;
 
-	txn = smp->strm->txn;
+	txn = smp->strm->txn.http;
 	if (!get_http_auth(smp, htx) || txn->auth.method != HTTP_AUTH_BASIC)
 		return 0;
 
@@ -1411,18 +1466,20 @@ static int smp_fetch_http_auth_bearer(const struct arg *args, struct sample *smp
 		if (http_find_header(htx, hdr_name, &ctx, 0)) {
 			struct ist type = istsplit(&ctx.value, ' ');
 
+			/* no space was found or the space is the first character or no "Bearer" method */
+			if (!istlen(type) || istlen(type) == istlen(ctx.value) || !isteqi(type, ist("Bearer")))
+				return 0;
+
 			/* There must be "at least" one space character between
 			 * the scheme and the following value so ctx.value might
 			 * still have leading spaces here (see RFC7235).
 			 */
 			ctx.value = istskip(ctx.value, ' ');
-
-			if (isteqi(type, ist("Bearer")) && istlen(ctx.value))
-				chunk_initlen(&bearer_val, istptr(ctx.value), 0, istlen(ctx.value));
+			chunk_initlen(&bearer_val, istptr(ctx.value), 0, istlen(ctx.value));
 		}
 	}
 	else {
-		txn = smp->strm->txn;
+		txn = smp->strm->txn.http;
 		if (!get_http_auth(smp, htx) || txn->auth.method != HTTP_AUTH_BEARER)
 			return 0;
 
@@ -1446,12 +1503,12 @@ static int smp_fetch_http_auth(const struct arg *args, struct sample *smp, const
 
 	if (!htx)
 		return 0;
-	if (!get_http_auth(smp, htx) || smp->strm->txn->auth.method != HTTP_AUTH_BASIC)
+	if (!get_http_auth(smp, htx) || smp->strm->txn.http->auth.method != HTTP_AUTH_BASIC)
 		return 0;
 
 	smp->data.type = SMP_T_BOOL;
-	smp->data.u.sint = check_user(args->data.usr, smp->strm->txn->auth.user,
-				      smp->strm->txn->auth.pass);
+	smp->data.u.sint = check_user(args->data.usr, smp->strm->txn.http->auth.user,
+				      smp->strm->txn.http->auth.pass);
 	return 1;
 }
 
@@ -1466,15 +1523,15 @@ static int smp_fetch_http_auth_grp(const struct arg *args, struct sample *smp, c
 
 	if (!htx)
 		return 0;
-	if (!get_http_auth(smp, htx) || smp->strm->txn->auth.method != HTTP_AUTH_BASIC)
+	if (!get_http_auth(smp, htx) || smp->strm->txn.http->auth.method != HTTP_AUTH_BASIC)
 		return 0;
 
 	/* if the user does not belong to the userlist or has a wrong password,
 	 * report that it unconditionally does not match. Otherwise we return
 	 * a string containing the username.
 	 */
-	if (!check_user(args->data.usr, smp->strm->txn->auth.user,
-	                smp->strm->txn->auth.pass))
+	if (!check_user(args->data.usr, smp->strm->txn.http->auth.user,
+	                smp->strm->txn.http->auth.pass))
 		return 0;
 
 	/* pat_match_auth() will need the user list */
@@ -1482,8 +1539,8 @@ static int smp_fetch_http_auth_grp(const struct arg *args, struct sample *smp, c
 
 	smp->data.type = SMP_T_STR;
 	smp->flags = SMP_F_CONST;
-	smp->data.u.str.area = smp->strm->txn->auth.user;
-	smp->data.u.str.data = strlen(smp->strm->txn->auth.user);
+	smp->data.u.str.area = smp->strm->txn.http->auth.user;
+	smp->data.u.str.data = strlen(smp->strm->txn.http->auth.user);
 
 	return 1;
 }
@@ -1554,7 +1611,7 @@ static int smp_fetch_capture_req_method(const struct arg *args, struct sample *s
 	if (!smp->strm)
 		return 0;
 
-	txn = smp->strm->txn;
+	txn = smp->strm->txn.http;
 	if (!txn || !txn->uri)
 		return 0;
 
@@ -1585,7 +1642,7 @@ static int smp_fetch_capture_req_uri(const struct arg *args, struct sample *smp,
 	if (!smp->strm)
 		return 0;
 
-	txn = smp->strm->txn;
+	txn = smp->strm->txn.http;
 	if (!txn || !txn->uri)
 		return 0;
 
@@ -1621,25 +1678,17 @@ static int smp_fetch_capture_req_uri(const struct arg *args, struct sample *smp,
  */
 static int smp_fetch_capture_req_ver(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct http_txn *txn;
+	struct stream *s = smp->strm;
+	struct buffer *vsn;
 
-	if (!smp->strm)
+	vsn = get_trash_chunk();
+	chunk_memcat(vsn, "HTTP/", 5);
+	if (!get_msg_version((s && s->txn.http) ? &s->txn.http->req : NULL, NULL, vsn))
 		return 0;
 
-	txn = smp->strm->txn;
-	if (!txn || txn->req.msg_state < HTTP_MSG_BODY)
-		return 0;
-
-	if (txn->req.flags & HTTP_MSGF_VER_11)
-		smp->data.u.str.area = "HTTP/1.1";
-	else
-		smp->data.u.str.area = "HTTP/1.0";
-
-	smp->data.u.str.data = 8;
-	smp->data.type  = SMP_T_STR;
-	smp->flags = SMP_F_CONST;
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str = *vsn;
 	return 1;
-
 }
 
 /* Retrieves the HTTP version from the response (either 1.0 or 1.1) and emits it
@@ -1647,23 +1696,16 @@ static int smp_fetch_capture_req_ver(const struct arg *args, struct sample *smp,
  */
 static int smp_fetch_capture_res_ver(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct http_txn *txn;
+	struct stream *s = smp->strm;
+	struct buffer *vsn;
 
-	if (!smp->strm)
+	vsn = get_trash_chunk();
+	chunk_memcat(vsn, "HTTP/", 5);
+	if (!get_msg_version((s && s->txn.http) ? &s->txn.http->rsp : NULL, NULL, vsn))
 		return 0;
 
-	txn = smp->strm->txn;
-	if (!txn || txn->rsp.msg_state < HTTP_MSG_BODY)
-		return 0;
-
-	if (txn->rsp.flags & HTTP_MSGF_VER_11)
-		smp->data.u.str.area = "HTTP/1.1";
-	else
-		smp->data.u.str.area = "HTTP/1.0";
-
-	smp->data.u.str.data = 8;
-	smp->data.type  = SMP_T_STR;
-	smp->flags = SMP_F_CONST;
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str = *vsn;
 	return 1;
 
 }
@@ -1944,12 +1986,16 @@ static int smp_fetch_param(char delim, const char *name, int name_len, const str
 	    vstart >= chunks[0] && vstart <= chunks[1] &&
 	    vend >= chunks[2] && vend <= chunks[3]) {
 		/* Wrapped case. */
-		temp = get_trash_chunk();
-		memcpy(temp->area, vstart, chunks[1] - vstart);
-		memcpy(temp->area + ( chunks[1] - vstart ), chunks[2],
-		       vend - chunks[2]);
+		size_t len1 = ( chunks[1] - vstart );
+		size_t len2 = ( vend - chunks[2] );
+
+		temp = get_trash_chunk_sz(len1 + len2);
+		if (!temp)
+			return 0;
+		memcpy(temp->area, vstart, len1);
+		memcpy(temp->area + len1, chunks[2], len2);
 		smp->data.u.str.area = temp->area;
-		smp->data.u.str.data = ( chunks[1] - vstart ) + ( vend - chunks[2] );
+		smp->data.u.str.data = len1 + len2;
 	} else {
 		/* Contiguous case. */
 		smp->data.u.str.area = (char *)vstart;
@@ -2056,13 +2102,16 @@ static int smp_fetch_body_param(const struct arg *args, struct sample *smp, cons
 
 	if (!smp->ctx.a[0]) { // first call, find the query string
 		struct htx *htx = smp_prefetch_htx(smp, chn, NULL, 1);
-		struct buffer *temp;
+		struct buffer *chk = NULL;
+		struct ist body = IST_NULL;
 		int32_t pos;
 
 		if (!htx)
 			return 0;
 
-		temp   = get_trash_chunk();
+		if ((htx->flags & (HTX_FL_FRAGMENTED|HTX_FL_UNORDERED)) || htx_space_wraps(htx))
+			htx_defrag(htx, NULL, 0);
+
 		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 			struct htx_blk   *blk  = htx_get_blk(htx, pos);
 			enum htx_blk_type type = htx_get_blk_type(blk);
@@ -2070,20 +2119,30 @@ static int smp_fetch_body_param(const struct arg *args, struct sample *smp, cons
 			if (type == HTX_BLK_TLR || type == HTX_BLK_EOT)
 				break;
 			if (type == HTX_BLK_DATA) {
-				if (!h1_format_htx_data(htx_get_blk_value(htx, blk), temp, 0))
-					return 0;
+				if (isttest(body)) {
+					/* More than one DATA block we must use a trash */
+					if (!chk) {
+						chk = get_trash_chunk_sz(htx->data);
+						if (!chunk_istcat(chk, body))
+							break;
+					}
+					if (!chunk_istcat(chk, htx_get_blk_value(htx, blk)))
+						break;
+					body = ist2(b_orig(chk), b_data(chk));
+				}
+				else
+					body = htx_get_blk_value(htx, blk);
 			}
 		}
 
-		smp->ctx.a[0] = temp->area;
-		smp->ctx.a[1] = temp->area + temp->data;
+		smp->ctx.a[0] = istptr(body);
+		smp->ctx.a[1] = istend(body);
 
 		/* Assume that the context is filled with NULL pointer
 		 * before the first call.
 		 * smp->ctx.a[2] = NULL;
 		 * smp->ctx.a[3] = NULL;
 		 */
-
 	}
 
 	return smp_fetch_param('&', name, name_len, args, smp, kw, private, insensitive);
@@ -2153,7 +2212,7 @@ static int smp_fetch_url32(const struct arg *args, struct sample *smp, const cha
 }
 
 /* This concatenates the source address with the 32-bit hash of the Host and
- * URL as returned by smp_fetch_base32(). The idea is to have per-source and
+ * URL as returned by smp_fetch_url32(). The idea is to have per-source and
  * per-url counters. The result is a binary block from 8 to 20 bytes depending
  * on the source address length. The URL hash is stored before the address so
  * that in environments where IPv6 is insignificant, truncating the output to
@@ -2301,8 +2360,8 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "req_proto_http",     smp_fetch_proto_http,         0,                NULL,    SMP_T_BOOL, SMP_USE_HRQHP },
 
 	/* HTTP version on the request path */
-	{ "req.ver",            smp_fetch_rqver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
-	{ "req_ver",            smp_fetch_rqver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
+	{ "req.ver",            smp_fetch_rqver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRQHP },
+	{ "req_ver",            smp_fetch_rqver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRQHP },
 
 	{ "req.body",           smp_fetch_body,               0,                NULL,    SMP_T_BIN,  SMP_USE_HRQHV },
 	{ "req.body_len",       smp_fetch_body_len,           0,                NULL,    SMP_T_SINT, SMP_USE_HRQHV },
@@ -2313,8 +2372,8 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "req.hdrs_bin",       smp_fetch_hdrs_bin,           0,                NULL,    SMP_T_BIN,  SMP_USE_HRQHV },
 
 	/* HTTP version on the response path */
-	{ "res.ver",            smp_fetch_stver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRSHV },
-	{ "resp_ver",           smp_fetch_stver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRSHV },
+	{ "res.ver",            smp_fetch_stver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRSHP },
+	{ "resp_ver",           smp_fetch_stver,              0,                NULL,    SMP_T_STR,  SMP_USE_HRSHP },
 
 	{ "res.body",           smp_fetch_body,               0,                NULL,    SMP_T_BIN,  SMP_USE_HRSHV },
 	{ "res.body_len",       smp_fetch_body_len,           0,                NULL,    SMP_T_SINT, SMP_USE_HRSHV },
@@ -2373,7 +2432,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "url_ip",             smp_fetch_url_ip,             0,                NULL,    SMP_T_IPV4, SMP_USE_HRQHV },
 	{ "url_port",           smp_fetch_url_port,           0,                NULL,    SMP_T_SINT, SMP_USE_HRQHV },
 	{ "url_param",          smp_fetch_url_param,          ARG3(0,STR,STR,STR),  NULL,    SMP_T_STR,  SMP_USE_HRQHV },
-	{ "urlp"     ,          smp_fetch_url_param,          ARG3(0,STR,STR,STR),  NULL,    SMP_T_STR,  SMP_USE_HRQHV },
+	{ "urlp",               smp_fetch_url_param,          ARG3(0,STR,STR,STR),  NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "urlp_val",           smp_fetch_url_param_val,      ARG3(0,STR,STR,STR),  NULL,    SMP_T_SINT, SMP_USE_HRQHV },
 
 	{ /* END */ },

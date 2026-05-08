@@ -128,18 +128,26 @@ struct notification {
  * pointer if the task/tasklet remains valid, and return NULL if it has been
  * deleted. The scheduler relies on this to know if it should update its state
  * on return.
+ *
+ * Keep in mind that tasks can be cast to tasklets while in the final tasklet
+ * queues, and will be listed via the tasklet's <list> instead of the task's
+ * <rq>. However other fields (wq, common) must remain totally valid for the
+ * task during this time. This explains why certain elements are present in
+ * the common part even though pure tasklets do not need them.
  */
 #define TASK_COMMON							\
-	struct {							\
-		unsigned int state; /* task state : bitfield of TASK_	*/ \
-		int tid;            /* tid of task/tasklet. <0 = local for tasklet, unbound for task */ \
-		struct task *(*process)(struct task *t, void *ctx, unsigned int state); /* the function which processes the task */ \
-		void *context; /* the task's context */			\
-		const struct ha_caller *caller;	 /* call place of last wakeup(); 0 on init, -1 on free */ \
-		uint32_t wake_date;              /* date of the last task wakeup */ \
-		unsigned int calls;              /* number of times process was called */ \
-		TASK_DEBUG_STORAGE;					\
-	}
+	unsigned int state; /* task state : bitfield of TASK_	*/ \
+	int tid;            /* tid of task/tasklet. <0 = local for tasklet, unbound for task */ \
+	struct task *(*process)(struct task *t, void *ctx, unsigned int state); /* the function which processes the task */ \
+	void *context; /* the task's context */			\
+	const struct ha_caller *caller;	 /* call place of last wakeup(); 0 on init, -1 on free */ \
+	uint32_t wake_date;              /* date of the last task wakeup */ \
+	unsigned int calls;              /* number of times process was called */ \
+	TASK_DEBUG_STORAGE;					\
+	short last_run;                  /* 16-bit now_ms of last run */          \
+	short nice;                      /* task prio from -1024 to +1024 */      \
+	int expire;                      /* next expiration date for this task, in ticks */
+	/* total: 36 or 48 bytes on 32/64 bit platforms */
 
 /* The base for all tasks */
 struct task {
@@ -151,9 +159,6 @@ struct task {
 	 * ever reorder these fields without taking this into account!
 	 */
 	struct eb32_node wq;		/* ebtree node used to hold the task in the wait queue */
-	int expire;			/* next expiration date for this task, in ticks */
-	short nice;                     /* task prio from -1024 to +1024 */
-	/* 16-bit hole here */
 };
 
 /* lightweight tasks, without priority, mainly used for I/Os */

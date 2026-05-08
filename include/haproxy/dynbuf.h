@@ -36,6 +36,8 @@
 #include <haproxy/pool.h>
 
 extern struct pool_head *pool_head_buffer;
+extern struct pool_head *pool_head_large_buffer;
+extern struct pool_head *pool_head_small_buffer;
 
 int init_buffer(void);
 void buffer_dump(FILE *o, struct buffer *b, int from, int to);
@@ -51,6 +53,42 @@ static inline int buffer_almost_full(const struct buffer *buf)
 		return 0;
 
 	return b_almost_full(buf);
+}
+
+/* Return 1 if <sz> is the  default buffer size */
+static inline int b_is_default_sz(size_t sz)
+{
+	return (sz == pool_head_buffer->size);
+}
+
+/* Return 1 if <sz> is the size of a large buffer (alwoys false is large buffers are not configured) */
+static inline int b_is_large_sz(size_t sz)
+{
+	return (pool_head_large_buffer && sz == pool_head_large_buffer->size);
+}
+
+/* Return 1 if <sz> is the size of a small buffer */
+static inline int b_is_small_sz(size_t sz)
+{
+	return (pool_head_small_buffer && sz == pool_head_small_buffer->size);
+}
+
+/* Return 1 if <bug> is a  default buffer */
+static inline int b_is_default(struct buffer *buf)
+{
+	return b_is_default_sz(b_size(buf));
+}
+
+/* Return 1 if <buf> is a large buffer (alwoys 0 is large buffers are not configured) */
+static inline int b_is_large(struct buffer *buf)
+{
+	return b_is_large_sz(b_size(buf));
+}
+
+/* Return 1 if <buf> is a small buffer */
+static inline int b_is_small(struct buffer *buf)
+{
+	return b_is_small_sz(b_size(buf));
 }
 
 /**************************************************/
@@ -136,13 +174,20 @@ static inline char *__b_get_emergency_buf(void)
 #define __b_free(_buf)							\
 	do {								\
 		char *area = (_buf)->area;				\
+		size_t sz = (_buf)->size;				\
 									\
 		/* let's first clear the area to save an occasional "show sess all" \
 		 * glancing over our shoulder from getting a dangling pointer.      \
 		 */							            \
 		*(_buf) = BUF_NULL;					\
 		__ha_barrier_store();					\
-		if (th_ctx->emergency_bufs_left < global.tune.reserved_bufs) \
+		/* if enabled, large buffers are always strictly greater \
+		 * than the default buffers */				\
+		if (unlikely(b_is_large_sz(sz)))			\
+			pool_free(pool_head_large_buffer, area);	\
+		else if (unlikely(b_is_small_sz(sz)))			\
+			pool_free(pool_head_small_buffer, area);	\
+		else if (th_ctx->emergency_bufs_left < global.tune.reserved_bufs) \
 			th_ctx->emergency_bufs[th_ctx->emergency_bufs_left++] = area; \
 		else							\
 			pool_free(pool_head_buffer, area);		\
@@ -154,6 +199,35 @@ static inline char *__b_get_emergency_buf(void)
 		if ((_buf)->size)		\
 			__b_free((_buf));	\
 	} while (0)
+
+
+static inline struct buffer *b_alloc_small(struct buffer *buf)
+{
+	char *area = NULL;
+
+	if (!buf->size) {
+		area = pool_alloc(pool_head_small_buffer);
+		if (!area)
+			return NULL;
+		buf->area = area;
+		buf->size = global.tune.bufsize_small;
+	}
+	return buf;
+}
+
+static inline struct buffer *b_alloc_large(struct buffer *buf)
+{
+	char *area = NULL;
+
+	if (!buf->size) {
+		area = pool_alloc(pool_head_large_buffer);
+		if (!area)
+			return NULL;
+		buf->area = area;
+		buf->size = global.tune.bufsize_large;
+	}
+	return buf;
+}
 
 /* Offer one or multiple buffer currently belonging to target <from> to whoever
  * needs one. Any pointer is valid for <from>, including NULL. Its purpose is

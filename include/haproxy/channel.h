@@ -376,6 +376,7 @@ static inline void channel_add_input(struct channel *chn, unsigned int len)
 		c_adv(chn, fwd);
 	}
 	/* notify that some data was read */
+	chn_prod(chn)->bytes_in += len;
 	chn->flags |= CF_READ_EVENT;
 }
 
@@ -787,8 +788,12 @@ static inline int channel_recv_max(const struct channel *chn)
  */
 static inline size_t channel_data_limit(const struct channel *chn)
 {
-	size_t max = (global.tune.bufsize - global.tune.maxrewrite);
 
+	size_t max;
+
+	if (!c_size(chn))
+		return 0;
+	max = (c_size(chn) - global.tune.maxrewrite);
 	if (IS_HTX_STRM(chn_strm(chn)))
 		max -= HTX_BUF_OVERHEAD;
 	return max;

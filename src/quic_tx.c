@@ -25,6 +25,7 @@
 #include <haproxy/quic_retransmit.h>
 #include <haproxy/quic_retry.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_stats.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_trace.h>
@@ -1840,7 +1841,7 @@ static inline int quic_enc_token(struct quic_conn *qc,
  * depending on its list of parameters. In most cases, <frms> frame list is
  * not empty. So, this function first tries to build this list of frames.
  *
- * Return 1 if succeeded (enough room to buile this packet), O if not.
+ * Return 1 if succeeded (enough room to build this packet), 0 if not.
  */
 static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
                            size_t dglen, struct quic_tx_packet *pkt,
@@ -1972,7 +1973,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 			if (qel->pktns->tx.pto_probe) {
 				/* If a probing packet was asked and could not be built,
 				 * this is not because there was not enough room, but due to
-				 * its frames which were already acknowledeged.
+				 * its frames which were already acknowledged.
 				 * See qc_stream_frm_is_acked()) called by qc_build_frms().
 				 * Note that qc_stream_frm_is_acked() logs a trace in this
 				 * case mentioning some frames were already acknowledged.
@@ -2086,7 +2087,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	/* payload building (ack-eliciting or not frames) */
 	payload = pos;
 	if (ack_frm_len) {
-		if (!qc_build_frm(&pos, end, &ack_frm, pkt, qc))
+		if (!qc_build_frm_pkt(&ack_frm, pkt, &pos, end, qc))
 			goto no_room;
 
 		pkt->largest_acked_pn = quic_pktns_get_largest_acked_pn(qel->pktns);
@@ -2097,7 +2098,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	if (!LIST_ISEMPTY(&frm_list)) {
 		struct quic_frame *tmp_cf;
 		list_for_each_entry_safe(cf, tmp_cf, &frm_list, list) {
-			if (!qc_build_frm(&pos, end, cf, pkt, qc)) {
+			if (!qc_build_frm_pkt(cf, pkt, &pos, end, qc)) {
 				ssize_t room = end - pos;
 				TRACE_PROTO("Not enough room", QUIC_EV_CONN_TXPKT,
 				            qc, NULL, NULL, &room);
@@ -2117,13 +2118,13 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	/* Build a PING frame if needed. */
 	if (add_ping_frm) {
 		frm.type = QUIC_FT_PING;
-		if (!qc_build_frm(&pos, end, &frm, pkt, qc))
+		if (!qc_build_frm_pkt(&frm, pkt, &pos, end, qc))
 			goto no_room;
 	}
 
 	/* Build a CONNECTION_CLOSE frame if needed. */
 	if (cc) {
-		if (!qc_build_frm(&pos, end, &cc_frm, pkt, qc))
+		if (!qc_build_frm_pkt(&cc_frm, pkt, &pos, end, qc))
 			goto no_room;
 
 		pkt->flags |= QUIC_FL_TX_PACKET_CC;
@@ -2133,7 +2134,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	if (padding_len) {
 		frm.type = QUIC_FT_PADDING;
 		frm.padding.len = padding_len;
-		if (!qc_build_frm(&pos, end, &frm, pkt, qc))
+		if (!qc_build_frm_pkt(&frm, pkt, &pos, end, qc))
 			goto no_room;
 	}
 

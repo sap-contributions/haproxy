@@ -104,7 +104,7 @@ const struct stat_col stat_cols_info[ST_I_INF_MAX] = {
 	[ST_I_INF_UPTIME_SEC]                     = { .name = "Uptime_sec",                  .alt_name = "uptime_seconds",                .desc = "How long ago this worker process was started (seconds)" },
 	[ST_I_INF_START_TIME_SEC]                 = { .name = "Start_time_sec",              .alt_name = "start_time_seconds",            .desc = "Start time in seconds" },
 	[ST_I_INF_MEMMAX_MB]                      = { .name = "Memmax_MB",                   .alt_name = NULL,                            .desc = "Worker process's hard limit on memory usage in MB (-m on command line)" },
-	[ST_I_INF_MEMMAX_BYTES]                   = { .name = "Memmax_bytes",                .alt_name = "max_memory_bytes",              .desc = "Worker process's hard limit on memory usage in byes (-m on command line)" },
+	[ST_I_INF_MEMMAX_BYTES]                   = { .name = "Memmax_bytes",                .alt_name = "max_memory_bytes",              .desc = "Worker process's hard limit on memory usage in bytes (-m on command line)" },
 	[ST_I_INF_POOL_ALLOC_MB]                  = { .name = "PoolAlloc_MB",                .alt_name = NULL,                            .desc = "Amount of memory allocated in pools (in MB)" },
 	[ST_I_INF_POOL_ALLOC_BYTES]               = { .name = "PoolAlloc_bytes",             .alt_name = "pool_allocated_bytes",          .desc = "Amount of memory allocated in pools (in bytes)" },
 	[ST_I_INF_POOL_USED_MB]                   = { .name = "PoolUsed_MB",                 .alt_name = NULL,                            .desc = "Amount of pool memory currently used (in MB)" },
@@ -174,6 +174,7 @@ const struct stat_col stat_cols_info[ST_I_INF_MAX] = {
 	[ST_I_INF_WARN_BLOCKED]                   = { .name = "BlockedTrafficWarnings",      .alt_name = NULL,                            .desc = "Total number of warnings issued about traffic being blocked by too slow a task" },
 	[ST_I_INF_PATTERNS_ADDED]                 = { .name = "PatternsAdded",               .alt_name = "patterns_added_total",          .desc = "Total number of patterns added (acl/map entries)" },
 	[ST_I_INF_PATTERNS_FREED]                 = { .name = "PatternsFreed",               .alt_name = "patterns_freed_total",          .desc = "Total number of patterns freed (acl/map entries)" },
+	[ST_I_INF_NBTGROUPS]                      = { .name = "NbThreadGroups",              .alt_name = "nb_thread_groups",              .desc = "Number of started thread groups (global.thread-groups)" },
 };
 
 /* one line of info */
@@ -590,12 +591,13 @@ int stats_dump_stat_to_buffer(struct stconn *sc, struct buffer *buf, struct htx 
 				goto full;
 		}
 
-		if (domain == STATS_DOMAIN_PROXY)
-			ctx->obj1 = proxies_list;
-
 		ctx->px_st = STAT_PX_ST_INIT;
 		ctx->field = 0;
 		ctx->state = STAT_STATE_LIST;
+		/* Update ctx->obj1 via watcher to point on the first proxy. */
+		if (domain == STATS_DOMAIN_PROXY)
+			watcher_attach(&ctx->px_watch, proxies_list);
+
 		__fallthrough;
 
 	case STAT_STATE_LIST:
@@ -840,6 +842,7 @@ int stats_fill_info(struct field *line, int len, uint flags)
 	line[ST_I_INF_WARN_BLOCKED]                   = mkf_u32(0, warn_blocked_issued);
 	line[ST_I_INF_PATTERNS_ADDED]                 = mkf_u64(0, patterns_added);
 	line[ST_I_INF_PATTERNS_FREED]                 = mkf_u64(0, patterns_freed);
+	line[ST_I_INF_NBTGROUPS]                      = mkf_u32(FO_CONFIG|FS_SERVICE, global.nbtgroups);
 
 	return 1;
 }
@@ -944,6 +947,8 @@ static int cli_parse_show_stat(char **args, char *payload, struct appctx *appctx
 	ctx->scope_len = 0;
 	ctx->http_px = NULL; // not under http context
 	ctx->flags = STAT_F_SHNODE | STAT_F_SHDESC;
+
+	watcher_init(&ctx->px_watch,  &ctx->obj1, offsetof(struct proxy, watcher_list));
 	watcher_init(&ctx->srv_watch, &ctx->obj2, offsetof(struct server, watcher_list));
 
 	if ((strm_li(appctx_strm(appctx))->bind_conf->level & ACCESS_LVL_MASK) >= ACCESS_LVL_OPER)
@@ -1028,8 +1033,12 @@ static int cli_io_handler_dump_stat(struct appctx *appctx)
 static void cli_io_handler_release_stat(struct appctx *appctx)
 {
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	if (ctx->px_st == STAT_PX_ST_SV && ctx->obj2)
-		watcher_detach(&ctx->srv_watch);
+
+	if (ctx->state == STAT_STATE_LIST && ctx->domain == STATS_DOMAIN_PROXY) {
+		watcher_detach(&ctx->px_watch);
+		if (ctx->px_st == STAT_PX_ST_SV)
+			watcher_detach(&ctx->srv_watch);
+	}
 }
 
 static int cli_io_handler_dump_json_schema(struct appctx *appctx)
@@ -1048,6 +1057,7 @@ static int cli_parse_dump_stat_file(char **args, char *payload,
 	ctx->domain = STATS_DOMAIN_PROXY;
 	ctx->flags |= STAT_F_FMT_FILE;
 	watcher_init(&ctx->srv_watch, &ctx->obj2, offsetof(struct server, watcher_list));
+	watcher_init(&ctx->px_watch,  &ctx->obj1, offsetof(struct proxy, watcher_list));
 
 	return 0;
 }
@@ -1089,16 +1099,21 @@ static int cli_io_handler_dump_stat_file(struct appctx *appctx)
 static void cli_io_handler_release_dump_stat_file(struct appctx *appctx)
 {
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	if (ctx->px_st == STAT_PX_ST_SV && ctx->obj2)
-		watcher_detach(&ctx->srv_watch);
+
+	if (ctx->state == STAT_STATE_LIST && ctx->domain == STATS_DOMAIN_PROXY) {
+		watcher_detach(&ctx->px_watch);
+		if (ctx->px_st == STAT_PX_ST_SV)
+			watcher_detach(&ctx->srv_watch);
+	}
 }
 
 int stats_allocate_proxy_counters_internal(struct extra_counters **counters,
-                                           int type, int px_cap)
+                                           int type, int px_cap,
+                                           char **storage, size_t step)
 {
 	struct stats_module *mod;
 
-	EXTRA_COUNTERS_REGISTER(counters, type, alloc_failed);
+	EXTRA_COUNTERS_REGISTER(counters, type, alloc_failed, storage, step);
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
 		if (!(stats_px_get_cap(mod->domain_flags) & px_cap))
@@ -1107,7 +1122,7 @@ int stats_allocate_proxy_counters_internal(struct extra_counters **counters,
 		EXTRA_COUNTERS_ADD(mod, *counters, mod->counters, mod->counters_size);
 	}
 
-	EXTRA_COUNTERS_ALLOC(*counters, alloc_failed);
+	EXTRA_COUNTERS_ALLOC(*counters, alloc_failed, global.nbtgroups);
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
 		if (!(stats_px_get_cap(mod->domain_flags) & px_cap))
@@ -1133,7 +1148,10 @@ int stats_allocate_proxy_counters(struct proxy *px)
 	if (px->cap & PR_CAP_FE) {
 		if (!stats_allocate_proxy_counters_internal(&px->extra_counters_fe,
 		                                            COUNTERS_FE,
-		                                            STATS_PX_CAP_FE)) {
+		                                            STATS_PX_CAP_FE,
+		                                            &px->per_tgrp->extra_counters_fe_storage,
+		                                            &px->per_tgrp[1].extra_counters_fe_storage -
+		                                            &px->per_tgrp[0].extra_counters_fe_storage)) {
 			return 0;
 		}
 	}
@@ -1141,7 +1159,10 @@ int stats_allocate_proxy_counters(struct proxy *px)
 	if (px->cap & PR_CAP_BE) {
 		if (!stats_allocate_proxy_counters_internal(&px->extra_counters_be,
 		                                            COUNTERS_BE,
-		                                            STATS_PX_CAP_BE)) {
+		                                            STATS_PX_CAP_BE,
+		                                            &px->per_tgrp->extra_counters_be_storage,
+		                                            &px->per_tgrp[1].extra_counters_be_storage -
+		                                            &px->per_tgrp[0].extra_counters_be_storage)) {
 			return 0;
 		}
 	}
@@ -1149,7 +1170,10 @@ int stats_allocate_proxy_counters(struct proxy *px)
 	for (sv = px->srv; sv; sv = sv->next) {
 		if (!stats_allocate_proxy_counters_internal(&sv->extra_counters,
 		                                            COUNTERS_SV,
-		                                            STATS_PX_CAP_SRV)) {
+		                                            STATS_PX_CAP_SRV,
+		                                            &sv->per_tgrp->extra_counters_storage,
+		                                            &sv->per_tgrp[1].extra_counters_storage -
+		                                            &sv->per_tgrp[0].extra_counters_storage)) {
 			return 0;
 		}
 	}
@@ -1157,7 +1181,8 @@ int stats_allocate_proxy_counters(struct proxy *px)
 	list_for_each_entry(li, &px->conf.listeners, by_fe) {
 		if (!stats_allocate_proxy_counters_internal(&li->extra_counters,
 		                                            COUNTERS_LI,
-		                                            STATS_PX_CAP_LI)) {
+		                                            STATS_PX_CAP_LI,
+		                                            &li->extra_counters_storage, 0)) {
 			return 0;
 		}
 	}
@@ -1315,8 +1340,7 @@ static void deinit_stats(void)
 	for (i = 0; i < STATS_DOMAIN_COUNT; ++i) {
 		const int domain = domains[i];
 
-		if (stat_cols[domain])
-			free(stat_cols[domain]);
+		free(stat_cols[domain]);
 	}
 }
 
@@ -1324,8 +1348,7 @@ REGISTER_POST_DEINIT(deinit_stats);
 
 static void free_trash_counters(void)
 {
-	if (trash_counters)
-		free(trash_counters);
+	free(trash_counters);
 }
 
 REGISTER_PER_THREAD_FREE(free_trash_counters);

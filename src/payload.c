@@ -264,7 +264,7 @@ smp_fetch_req_ssl_st_ext(const struct arg *args, struct sample *smp, const char 
 		if (ext_len > hs_len - 4) /* Extension too long */
 			goto not_ssl_hello;
 
-		/* SesstionTicket extension */
+		/* SessionTicket extension */
 		if (ext_type == 35) {
 			smp->data.type = SMP_T_SINT;
 			/* SessionTicket also present */
@@ -697,13 +697,13 @@ smp_fetch_ssl_keyshare_groups(const struct arg *args, struct sample *smp, const 
 				goto not_ssl_hello;
 
 			keyshare_len = (data[4] << 8) + data[5]; /* Client keyshare length */
-			if (keyshare_len < 2 || keyshare_len > hs_len - 6)
-				goto not_ssl_hello; /* at least 2 bytes per keyshare */
+			if (keyshare_len < 4 || keyshare_len > hs_len - 6)
+				goto not_ssl_hello; /* at least 4 bytes for one keyshare entry */
 			dataPointer = data + 6; /* start of keyshare entries */
 			readPosition = 0;
 			numberOfKeyshares = 0;
 			smp_trash = get_trash_chunk();
-			while (readPosition < keyshare_len) {
+			while (readPosition + 4 <= keyshare_len) {
 				/* Get the binary value of the keyshare group and move the offset to the end of the related keyshare */
 				memmove(b_orig(smp_trash) + (2*numberOfKeyshares), &dataPointer[readPosition], 2);
 				numberOfKeyshares++;
@@ -873,6 +873,9 @@ smp_fetch_ssl_hello_sni(const struct arg *args, struct sample *smp, const char *
 
 			name_type = data[6];
 			name_len = (data[7] << 8) + data[8];
+
+			if (name_len + 3 > srv_len)
+				goto not_ssl_hello;
 
 			if (name_type == 0) { /* hostname */
 				smp->data.type = SMP_T_STR;
@@ -1205,7 +1208,6 @@ smp_fetch_payload_lv(const struct arg *arg_p, struct sample *smp, const char *kw
 	unsigned int len_size = arg_p[1].data.sint;
 	unsigned int buf_offset;
 	unsigned int buf_size = 0;
-	struct channel *chn = NULL;
 	char *head = NULL;
 	size_t max, data;
 	int i;
@@ -1215,12 +1217,15 @@ smp_fetch_payload_lv(const struct arg *arg_p, struct sample *smp, const char *kw
 	/* buf offset could be absolute or relative to len offset + len size if prefixed by + or - */
 
 	if (smp->strm) {
+		struct channel *chn = NULL;
+
 		/* meaningless for HTX buffers */
 		if (IS_HTX_STRM(smp->strm))
 			return 0;
 		chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
 		head = ci_head(chn);
 		data = ci_data(chn);
+		max = c_size(chn);
 	}
 	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK) {
 		struct check *check = __objt_check(smp->sess->origin);
@@ -1230,8 +1235,9 @@ smp_fetch_payload_lv(const struct arg *arg_p, struct sample *smp, const char *kw
 			return 0;
 		head = b_head(&check->bi);
 		data = b_data(&check->bi);
+		max = b_size(&check->bi);
 	}
-	max = global.tune.bufsize;
+
 	if (!head)
 		goto too_short;
 
@@ -1290,6 +1296,7 @@ smp_fetch_payload(const struct arg *arg_p, struct sample *smp, const char *kw, v
 		chn = ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_RES) ? &smp->strm->res : &smp->strm->req;
 		head = ci_head(chn);
 		data = ci_data(chn);
+		max = c_size(chn);
 	}
 	else if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK) {
 		struct check *check = __objt_check(smp->sess->origin);
@@ -1299,8 +1306,8 @@ smp_fetch_payload(const struct arg *arg_p, struct sample *smp, const char *kw, v
 			return 0;
 		head = b_head(&check->bi);
 		data = b_data(&check->bi);
+		max =  b_size(&check->bi);
 	}
-	max = global.tune.bufsize;
 	if (!head)
 		goto too_short;
 
@@ -1448,6 +1455,8 @@ smp_fetch_distcc_param(const struct arg *arg_p, struct sample *smp, const char *
 				return 1;
 			}
 		}
+		if (body > ci_data(chn) - ofs)
+			goto no_match;
 		ofs += body;
 	}
 
@@ -1540,6 +1549,8 @@ smp_fetch_distcc_body(const struct arg *arg_p, struct sample *smp, const char *k
 				return 1;
 			}
 		}
+		if (body > ci_data(chn) - ofs)
+			goto no_match;
 		ofs += body;
 	}
 

@@ -94,26 +94,30 @@ enum jwt_alg jwt_parse_alg(const char *alg_str, unsigned int alg_len)
  * now, we don't need to manage more than three subparts in the tokens.
  * See section 3.1 of RFC7515 for more information about JWS Compact
  * Serialization.
- * Returns 0 in case of success.
+ * Returns -1 in case of error, 0 if the token has exactly <item_num> parts, a
+ * positive value otherwise.
  */
-int jwt_tokenize(const struct buffer *jwt, struct jwt_item *items, unsigned int *item_num)
+int jwt_tokenize(const struct buffer *jwt, struct jwt_item *items, unsigned int item_num)
 {
 	char *ptr = jwt->area;
 	char *jwt_end = jwt->area + jwt->data;
 	unsigned int index = 0;
 	unsigned int length = 0;
 
-	if (index < *item_num) {
-		items[index].start = ptr;
-		items[index].length = 0;
-	}
+	if (item_num == 0)
+		return -1;
 
-	while (index < *item_num && ptr < jwt_end) {
+	items[index].start = ptr;
+	items[index].length = 0;
+
+	while (ptr < jwt_end) {
 		if (*ptr++ == '.') {
 			items[index++].length = length;
+			/* We found enough items, no need to keep looking for
+			 * separators. */
+			if (index == item_num)
+				return 1;
 
-			if (index == *item_num)
-				return -1;
 			items[index].start = ptr;
 			items[index].length = 0;
 			length = 0;
@@ -121,10 +125,11 @@ int jwt_tokenize(const struct buffer *jwt, struct jwt_item *items, unsigned int 
 			++length;
 	}
 
-	if (index < *item_num)
-		items[index].length = length;
+	/* We might not have found enough items */
+	if (index < item_num - 1)
+		return -1;
 
-	*item_num = (index+1);
+	items[index].length = length;
 
 	return (ptr != jwt_end);
 }
@@ -289,7 +294,7 @@ jwt_jwsverify_hmac(const struct jwt_ctx *ctx, const struct buffer *decoded_signa
 }
 
 /*
- * Convert a JWT ECDSA signature (R and S parameters concatenatedi, see section
+ * Convert a JWT ECDSA signature (R and S parameters concatenated, see section
  * 3.4 of RFC7518) into an ECDSA_SIG that can be fed back into OpenSSL's digest
  * verification functions.
  * Returns 0 in case of success.
@@ -326,13 +331,20 @@ static int convert_ecdsa_sig(const struct jwt_ctx *ctx, struct buffer *signature
 	/* Build ecdsa out of R and S values. */
 	ECDSA_SIG_set0(ecdsa_sig, ec_R, ec_S);
 
-	p = (unsigned char*)signature->area;
-
-	signature->data = i2d_ECDSA_SIG(ecdsa_sig, &p);
-	if (signature->data == 0) {
+	/* i2d_ECDSA_SIG writes with no output bound. The DER encoding adds
+	 * a SEQUENCE header (~4 bytes), two INTEGER headers (~4 bytes each),
+	 * and up to two sign-padding bytes on top of the raw R||S bytes.
+	 * Compute the length first to avoid overflowing signature->area.
+	 */
+	retval = i2d_ECDSA_SIG(ecdsa_sig, NULL);
+	if (retval <= 0 || (size_t)retval > signature->size) {
 		retval = JWT_VRFY_INVALID_TOKEN;
 		goto end;
 	}
+
+	p = (unsigned char*)signature->area;
+	signature->data = i2d_ECDSA_SIG(ecdsa_sig, &p);
+	retval = 0;
 
 end:
 	ECDSA_SIG_free(ecdsa_sig);
@@ -493,12 +505,8 @@ enum jwt_vrfy_status jwt_verify(const struct buffer *token, const struct buffer 
 	if (ctx.alg == JWT_ALG_DEFAULT)
 		return JWT_VRFY_UNKNOWN_ALG;
 
-	if (jwt_tokenize(token, items, &item_num))
+	if (jwt_tokenize(token, items, item_num))
 		return JWT_VRFY_INVALID_TOKEN;
-
-	if (item_num != JWT_ELT_MAX)
-		if (ctx.alg != JWS_ALG_NONE || item_num != JWT_ELT_SIG)
-			return JWT_VRFY_INVALID_TOKEN;
 
 	ctx.jose = items[JWT_ELT_JOSE];
 	ctx.claims = items[JWT_ELT_CLAIMS];

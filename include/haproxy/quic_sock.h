@@ -45,6 +45,7 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status);
 
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
 void quic_lstnr_sock_fd_iocb(int fd);
+int quic_dgram_requeue(struct quic_dgram *dgram, int cid_tid);
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t count,
                int flags, uint16_t gso_size);
 int qc_rcv_buf(struct quic_conn *qc);
@@ -106,6 +107,40 @@ static inline int quic_increment_curr_handshake(struct listener *l)
 
  end:
 	return next;
+}
+
+/* Initializes <dst> sockaddr_storage from <src> union sockaddr_in46 type.
+ * Only unspec, IPv4 and IPv6 addresses are supported.
+ */
+static inline void in46un_to_addr(const union sockaddr_in46 *src,
+                                  struct sockaddr_storage *dst)
+{
+	struct sockaddr_in  *in;
+	struct sockaddr_in6 *in6;
+
+	switch (((struct sockaddr_storage *)src)->ss_family) {
+	case AF_UNSPEC:
+		memset(dst, 0, sizeof(*dst));
+		break;
+
+	case AF_INET:
+		in = (struct sockaddr_in *)dst;
+		in->sin_family = AF_INET;
+		in->sin_addr = src->in4.sin_addr;
+		in->sin_port = src->in4.sin_port;
+		break;
+
+	case AF_INET6:
+		in6 = (struct sockaddr_in6 *)dst;
+		in6->sin6_family = AF_INET6;
+		in6->sin6_addr = src->in6.sin6_addr;
+		in6->sin6_port = src->in6.sin6_port;
+		break;
+
+	default:
+		ABORT_NOW();
+		break;
+	}
 }
 
 #endif /* USE_QUIC */

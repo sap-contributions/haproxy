@@ -28,7 +28,9 @@
 #include <haproxy/stream-t.h>
 
 extern const char *trace_flt_id;
-extern const char *http_comp_flt_id;
+extern const char *http_comp_req_flt_id;
+extern const char *http_comp_res_flt_id;
+
 extern const char *cache_store_flt_id;
 extern const char *spoe_filter_id;
 extern const char *fcgi_flt_id;
@@ -40,13 +42,13 @@ extern const char *fcgi_flt_id;
 /* Useful macros to access per-channel values. It can be safely used inside
  * filters. */
 #define CHN_IDX(chn)     (((chn)->flags & CF_ISRESP) == CF_ISRESP)
-#define FLT_STRM_OFF(s, chn) (strm_flt(s)->offset[CHN_IDX(chn)])
+#define FLT_STRM_OFF(s, chn) (chn->flt.offset)
 #define FLT_OFF(flt, chn) ((flt)->offset[CHN_IDX(chn)])
 
 #define HAS_FILTERS(strm)           ((strm)->strm_flt.flags & STRM_FLT_FL_HAS_FILTERS)
 
-#define HAS_REQ_DATA_FILTERS(strm)  ((strm)->strm_flt.nb_req_data_filters != 0)
-#define HAS_RSP_DATA_FILTERS(strm)  ((strm)->strm_flt.nb_rsp_data_filters != 0)
+#define HAS_REQ_DATA_FILTERS(strm)  ((strm)->req.flt.nb_data_filters != 0)
+#define HAS_RSP_DATA_FILTERS(strm)  ((strm)->res.flt.nb_data_filters != 0)
 #define HAS_DATA_FILTERS(strm, chn) (((chn)->flags & CF_ISRESP) ? HAS_RSP_DATA_FILTERS(strm) : HAS_REQ_DATA_FILTERS(strm))
 
 #define IS_REQ_DATA_FILTER(flt)  ((flt)->flags & FLT_FL_IS_REQ_DATA_FILTER)
@@ -137,14 +139,11 @@ static inline void
 register_data_filter(struct stream *s, struct channel *chn, struct filter *filter)
 {
 	if (!IS_DATA_FILTER(filter, chn)) {
-		if (chn->flags & CF_ISRESP) {
+		if (chn->flags & CF_ISRESP)
 			filter->flags |= FLT_FL_IS_RSP_DATA_FILTER;
-			strm_flt(s)->nb_rsp_data_filters++;
-		}
-		else  {
+		else
 			filter->flags |= FLT_FL_IS_REQ_DATA_FILTER;
-			strm_flt(s)->nb_req_data_filters++;
-		}
+		chn->flt.nb_data_filters++;
 	}
 }
 
@@ -153,16 +152,64 @@ static inline void
 unregister_data_filter(struct stream *s, struct channel *chn, struct filter *filter)
 {
 	if (IS_DATA_FILTER(filter, chn)) {
-		if (chn->flags & CF_ISRESP) {
+		if (chn->flags & CF_ISRESP)
 			filter->flags &= ~FLT_FL_IS_RSP_DATA_FILTER;
-			strm_flt(s)->nb_rsp_data_filters--;
-
-		}
-		else  {
+		else
 			filter->flags &= ~FLT_FL_IS_REQ_DATA_FILTER;
-			strm_flt(s)->nb_req_data_filters--;
-		}
+		chn->flt.nb_data_filters--;
 	}
+}
+
+/*
+ * flt_list_start() and flt_list_next() can be used to iterate over the list of filters
+ * for a given <strm> and <chn> combination. It will automatically choose the proper
+ * list to iterate from depending on the context.
+ *
+ * flt_list_start() has to be called exactly once to get the first value from the list
+ * to get the following values, use flt_list_next() until NULL is returned.
+ *
+ * Example:
+ *
+ *    struct filter *filter;
+ *
+ *    for (filter = flt_list_start(stream, channel); filter;
+ *         filter = flt_list_next(stream, channel, filter)) {
+ *	...
+ *    }
+ */
+static inline struct filter *flt_list_start(struct stream *strm, struct channel *chn)
+{
+	struct filter *filter;
+
+	if (chn->flags & CF_ISRESP) {
+		filter = LIST_NEXT(&chn->flt.filters, struct filter *, res_list);
+		if (&filter->res_list == &chn->flt.filters)
+			filter = NULL; /* empty list */
+	}
+	else {
+		filter = LIST_NEXT(&chn->flt.filters, struct filter *, req_list);
+		if (&filter->req_list == &chn->flt.filters)
+			filter = NULL; /* empty list */
+	}
+
+	return filter;
+}
+
+static inline struct filter *flt_list_next(struct stream *strm, struct channel *chn,
+                                           struct filter *filter)
+{
+	if (chn->flags & CF_ISRESP) {
+		filter = LIST_NEXT(&filter->res_list, struct filter *, res_list);
+		if (&filter->res_list == &chn->flt.filters)
+			filter = NULL; /* end of list */
+	}
+	else {
+		filter = LIST_NEXT(&filter->req_list, struct filter *, req_list);
+		if (&filter->req_list == &chn->flt.filters)
+			filter = NULL; /* end of list */
+	}
+
+	return filter;
 }
 
 /* This function must be called when a filter alter payload data. It updates
@@ -177,7 +224,8 @@ flt_update_offsets(struct filter *filter, struct channel *chn, int len)
 	struct stream *s = chn_strm(chn);
 	struct filter *f;
 
-	list_for_each_entry(f, &strm_flt(s)->filters, list) {
+	for (f = flt_list_start(s, chn); f;
+	     f = flt_list_next(s, chn, f)) {
 		if (f == filter)
 			break;
 		FLT_OFF(f, chn) += len;

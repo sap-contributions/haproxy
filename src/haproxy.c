@@ -117,7 +117,6 @@
 #include <haproxy/sock_inet.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stats-file.h>
-#include <haproxy/stats-t.h>
 #include <haproxy/stream.h>
 #include <haproxy/systemd.h>
 #include <haproxy/task.h>
@@ -150,6 +149,10 @@ char **init_env;		/* to keep current process env variables backup */
 int  pidfd = -1;		/* FD to keep PID */
 int daemon_fd[2] = {-1, -1};	/* pipe to communicate with parent process */
 int devnullfd = -1;
+int fileless_mode;
+struct cfgfile fileless_cfg;
+extern __attribute__((weak)) void haproxy_init_args(int argc, char **argv);
+extern __attribute__((weak)) char **copy_argv(int argc, char **argv);
 
 static int stopped_tgroups;
 static int stop_detected;
@@ -179,6 +182,7 @@ struct global global = {
 		.options = GTUNE_LISTENER_MQ_OPT,
 		.bufsize = (BUFSIZE + 2*sizeof(void *) - 1) & -(2*sizeof(void *)),
 		.bufsize_small = BUFSIZE_SMALL,
+		.bufsize_large = 0,
 		.maxrewrite = MAXREWRITE,
 		.reserved_bufs = RESERVED_BUFS,
 		.pattern_cache = DEFAULT_PAT_LRU_SIZE,
@@ -197,6 +201,7 @@ struct global global = {
 #endif
 		.nb_stk_ctr = MAX_SESS_STKCTR,
 		.default_shards = -2, /* by-group */
+		.cli_max_payload_sz = 128 * 1024,
 	},
 #ifdef USE_OPENSSL
 #ifdef DEFAULT_MAXSSLCONN
@@ -205,7 +210,7 @@ struct global global = {
 #endif
 	/* by default allow clients which use a privileged port for TCP only */
 	.clt_privileged_ports = HA_PROTO_TCP,
-	.maxthrpertgroup = MAX_THREADS_PER_GROUP,
+	.maxthrpertgroup = DEF_MAX_THREADS_PER_GROUP,
 	/* others NULL OK */
 };
 
@@ -266,6 +271,10 @@ unsigned int tainted = 0;
 
 unsigned int experimental_directives_allowed = 0;
 unsigned int deprecated_directives_allowed = 0;
+
+/* mapped storage for collected libs */
+void *lib_storage = NULL;
+size_t lib_size = 0;
 
 int check_kw_experimental(struct cfg_keyword *kw, const char *file, int linenum,
                           char **errmsg)
@@ -604,6 +613,48 @@ void display_version()
 	}
 }
 
+/* compare a feature string, ignoring the first character (-/+)
+   used for qsort */
+static int feat_cmp(const void *a, const void *b)
+{
+	const struct ist *ia = a;
+	const struct ist *ib = b;
+
+	struct ist sa = istadv(*ia, 1);
+	struct ist sb = istadv(*ib, 1);
+
+	return istdiff(sa, sb);
+}
+
+/* split the feature list into an allocated sorted array of ist
+   the return ptr must be freed by the caller */
+static struct ist *split_feature_list()
+{
+	struct ist *out;
+	struct ist tmp = ist(build_features);
+
+	int n = 1; /* last element don't have a ' ' */
+	int i = 0;
+
+	for (i = 0; build_features[i] != '\0'; i++) {
+		if (build_features[i] == ' ')
+			n++;
+	}
+	out = calloc(n + 1, sizeof(*out)); // last elem is NULL
+	if (!out)
+		goto end;
+
+	i = 0;
+	while (tmp.len)
+		out[i++] = istsplit(&tmp, ' ');
+
+	qsort(out, n, sizeof(struct ist), feat_cmp);
+
+end:
+
+	return out;
+}
+
 /* display_mode:
  * 0 = short version (e.g., "3.3.1")
  * 1 = full version (e.g., "3.3.1-dev5-1bb975-71")
@@ -643,14 +694,23 @@ void display_version_plain(int display_mode)
 static void display_build_opts()
 {
 	const char **opt;
+	struct ist *feat_list = NULL, *tmp;
 
-	printf("Build options : %s"
-	       "\n\nFeature list : %s"
-	       "\n\nDefault settings :"
+	feat_list = split_feature_list();
+
+	printf("Build options : %s", build_opts_string);
+	printf("\n\nFeature list :");
+	for (tmp = feat_list;tmp->ptr;tmp++)
+		if (!isttest(istist(*tmp, ist("HAVE_WORKING_"))))
+			printf(" %.*s", (int)tmp->len, tmp->ptr);
+	printf("\nDetected feature list :");
+	for (tmp = feat_list;tmp->ptr;tmp++)
+		if (isttest(istist(*tmp, ist("HAVE_WORKING_"))))
+			printf(" %.*s", (int)tmp->len, tmp->ptr);
+	printf("\n\nDefault settings :"
 	       "\n  bufsize = %d, maxrewrite = %d, maxpollevents = %d"
 	       "\n\n",
-	       build_opts_string,
-	       build_features, BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
+	       BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
 
 	for (opt = NULL; (opt = hap_get_next_build_opt(opt)); puts(*opt))
 		;
@@ -669,6 +729,7 @@ static void display_build_opts()
 	putchar('\n');
 	list_filters(stdout);
 	putchar('\n');
+	ha_free(&feat_list);
 }
 
 /*
@@ -1061,6 +1122,8 @@ static int read_cfg()
 	setenv("HAPROXY_HTTPS_LOG_FMT", default_https_log_format, 1);
 	setenv("HAPROXY_TCP_LOG_FMT", default_tcp_log_format, 1);
 	setenv("HAPROXY_TCP_CLF_LOG_FMT", clf_tcp_log_format, 1);
+	setenv("HAPROXY_KEYLOG_FC_LOG_FMT", keylog_format_fc, 1);
+	setenv("HAPROXY_KEYLOG_BC_LOG_FMT", keylog_format_bc, 1);
 	setenv("HAPROXY_BRANCH", PRODUCT_BRANCH, 1);
 	list_for_each_entry(cfg, &cfg_cfgfiles, list) {
 		int ret;
@@ -1119,7 +1182,7 @@ err:
  * Return an allocated copy of argv
  */
 
-static char **copy_argv(int argc, char **argv)
+char **copy_argv(int argc, char **argv)
 {
 	char **newargv, **retargv;
 
@@ -1447,52 +1510,9 @@ static void init_early(int argc, char **argv)
 	}
 }
 
-/* handles program arguments. Very minimal parsing is performed, variables are
- * fed with some values, and lists are completed with other ones. In case of
- * error, it will exit.
- */
-static void init_args(int argc, char **argv)
+void haproxy_init_args(int argc, char **argv)
 {
 	char *err_msg = NULL;
-
-	/* pre-fill in the global tuning options before we let the cmdline
-	 * change them.
-	 */
-	global.tune.options |= GTUNE_USE_SELECT;  /* select() is always available */
-#if defined(USE_POLL)
-	global.tune.options |= GTUNE_USE_POLL;
-#endif
-#if defined(USE_EPOLL)
-	global.tune.options |= GTUNE_USE_EPOLL;
-#endif
-#if defined(USE_KQUEUE)
-	global.tune.options |= GTUNE_USE_KQUEUE;
-#endif
-#if defined(USE_EVPORTS)
-	global.tune.options |= GTUNE_USE_EVPORTS;
-#endif
-#if defined(USE_LINUX_SPLICE)
-	global.tune.options |= GTUNE_USE_SPLICE;
-#endif
-#if defined(USE_GETADDRINFO)
-	global.tune.options |= GTUNE_USE_GAI;
-#endif
-#ifdef USE_THREAD
-	global.tune.options |= GTUNE_IDLE_POOL_SHARED;
-#endif
-	global.tune.options |= GTUNE_STRICT_LIMITS;
-
-	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
-
-	/* Use zero-copy forwarding by default */
-	global.tune.no_zero_copy_fwd = 0;
-
-	/* keep a copy of original arguments for the master process */
-	old_argv = copy_argv(argc, argv);
-	if (!old_argv) {
-		ha_alert("failed to copy argv.\n");
-		exit(EXIT_FAILURE);
-	}
 
 	/* skip program name and start */
 	argc--; argv++;
@@ -1622,18 +1642,11 @@ static void init_args(int argc, char **argv)
 					argc--; argv++;
 				}
 
-				ret = trace_parse_cmd(arg, &err_msg);
-				if (ret <= -1) {
-					if (ret < -1) {
-						ha_alert("-dt: %s.\n", err_msg);
-						ha_free(&err_msg);
-						exit(EXIT_FAILURE);
-					}
-					else {
-						printf("%s\n", err_msg);
-						ha_free(&err_msg);
-						exit(0);
-					}
+				ret = trace_add_cmd(arg, &err_msg);
+				if (ret) {
+					ha_alert("-dt: %s.\n", err_msg);
+					ha_free(&err_msg);
+					exit(EXIT_FAILURE);
 				}
 			}
 #ifdef HA_USE_KTLS
@@ -1795,6 +1808,54 @@ static void init_args(int argc, char **argv)
 		argv++; argc--;
 	}
 	free(err_msg);
+}
+
+/* handles program arguments. Very minimal parsing is performed, variables are
+ * fed with some values, and lists are completed with other ones. In case of
+ * error, it will exit.
+ */
+static void init_args(int argc, char **argv)
+{
+	/* pre-fill in the global tuning options before we let the cmdline
+	 * change them.
+	 */
+	global.tune.options |= GTUNE_USE_SELECT;  /* select() is always available */
+#if defined(USE_POLL)
+	global.tune.options |= GTUNE_USE_POLL;
+#endif
+#if defined(USE_EPOLL)
+	global.tune.options |= GTUNE_USE_EPOLL;
+#endif
+#if defined(USE_KQUEUE)
+	global.tune.options |= GTUNE_USE_KQUEUE;
+#endif
+#if defined(USE_EVPORTS)
+	global.tune.options |= GTUNE_USE_EVPORTS;
+#endif
+#if defined(USE_LINUX_SPLICE)
+	global.tune.options |= GTUNE_USE_SPLICE;
+#endif
+#if defined(USE_GETADDRINFO)
+	global.tune.options |= GTUNE_USE_GAI;
+#endif
+#ifdef USE_THREAD
+	global.tune.options |= GTUNE_IDLE_POOL_SHARED;
+#endif
+	global.tune.options |= GTUNE_STRICT_LIMITS;
+
+	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
+
+	/* Use zero-copy forwarding by default */
+	global.tune.no_zero_copy_fwd = 0;
+
+	/* keep a copy of original arguments for the master process */
+	old_argv = copy_argv(argc, argv);
+	if (!old_argv) {
+		ha_alert("failed to copy argv.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	haproxy_init_args(argc, argv);
 }
 
 /* call the various keyword dump functions based on the comma-delimited list of
@@ -2105,7 +2166,7 @@ static void step_init_2(int argc, char** argv)
 
 	/* Free last defaults if it is unnamed and unreferenced. */
 	if (last_defproxy && last_defproxy->id[0] == '\0' &&
-	    !last_defproxy->conf.refcount) {
+	    !last_defproxy->conf.def_ref) {
 		defaults_px_destroy(last_defproxy);
 	}
 	last_defproxy = NULL; /* This variable is not used after parsing. */
@@ -2295,7 +2356,8 @@ static void step_init_2(int argc, char** argv)
 		deinit_and_exit(0);
 
 	/* now we know the buffer size, we can initialize the channels and buffers */
-	init_buffer();
+	if (!init_buffer())
+		exit(1); // error already reported
 
 	list_for_each_entry(pcf, &post_check_list, list) {
 		err_code |= pcf->fct();
@@ -2461,6 +2523,10 @@ static void step_init_2(int argc, char** argv)
 	chunk_appendf(&trash, "TARGET='%s'", pm_target_opts);
 
 	post_mortem_add_component("haproxy", haproxy_version, cc, cflags, opts, argv[0]);
+
+	if ((global.tune.options & (GTUNE_SET_DUMPABLE | GTUNE_COLLECT_LIBS)) ==
+	    (GTUNE_SET_DUMPABLE | GTUNE_COLLECT_LIBS))
+		collect_libs();
 }
 
 /* This is a third part of the late init sequence, where we register signals for
@@ -2752,20 +2818,16 @@ void deinit(void)
 	while (p) {
 		p0 = p;
 		p = p->next;
-		free_proxy(p0);
+		proxy_drop(p0);
 	}/* end while(p) */
 
 	/* we don't need to free sink_proxies_list nor cfg_log_forward proxies since
 	 * they are respectively cleaned up in sink_deinit() and deinit_log_forward()
 	 */
 
-	/* If named defaults were preserved, ensure refcount is resetted. */
+	/* If named defaults were preserved, ensure <def_ref> count is reset. */
 	if (!(global.tune.options & GTUNE_PURGE_DEFAULTS))
 		defaults_px_unref_all();
-	/* All proxies are removed now, so every defaults should also be freed
-	 * when their refcount reached zero.
-	 */
-	BUG_ON(!LIST_ISEMPTY(&defaults_list));
 
 	userlist_free(userlist);
 
@@ -2775,6 +2837,11 @@ void deinit(void)
 
 	list_for_each_entry(pdf, &post_deinit_list, list)
 		pdf->fct();
+
+	/* All proxies are removed now, so every defaults should also be freed
+	 * when their <def_ref> count reached zero.
+	 */
+	BUG_ON(!LIST_ISEMPTY(&defaults_list));
 
 	ha_free(&global.log_send_hostname);
 	chunk_destroy(&global.log_tag);
@@ -3321,8 +3388,16 @@ int main(int argc, char **argv)
 	if (backup_env() != 0)
 		exit(EXIT_FAILURE);
 
-	/* parse conf in discovery mode and set modes from config */
-	read_cfg_in_discovery_mode(argc, argv);
+	if (!fileless_mode)
+		/* parse conf in discovery mode and set modes from config */
+		read_cfg_in_discovery_mode(argc, argv);
+	else {
+		int ret;
+
+		ret = parse_cfg(&fileless_cfg);
+		if (ret != 0)
+			exit(EXIT_FAILURE);
+	}
 
 	/* From this stage all runtime modes are known. So let's do below some
 	 * preparation steps and then let's apply all discovered modes.
@@ -3364,8 +3439,10 @@ int main(int argc, char **argv)
 		mworker_apply_master_worker_mode();
 	}
 
-	/* Worker, daemon, foreground modes read the rest of the config */
-	if (!master) {
+	/* Worker, daemon, foreground, configuration with files modes read the rest
+	 * of the config.
+	 */
+	if (!master && !fileless_mode) {
 		usermsgs_clr("config");
 		if (global.mode & MODE_MWORKER) {
 			if (clean_env() != 0) {
@@ -3405,6 +3482,7 @@ int main(int argc, char **argv)
 		list_for_each_entry_safe(cfg, cfg_tmp, &cfg_cfgfiles, list)
 			ha_free(&cfg->content);
 
+		trace_parse_cmds();
 		usermsgs_clr(NULL);
 	}
 
@@ -3698,6 +3776,7 @@ int main(int argc, char **argv)
 		char *msg = NULL;
 		char c;
 		int r __maybe_unused;
+		struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
 
 		if (socketpair(PF_UNIX, SOCK_STREAM, 0, sock_pair) == -1) {
 			ha_alert("[%s.main()] Cannot create socketpair to update the new worker state\n",
@@ -3707,9 +3786,11 @@ int main(int argc, char **argv)
 		}
 
 		list_for_each_entry(proc, &proc_list, list) {
-			if (proc->pid == -1)
+			if (proc->pid == -1 && proc->options & PROC_O_TYPE_WORKER)
 				break;
 		}
+
+		BUG_ON(!(proc->options & PROC_O_TYPE_WORKER));
 
 		if (send_fd_uxst(proc->ipc_fd[1], sock_pair[0]) == -1) {
 			ha_alert("[%s.main()] Cannot transfer connection fd %d over the sockpair@%d\n",
@@ -3734,6 +3815,7 @@ int main(int argc, char **argv)
 		 * we make sure that the fd is received correctly.
 		 */
 		shutdown(sock_pair[1], SHUT_WR);
+		setsockopt(sock_pair[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 		r = read(sock_pair[1], &c, 1);
 		close(sock_pair[1]);
 		close(sock_pair[0]);
