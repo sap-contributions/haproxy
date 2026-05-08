@@ -3484,8 +3484,25 @@ int pcli_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	 * current one. Just wait. At this stage, errors should be handled by
 	 * the response analyzer.
 	 */
-	if (s->res.analysers & AN_RES_WAIT_CLI)
+	if (s->res.analysers & AN_RES_WAIT_CLI) {
+		/* Prevent process_stream from auto-forwarding the client close to
+		 * the backend via the CF_AUTO_CLOSE check while we're waiting for
+		 * a response - we manage the connection lifetime ourselves.
+		 */
+		channel_dont_close(req);
+
+		/* If the client disconnected cleanly and we have no more commands
+		 * to send, arm the server-fin timer on the backend.  A stuck
+		 * worker that never responds will then be aborted after
+		 * timeout server-fin, freeing the connection slot (GH #3351).
+		 * When lra is TICK_ETERNITY (no data received yet) the timer never
+		 * fires, so this is safe to call on every wakeup.
+		 */
+		if ((s->scf->flags & SC_FL_EOS) && !ci_data(req))
+			sc_set_hcto(s->scb);
+
 		return 0;
+	}
 
 	pcli->flags &= ~PCLI_F_BIDIR; // only for one connection
 	if ((pcli->flags & ACCESS_LVL_MASK) == ACCESS_LVL_NONE)
@@ -3528,13 +3545,7 @@ read_again:
 		else
 			channel_forward_forever(req);
 
-		if (!(pcli->flags & PCLI_F_PAYLOAD)) {
-			/* we send only 1 command per request, and we write
-			 * close after it when not in full-duplex mode.
-			 */
-			if (!(pcli->flags & PCLI_F_BIDIR))
-				sc_schedule_shutdown(s->scb);
-		} else {
+		if (pcli->flags & PCLI_F_PAYLOAD) {
 			pcli_write_prompt(s);
 		}
 
@@ -3595,6 +3606,13 @@ missing_data:
         if (s->scf->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) {
                 /* There is no more request or a only a partial one and we
                  * receive a close from the client, we can leave */
+		if (s->scf->flags & SC_FL_ABRT_DONE) {
+			/* Client sent RST: abort the backend immediately.
+			 * Note: when AN_RES_WAIT_CLI is set we never reach here
+			 * (early return above), so this handles the pre-connect case.
+			 */
+			sc_schedule_abort(s->scb);
+		}
 		sc_schedule_shutdown(s->scf);
                 s->req.analysers &= ~AN_REQ_WAIT_CLI;
                 return 1;
@@ -3834,8 +3852,13 @@ int mworker_cli_create_master_proxy(char **errmsg)
 	mworker_proxy->mode = PR_MODE_CLI;
 	/* default to 10 concurrent connections */
 	mworker_proxy->maxconn = 10;
-	/* no timeout */
-	mworker_proxy->timeout.client = 0;
+	mworker_proxy->timeout.client = 0; /* no timeout */
+	/* 1s server-fin timeout: armed only after the client disconnects cleanly
+	 * (scf EOS + no pending commands), so it never fires during normal command
+	 * processing.  It ensures a stuck backend releases its slot promptly once
+	 * the client is gone.
+	 */
+	mworker_proxy->timeout.serverfin = MS_TO_TICKS(1000);
 	mworker_proxy->conf.file = strdup("MASTER");
 	mworker_proxy->conf.line = 0;
 	mworker_proxy->accept = frontend_accept;
