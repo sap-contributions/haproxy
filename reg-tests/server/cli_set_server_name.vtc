@@ -35,6 +35,19 @@ haproxy h1 -conf {
     backend norename
         balance random
         server s1 ${s1_addr}:${s1_port}
+
+    backend useserver
+        option server-rename
+        balance random
+        server s1 ${s1_addr}:${s1_port}
+        server s2 ${s1_addr}:${s1_port}
+        use-server s1 if { always_true }
+
+    backend tracked
+        option server-rename
+        balance random
+        server s1 ${s1_addr}:${s1_port}
+        server s2 ${s1_addr}:${s1_port} track tracked/s1
 } -start
 
 haproxy h1 -cli {
@@ -63,6 +76,18 @@ haproxy h1 -cli {
     # duplicate name — s2 already exists
     send "set server test/s1 name s2"
     expect ~ "A server with the same name already exists"
+
+    # server targeted by a static use-server rule
+    send "disable server useserver/s1"
+    expect ~ ".*"
+    send "set server useserver/s1 name newname"
+    expect ~ "referenced by a 'use-server' rule"
+
+    # server tracked by another server
+    send "disable server tracked/s1"
+    expect ~ ".*"
+    send "set server tracked/s1 name newname"
+    expect ~ "tracked by another server"
 
     # renaming to the same name is a no-op (success)
     send "set server test/s1 name s1"

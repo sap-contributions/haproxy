@@ -5477,7 +5477,17 @@ const char *srv_update_fqdn(struct server *server, const char *fqdn, const char 
  *   - server must be administratively in maintenance
  *   - new name must not conflict with an existing server in the backend
  *   - new name must be syntactically valid (no spaces, '/', '#' prefix)
+ *   - server must not be targeted by a static 'use-server' rule
+ *   - server must not be tracked by another server ('track' directive)
  *   - backend must not have sticking rules referencing a peer-synced table
+ *
+ * Note: sample fetches that take a server argument by name (srv_queue(),
+ * srv_conn(), srv_is_up(), etc.) are also resolved to pointers at config-check
+ * time and therefore continue to work after a rename, but will leave the config
+ * text inconsistent with the running state. Detecting all such references would
+ * require walking every ACL/rule expression tree in the proxy and is not
+ * currently implemented. Operators should audit their ACL expressions manually
+ * before renaming a server.
  *
  * Returns NULL on success, or a pointer to a static/trash error message
  * string on failure. On success, a ha_notice() is emitted and the
@@ -5487,6 +5497,7 @@ static const char *srv_update_server_name(struct server *srv, const char *new_na
 {
 	struct proxy *be = srv->proxy;
 	struct sticking_rule *rule;
+	struct server_rule *srule;
 	char *old_name;
 	char *dup;
 	const char *p;
@@ -5516,6 +5527,20 @@ static const char *srv_update_server_name(struct server *srv, const char *new_na
 	/* server must be administratively down (in maintenance) */
 	if (!(srv->cur_admin & SRV_ADMF_MAINT))
 		return "Server must be in maintenance mode to be renamed (set server <b>/<s> state maint).\n";
+
+	/* reject if a static 'use-server' rule hard-codes this server's name:
+	 * dynamic rules use a logformat expression so srv.ptr is NULL there.
+	 */
+	list_for_each_entry(srule, &be->server_rules, list) {
+		if (!srule->dynamic && srule->srv.ptr == srv)
+			return "Cannot rename: server is referenced by a 'use-server' rule.\n";
+	}
+
+	/* reject if another server tracks this one via 'track': renaming would
+	 * make the running state inconsistent with the config text.
+	 */
+	if (srv->trackers)
+		return "Cannot rename: server is tracked by another server ('track' directive).\n";
 
 	/* reject if any sticking rule references a peer-synced table */
 	list_for_each_entry(rule, &be->sticking_rules, list) {
