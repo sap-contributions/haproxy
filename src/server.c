@@ -49,6 +49,8 @@
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
 #include <haproxy/event_hdl.h>
+#include <haproxy/peers-t.h>
+#include <haproxy/stick_table-t.h>
 
 
 static void srv_update_status(struct server *s, int type, int cause);
@@ -5042,6 +5044,136 @@ const char *srv_update_fqdn(struct server *server, const char *fqdn, const char 
 }
 
 
+/* Rename a server at runtime. This function handles all precondition checks,
+ * tree re-indexing under thread_isolate(), and event publication.
+ *
+ * The caller must NOT hold any lock — this function uses thread_isolate()
+ * internally for tree manipulation.
+ *
+ * Preconditions enforced:
+ *   - backend must have "option server-rename" set (or global "server-rename")
+ *   - server must be administratively in maintenance
+ *   - new name must not conflict with an existing server in the backend
+ *   - new name must be syntactically valid (no spaces, '/', '#' prefix)
+ *   - server must not be targeted by a static 'use-server' rule
+ *   - server must not be tracked by another server ('track' directive)
+ *   - backend must not have sticking rules referencing a peer-synced table
+ *
+ * Note: sample fetches with ARG_SRV arguments (srv_queue(), srv_conn(),
+ * srv_is_up(), etc.) are resolved to pointers at config-check time and
+ * therefore continue to work after a rename, but will leave the config
+ * text inconsistent with the running state. Operators should audit their
+ * ACL expressions manually before renaming a server.
+ *
+ * Returns NULL on success, or a pointer to a static/trash error message
+ * string on failure. On success, a ha_notice() is emitted and the
+ * EVENT_HDL_SUB_SERVER_NAME event is published.
+ */
+static const char *srv_update_server_name(struct server *srv, const char *new_name)
+{
+	struct proxy *be = srv->proxy;
+	struct sticking_rule *rule;
+	struct server_rule *srule;
+	char *old_name;
+	char *dup;
+	const char *p;
+
+	/* validate the new name is not empty */
+	if (!*new_name)
+		return "Require a new server name.\n";
+
+	/* reject names that are too long for the event data structure */
+	if (strlen(new_name) >= sizeof(((struct event_hdl_cb_data_server_name *)0)->safe.new_name))
+		return "Server name too long.\n";
+
+	/* reject names starting with '#' (numeric ID syntax in server_find) */
+	if (*new_name == '#')
+		return "Server name must not start with '#'.\n";
+
+	/* reject control characters, spaces, and '/' which break CLI parsing */
+	for (p = new_name; *p; p++) {
+		if ((unsigned char)*p <= ' ' || *p == '/')
+			return "Server name must not contain spaces, control characters, or '/'.\n";
+	}
+
+	/* per-backend or global opt-in required */
+	if (!(be->options2 & PR_O2_SRV_RENAME) && !(global.tune.options & GTUNE_SRV_RENAME))
+		return "Backend does not allow server renaming (add 'option server-rename' or global 'server-rename').\n";
+
+	/* server must be administratively down (in maintenance) */
+	if (!(srv->cur_admin & SRV_ADMF_MAINT))
+		return "Server must be in maintenance mode to be renamed (set server <b>/<s> state maint).\n";
+
+	/* reject if a static 'use-server' rule hard-codes this server's name */
+	list_for_each_entry(srule, &be->server_rules, list) {
+		if (!srule->dynamic && srule->srv.ptr == srv)
+			return "Cannot rename: server is referenced by a 'use-server' rule.\n";
+	}
+
+	/* reject if another server tracks this one via 'track' */
+	if (srv->trackers)
+		return "Cannot rename: server is tracked by another server ('track' directive).\n";
+
+	/* reject if any sticking rule references a peer-synced table */
+	list_for_each_entry(rule, &be->sticking_rules, list) {
+		if (rule->table.t && rule->table.t->peers.p)
+			return "Cannot rename: backend has sticking rules using a peer-synced table.\n";
+	}
+	list_for_each_entry(rule, &be->storersp_rules, list) {
+		if (rule->table.t && rule->table.t->peers.p)
+			return "Cannot rename: backend has store-response rules using a peer-synced table.\n";
+	}
+
+	/* same name is a no-op success */
+	if (strcmp(srv->id, new_name) == 0)
+		return NULL;
+
+	/* allocate new name before taking isolation */
+	dup = strdup(new_name);
+	if (!dup)
+		return "Out of memory allocating new server name.\n";
+
+	/* tree manipulation requires thread isolation (same pattern as
+	 * add/del server). This is rare enough that the cost is acceptable.
+	 */
+	thread_isolate();
+
+	/* re-check for name conflict under isolation */
+	if (server_find_by_name(be, new_name)) {
+		thread_release();
+		free(dup);
+		return "A server with the same name already exists in this backend.\n";
+	}
+
+	/* --- point of no return --- */
+
+	old_name = srv->id;
+
+	/* re-index in the name tree (ebtree API used by 3.0) */
+	ebpt_delete(&srv->conf.name);
+	srv->id = dup;
+	srv->conf.name.key = srv->id;
+	ebis_insert(&be->conf.used_server_name, &srv->conf.name);
+
+	/* publish rename event with both old and new names */
+	{
+		struct event_hdl_cb_data_server_name cb_data;
+
+		_srv_event_hdl_prepare(&cb_data.server, srv, 1);
+		snprintf(cb_data.safe.old_name, sizeof(cb_data.safe.old_name), "%s", old_name);
+		snprintf(cb_data.safe.new_name, sizeof(cb_data.safe.new_name), "%s", new_name);
+		_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_NAME, cb_data, srv);
+	}
+
+	thread_release();
+
+	ha_notice("Server %s/%s renamed from '%s'.\n", be->id, srv->id, old_name);
+	free(old_name);
+
+	return NULL;
+}
+
+
 /* Expects to find a backend and a server in <arg> under the form <backend>/<server>,
  * and returns the pointer to the server. Otherwise, display adequate error messages
  * on the CLI, sets the CLI's state to CLI_ST_PRINT and returns NULL. This is only
@@ -5291,11 +5423,26 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 #else
 		cli_msg(appctx, LOG_NOTICE, "server ssl setting not supported.\n");
 #endif
-	} else {
+	}
+	else if (strcmp(args[3], "name") == 0) {
+		if (!*args[4]) {
+			cli_err(appctx, "set server <b>/<s> name requires a new name.\n");
+			goto out;
+		}
+		/* srv_update_server_name() handles its own locking via
+		 * thread_isolate(), so do NOT hold the server lock here.
+		 */
+		warning = srv_update_server_name(sv, args[4]);
+		if (warning)
+			cli_err(appctx, warning);
+		else
+			cli_msg(appctx, LOG_NOTICE, "Server name updated.\n");
+	}
+	else {
 		cli_err(appctx,
 			"usage: set server <backend>/<server> "
 			"addr | agent | agent-addr | agent-port | agent-send | "
-			"check-addr | check-port | fqdn | health | ssl | "
+			"check-addr | check-port | fqdn | health | name | ssl | "
 			"state | weight\n");
 	}
  out:
@@ -6156,7 +6303,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "enable", "health",  NULL },         "enable health                           : enable health checks",                                        cli_parse_enable_health, NULL },
 	{ { "enable", "server",  NULL },         "enable server  (DEPRECATED)             : enable a disabled server (use 'set server' instead)",         cli_parse_enable_server, NULL },
 	{ { "set", "maxconn", "server",  NULL }, "set maxconn server <bk>/<srv>           : change a server's maxconn setting",                           cli_parse_set_maxconn_server, NULL },
-	{ { "set", "server", NULL },             "set server <bk>/<srv> [opts]            : change a server's state, weight, address or ssl",             cli_parse_set_server },
+	{ { "set", "server", NULL },             "set server <bk>/<srv> [opts]            : change a server's state, weight, address, name or ssl",      cli_parse_set_server },
 	{ { "get", "weight", NULL },             "get weight <bk>/<srv>                   : report a server's current weight",                            cli_parse_get_weight },
 	{ { "set", "weight", NULL },             "set weight <bk>/<srv>  (DEPRECATED)     : change a server's weight (use 'set server' instead)",         cli_parse_set_weight },
 	{ { "add", "server", NULL },             "add server <bk>/<srv>                   : create a new server",                                         cli_parse_add_server, NULL },

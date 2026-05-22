@@ -33,7 +33,7 @@ int cluster_secret_isset;
 static const char *common_kw_list[] = {
 	"global", "daemon", "master-worker", "noepoll", "nokqueue",
 	"noevports", "nopoll", "busy-polling", "set-dumpable",
-	"insecure-fork-wanted", "insecure-setuid-wanted", "nosplice",
+	"insecure-fork-wanted", "insecure-setuid-wanted", "nosplice", "server-rename",
 	"nogetaddrinfo", "noreuseport", "quiet", "zero-warning",
 	"tune.runqueue-depth", "tune.maxpollevents", "tune.maxaccept",
 	"tune.recv_enough", "tune.bufsize", "tune.maxrewrite",
@@ -171,6 +171,14 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			global.tune.options &= ~GTUNE_INSECURE_SETUID;
 		else
 			global.tune.options |=  GTUNE_INSECURE_SETUID;
+	}
+	else if (strcmp(args[0], "server-rename") == 0) { /* "no server-rename" or "server-rename" */
+		if (alertif_too_many_args(0, file, linenum, args, &err_code))
+			goto out;
+		if (kwm == KWM_NO)
+			global.tune.options &= ~GTUNE_SRV_RENAME;
+		else
+			global.tune.options |=  GTUNE_SRV_RENAME;
 	}
 	else if (strcmp(args[0], "nosplice") == 0) {
 		if (alertif_too_many_args(0, file, linenum, args, &err_code))
