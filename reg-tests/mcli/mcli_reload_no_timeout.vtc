@@ -1,0 +1,65 @@
+varnishtest "Verify reload via master CLI is not affected by serverfin timeout"
+
+# Regression test: the timeout server-fin on the MASTER proxy must not
+# apply to locally-handled commands (applets).  A reload command is
+# forwarded to the master applet and may take longer than 1s while the
+# new worker is starting.  Without the fix, the pcli response analyser
+# would fire a read timeout and return "Can't connect to the target CLI!"
+# instead of the reload status.
+
+#REQUIRE_OPTIONS=LUA
+#REGTEST_TYPE=bug
+
+feature cmd "command -v socat"
+feature cmd "$HAPROXY_PROGRAM -vv | grep -q '+LUA'"
+feature ignore_unknown_macro
+
+server s1 {
+    rxreq
+    txresp
+} -start
+
+haproxy h1 -W -S -conf {
+    global
+        tune.lua.bool-sample-conversion normal
+        # Lua init hook that sleeps 2s, delaying worker readiness on reload
+        lua-load ${testdir}/mcli_reload_no_timeout.lua
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend be
+
+    backend be
+        server s1 ${s1_addr}:${s1_port}
+} -start
+
+# Issue a reload via socat as a second command (after "show version").
+# The first command causes CF_AUTO_CLOSE to be set on the request channel.
+# When socat half-closes its write side after sending, process_stream()
+# triggers sc_shutdown(scb) -> sc_set_hcto() which applies serverfin=1s
+# to the backend applet.  Without the fix, the reload response (which comes
+# from the master applet) would be killed by this 1s timeout if the new
+# worker takes time to start, returning "Can't connect to the target CLI!".
+shell {
+    RESULT=$(printf "show version\nreload\n" | socat -t10 TCP:${h1_mcli_addr}:${h1_mcli_port} - 2>/dev/null)
+    echo "Got: $RESULT"
+    echo "$RESULT" | grep -q "Success=1" || {
+        echo "FAIL: reload did not succeed. Got: $RESULT"
+        exit 1
+    }
+}
+
+# Verify the master CLI is still functional after reload
+shell {
+    RESULT=$(printf "show version\n" | socat -t5 TCP:${h1_mcli_addr}:${h1_mcli_port} - 2>/dev/null)
+    echo "$RESULT" | grep -q "3\." || {
+        echo "FAIL: show version failed. Got: $RESULT"
+        exit 1
+    }
+}
