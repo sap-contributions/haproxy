@@ -80,6 +80,7 @@
 #define GTUNE_DISABLE_ACTIVE_CLOSE (1<<22)
 #define GTUNE_QUICK_EXIT         (1<<23)
 #define GTUNE_COLLECT_LIBS       (1<<24)
+#define GTUNE_SRV_RENAME         (1<<25)
 /* (1<<25) unused */
 #define GTUNE_USE_FAST_FWD       (1<<26)
 #define GTUNE_LISTENER_MQ_FAIR   (1<<27)

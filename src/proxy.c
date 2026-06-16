@@ -158,6 +158,7 @@ const struct cfg_opt cfg_opts3[] =
 {
 	{"assume-rfc6587-ntf",            PR_O3_ASSUME_RFC6587_NTF, PR_CAP_FE, 0, PR_MODE_SYSLOG },
 	{"dont-parse-log",                PR_O3_DONTPARSELOG, PR_CAP_FE, 0, PR_MODE_SYSLOG },
+	{"server-rename",                 PR_O3_SRV_RENAME, PR_CAP_BE, 0, 0 },
 	{ NULL, 0, 0, 0 }
 };
 
