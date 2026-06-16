@@ -1817,6 +1817,7 @@ The following keywords are supported in the "global" section :
    - presetenv
    - prealloc-fd
    - resetenv
+   - server-rename
    - set-dumpable
    - set-var
    - setenv
@@ -3208,6 +3209,14 @@ server-state-file <file>
   for each server found in the file and available in its current running
   configuration. See also "server-state-base" and "show servers state",
   "load-server-state-from-file" and "server-state-file-name"
+
+server-rename
+  Enable runtime renaming of servers via the CLI for all backends globally.
+  When set, it allows the name of any server to be changed at runtime using
+  the CLI command "set server <backend>/<server> name <newname>" without
+  requiring "option server-rename" in each backend individually. This option
+  supports the "no" prefix to disable it. See also: 'option server-rename'
+  for per-backend control.
 
 set-dumpable [ on | off | libs ]
   This option helps choose the core dump behavior in case of process crash.
@@ -6187,6 +6196,7 @@ option pgsql-check                        X          -         X         X
 option prefer-last-server            (*)  X          -         X         X
 option redispatch                    (*)  X          -         X         X
 option redis-check                        X          -         X         X
+option server-rename                      -          -         X         X
 option smtpchk                            X          -         X         X
 option socket-stats                  (*)  X          X         X         -
 option splice-auto                   (*)  X          X         X         X
@@ -6274,6 +6284,36 @@ use-server                                -          -         X         X
 
 
 4.2. Alphabetically sorted keywords reference
+
+option server-rename
+  Enable runtime renaming of servers via the CLI.
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 no    |    no    |   no   |   yes
+
+  When this option is enabled in a backend, it allows the name of any server in that backend to be changed at runtime using the CLI command:
+      set server <backend>/<server> name <newname>
+
+  Restrictions:
+    - The new name must be unique among all servers in the backend.
+    - The change is effective immediately for all runtime operations, stats, and logs.
+    - The new name is not persisted to the configuration file and will be lost on reload.
+    - Renaming is only available if 'option server-rename' is set in the backend
+      or 'server-rename' is set in the global section.
+    - Some features that rely on static server names (such as certain stick-tables or external monitoring) may not recognize the new name until restart.
+
+  Example:
+      backend myapp
+        option server-rename
+        server s1 10.0.0.1:80
+        server s2 10.0.0.2:80
+
+  To rename server 's1' to 'blue':
+      echo "set server myapp/s1 name blue" | socat /var/run/haproxy.sock -
+
+  See also: 'server-rename' in the global section, 'set server <b>/<s> name' in the management guide (doc/management.txt).
 ---------------------------------------------
 
 This section provides a description of each keyword and its usage.
