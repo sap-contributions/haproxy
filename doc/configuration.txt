@@ -6187,6 +6187,7 @@ option pgsql-check                        X          -         X         X
 option prefer-last-server            (*)  X          -         X         X
 option redispatch                    (*)  X          -         X         X
 option redis-check                        X          -         X         X
+option server-rename                      -          -         X         X
 option smtpchk                            X          -         X         X
 option socket-stats                  (*)  X          X         X         -
 option splice-auto                   (*)  X          X         X         X
@@ -11564,6 +11565,37 @@ option redis-check
         option redis-check
 
   See also : "option httpchk", "option tcp-check", "tcp-check expect"
+
+
+option server-rename
+  Enable runtime renaming of servers via the CLI.
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 no    |    no    |   no   |   yes
+
+  When this option is enabled in a backend, it allows the name of any server in that backend to be changed at runtime using the CLI command:
+      set server <backend>/<server> name <newname>
+
+  Restrictions:
+    - The new name must be unique among all servers in the backend.
+    - The change is effective immediately for all runtime operations, stats, and logs.
+    - The new name is not persisted to the configuration file and will be lost on reload.
+    - Renaming is only available if 'option server-rename' is set in the backend
+      or in a defaults section.
+    - Some features that rely on static server names (such as certain stick-tables or external monitoring) may not recognize the new name until restart.
+
+  Example:
+      backend myapp
+        option server-rename
+        server s1 10.0.0.1:80
+        server s2 10.0.0.2:80
+
+  To rename server 's1' to 'blue':
+      echo "set server myapp/s1 name blue" | socat /var/run/haproxy.sock -
+
+  See also: 'set server <b>/<s> name' in the management guide (doc/management.txt).
 
 
 option smtpchk

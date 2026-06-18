@@ -71,7 +71,7 @@ haproxy h1 -cli {
 
     # name containing '/' is rejected
     send "set server test/s1 name bad/name"
-    expect ~ "Server name must not contain spaces, control characters, or '/'."
+    expect ~ "Server name contains invalid characters."
 
     # duplicate name — s2 already exists
     send "set server test/s1 name s2"
