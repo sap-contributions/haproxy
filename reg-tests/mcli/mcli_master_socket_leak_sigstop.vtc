@@ -1,0 +1,106 @@
+varnishtest "Master CLI slot leak: frozen worker (SIGSTOP) — fix verified"
+
+# Companion to mcli_master_socket_leak.vtc.  That test uses
+# "debug dev delay" to block the worker INSIDE its CLI handler.  This
+# test goes further: it freezes the worker process at the OS level via
+# SIGSTOP BEFORE any byte flows back through the master->worker
+# sockpair.  This was raised as a possible gap in the fix, on the
+# theory that the backend stconn's `lra` (last-read-activity) field
+# might still be TICK_ETERNITY when the client disconnects, in which
+# case tick_add(lra, ioto) == TICK_ETERNITY and timeout server-fin
+# never fires, so the slot would still leak.
+#
+# Empirical result (run locally against fix f218e2252 on top of
+# 3.4-dev9): slots are freed within ~2s of client disconnect even with
+# the worker SIGSTOPped before any traffic.  The 11th connection
+# attempt while the worker was still frozen succeeded in ~0.5s.
+#
+# Likely explanation: `lra` is updated when the backend stconn enters
+# the EST state during sockpair setup, which happens at the kernel
+# level immediately (sockpairs are pre-connected) — independently of
+# the worker actually reading any byte.  SIGSTOP'ing the worker does
+# not unwind that master-side state, so by the time sc_set_hcto()
+# arms timeout server-fin on client disconnect, lra is already finite
+# and tick_add() yields a real expiry ~1s in the future.
+#
+# This test is kept as a local diagnostic.  It is NOT recommended for
+# upstream submission: the existing master_socket_leak test explicitly
+# avoids SIGSTOP/SIGCONT for CI reliability reasons.
+
+#REGTEST_TYPE=bug
+
+feature cmd "command -v socat"
+feature cmd "command -v timeout"
+feature cmd "command -v awk"
+feature ignore_unknown_macro
+
+server s1 {
+} -start
+
+haproxy h1 -W -S -conf {
+    global
+        nbthread 1
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend be
+
+    backend be
+        server s1 ${s1_addr}:${s1_port}
+} -start
+
+# Discover the worker PID via the master CLI, freeze it with SIGSTOP
+# BEFORE any client traffic, fill all 10 slots with clients that get
+# killed after 2s, then verify the master CLI is still reachable while
+# the worker is still frozen.  The trap ensures we never leave a
+# stopped worker behind.
+shell {
+    set -e
+    WORKER_PID=$(printf "show proc\n" \
+        | socat -t2 TCP:${h1_mcli_addr}:${h1_mcli_port} - 2>/dev/null \
+        | awk '$1 ~ /^[0-9]+$/ && $0 ~ /worker/ { print $1; exit }')
+    test -n "$WORKER_PID" || { echo "FAIL: could not find worker pid"; exit 1; }
+    echo "worker pid: $WORKER_PID"
+
+    trap 'kill -CONT '"$WORKER_PID"' 2>/dev/null || true' EXIT INT TERM
+
+    kill -STOP "$WORKER_PID"
+
+    SOCAT_PIDS=""
+    for i in $(seq 1 10); do
+        (printf "@1 show info\n" \
+         | timeout --kill-after=1 2 socat TCP:${h1_mcli_addr}:${h1_mcli_port} - \
+           2>/dev/null) &
+        SOCAT_PIDS="$SOCAT_PIDS $!"
+    done
+    for pid in $SOCAT_PIDS; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    # The key assertion: 11th connection MUST succeed while worker is
+    # still SIGSTOPped.  If the lra==TICK_ETERNITY concern were real,
+    # this would hang or fail.
+    RESULT=$(printf "show version\n" \
+        | timeout --kill-after=1 5 socat -t4 TCP:${h1_mcli_addr}:${h1_mcli_port} - \
+          2>&1)
+    echo "11th connection result: $RESULT"
+    echo "$RESULT" | grep -qE '[0-9]+\.[0-9]+' || {
+        echo "FAIL: master CLI unreachable while worker still SIGSTOPped"
+        exit 1
+    }
+
+    kill -CONT "$WORKER_PID"
+    trap - EXIT INT TERM
+}
+
+# Sanity check: master CLI works after worker resumed.
+haproxy h1 -mcli {
+    send "show version"
+    expect ~ "."
+}
