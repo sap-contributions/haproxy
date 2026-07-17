@@ -1652,45 +1652,26 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 
 	for (px = proxies_list; px; px = px->next) {
 		if (clrall) {
-			memset(&px->be_counters, 0, sizeof(px->be_counters));
-			memset(&px->fe_counters, 0, sizeof(px->fe_counters));
+			counters_be_reset(&px->be_counters);
+			counters_fe_reset(&px->fe_counters);
 		}
 		else {
-			px->be_counters.conn_max = 0;
-			px->be_counters.p.http.rps_max = 0;
-			px->be_counters.sps_max = 0;
-			px->be_counters.cps_max = 0;
-			px->be_counters.nbpend_max = 0;
-			px->be_counters.qtime_max = 0;
-			px->be_counters.ctime_max = 0;
-			px->be_counters.dtime_max = 0;
-			px->be_counters.ttime_max = 0;
-
-			px->fe_counters.conn_max = 0;
-			px->fe_counters.p.http.rps_max = 0;
-			px->fe_counters.sps_max = 0;
-			px->fe_counters.cps_max = 0;
+			counters_be_reset_max(&px->be_counters);
+			counters_fe_reset_max(&px->fe_counters);
 		}
 
 		for (sv = px->srv; sv; sv = sv->next)
 			if (clrall)
-				memset(&sv->counters, 0, sizeof(sv->counters));
-			else {
-				sv->counters.cur_sess_max = 0;
-				sv->counters.nbpend_max = 0;
-				sv->counters.sps_max = 0;
-				sv->counters.qtime_max = 0;
-				sv->counters.ctime_max = 0;
-				sv->counters.dtime_max = 0;
-				sv->counters.ttime_max = 0;
-			}
+				counters_be_reset(&sv->counters);
+			else
+				counters_be_reset_max(&sv->counters);
 
 		list_for_each_entry(li, &px->conf.listeners, by_fe)
 			if (li->counters) {
 				if (clrall)
-					memset(li->counters, 0, sizeof(*li->counters));
+					counters_fe_reset(li->counters);
 				else
-					li->counters->conn_max = 0;
+					counters_fe_reset_max(li->counters);
 			}
 	}
 
@@ -1733,5 +1714,34 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 				}
 			}
 		}
+	}
+}
+
+/* Reset the module-registered extra counters of a single server <sv>, as done
+ * by "clear counters" for every server. Only modules flagged clearable are
+ * reset, matching the OPER-level "clear counters" semantics (the ADMIN-only
+ * "clear counters all" resets non-clearable modules too, but there is no
+ * per-server equivalent of "all"). The native counters are handled separately
+ * by the caller via counters_be_reset().
+ */
+void srv_stats_clear_extra_counters(struct server *sv)
+{
+	struct list *stat_modules = &stats_module_list[STATS_DOMAIN_PROXY];
+	struct stats_module *mod;
+
+	list_for_each_entry(mod, stat_modules, list) {
+		enum stats_domain_px_cap mod_cap = stats_px_get_cap(mod->domain_flags);
+
+		if (!mod->clearable)
+			continue;
+		if (!(mod_cap & STATS_PX_CAP_SRV))
+			continue;
+		if (!sv->extra_counters)
+			continue;
+
+		EXTRA_COUNTERS_INIT(sv->extra_counters,
+		                    mod,
+		                    mod->counters,
+		                    mod->counters_size);
 	}
 }
