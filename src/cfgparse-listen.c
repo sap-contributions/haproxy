@@ -1569,17 +1569,25 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	else if (strcmp(args[0], "use-server") == 0) {
 		struct server_rule *rule;
 
-		if (curproxy->cap & PR_CAP_DEF) {
-			ha_alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
 		if (*(args[1]) == 0) {
 			ha_alert("parsing [%s:%d] : '%s' expects a server name.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		/* Conservative pre-filter for a common mistake: a static server name
+		 * cannot be resolved in a defaults section (no servers there), so only
+		 * log-format expressions are allowed. This fails early with a clear
+		 * error; the authoritative dynamic/static classification happens later
+		 * in proxy_resolve_server_rules().
+		 */
+		if ((curproxy->cap & PR_CAP_DEF) && !strchr(args[1], '%')) {
+			ha_alert("parsing [%s:%d] : '%s' in a 'defaults' section requires a dynamic "
+			         "log-format expression (e.g. %%[var(...)]), not a static server name.\n",
+			         file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}

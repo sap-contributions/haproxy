@@ -1335,35 +1335,47 @@ static int process_server_rules(struct stream *s, struct channel *req, int an_bi
 	DBG_TRACE_ENTER(STRM_EV_STRM_ANA, s);
 
 	if (!(s->flags & SF_ASSIGNED)) {
-		list_for_each_entry(rule, &px->server_rules, list) {
-			struct server *srv;
+		struct list *rules;
+		int pass;
 
-			if (!acl_match_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
-				continue;
-
-			if (rule->dynamic) {
-				struct buffer *tmp = get_trash_chunk();
-
-				if (!build_logline(s, tmp->area, tmp->size, &rule->expr))
-					break;
-
-				srv = server_find_by_name(s->be, tmp->area);
-				if (!srv)
-					break;
-			}
+		for (pass = 0; pass < 2 && !(s->flags & SF_ASSIGNED); pass++) {
+			if (pass == 0)
+				rules = &px->server_rules;
+			else if (px->defpx && !LIST_ISEMPTY(&px->defpx->server_rules))
+				rules = &px->defpx->server_rules;
 			else
-				srv = rule->srv.ptr;
-
-			if ((srv->cur_state != SRV_ST_STOPPED) ||
-			    (px->options & PR_O_PERSIST) ||
-			    (s->flags & SF_FORCE_PRST)) {
-				s->flags |= SF_DIRECT | SF_ASSIGNED;
-				stream_set_srv_target(s, srv);
 				break;
+
+			list_for_each_entry(rule, rules, list) {
+				struct server *srv;
+
+				if (!acl_match_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+					continue;
+
+				if (rule->dynamic) {
+					struct buffer *tmp = get_trash_chunk();
+
+					if (!build_logline(s, tmp->area, tmp->size, &rule->expr))
+						break;
+
+					srv = server_find_by_name(s->be, tmp->area);
+					if (!srv)
+						break;
+				}
+				else
+					srv = rule->srv.ptr;
+
+				if ((srv->cur_state != SRV_ST_STOPPED) ||
+				    (px->options & PR_O_PERSIST) ||
+				    (s->flags & SF_FORCE_PRST)) {
+					s->flags |= SF_DIRECT | SF_ASSIGNED;
+					stream_set_srv_target(s, srv);
+					break;
+				}
+				/* if the server is not UP, let's go on with next rules
+				 * just in case another one is suited.
+				 */
 			}
-			/* if the server is not UP, let's go on with next rules
-			 * just in case another one is suited.
-			 */
 		}
 	}
 
