@@ -6300,7 +6300,7 @@ unique-id-format                          X          X         X         X
 unique-id-header                          X          X         X         -
 use_backend                               -          X         X         -
 use-fcgi-app                              -          -         X         X
-use-server                                -          -         X         X
+use-server                                X          -         X         X
 ------------------------------------+----------+----------+---------+---------
  keyword                              defaults   frontend   listen    backend
 
@@ -15399,7 +15399,7 @@ use-server <server> unless <condition>
   May be used in the following contexts: tcp, http
 
   May be used in sections :   defaults | frontend | listen | backend
-                                  no   |    no    |   yes  |   yes
+                                 yes   |    no    |   yes  |   yes
 
   Arguments :
     <server>    is the name of a valid server in the same backend section
@@ -15456,6 +15456,13 @@ use-server <server> unless <condition>
   configuration, and if we can't resolve a valid server name at runtime but the
   use-server rule was conditioned by an ACL returning true, no other use-server
   rule is applied and we fall back to load balancing.
+
+  In a "defaults" section, only the Custom log format form is allowed, since a
+  defaults section has no servers against which a simple name could be resolved.
+  A simple server name is therefore rejected at parse time. Backends inheriting
+  from such a defaults section evaluate their own "use-server" rules first, then
+  the ones from the defaults section, which lets a set of dynamic rules be shared
+  across several backends.
 
   See also: "use_backend", section 5 about server and section 7 about ACLs.
 
