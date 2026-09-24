@@ -2389,6 +2389,17 @@ int check_config_validity()
 		cfgerr += check_action_rules(&defpx->quic_init_rules, defpx, &err_code);
 #endif
 
+		/* Resolve log-format expressions in use-server rules so that
+		 * dynamic rules (e.g. %[var(...)]) get srule->dynamic=1 set.
+		 * This normally happens in proxy_finalize(), which skips defaults.
+		 * It must run before smp_resolve_args() below so that the
+		 * sample-fetch arguments registered while parsing the log-format
+		 * expressions get resolved too, exactly like proxy_finalize() does
+		 * for regular proxies.
+		 */
+		if (!LIST_ISEMPTY(&defpx->server_rules))
+			cfgerr += proxy_resolve_server_rules(defpx, &err_code);
+
 		err = NULL;
 		i = smp_resolve_args(defpx, &err);
 		cfgerr += i;
