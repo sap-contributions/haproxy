@@ -2402,6 +2402,13 @@ int check_config_validity()
 		}
 
 		err_code |= proxy_check_http_errors(defpx);
+
+		/* Resolve log-format expressions in use-server rules so that
+		 * dynamic rules (e.g. %[var(...)]) get srule->dynamic=1 set.
+		 * This normally happens in proxy_finalize(), which skips defaults.
+		 */
+		if (!LIST_ISEMPTY(&defpx->server_rules))
+			cfgerr += proxy_resolve_server_rules(defpx, &err_code);
 	}
 
 	/* starting to initialize the main proxies list */
