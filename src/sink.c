@@ -623,6 +623,7 @@ static void sink_forward_session_release(struct appctx *appctx)
 	__sink_forward_session_deinit(sft);
 	sft->last_close = now_ms;
 	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
+	sft->last_close = now_ms;
 }
 
 static struct applet sink_forward_applet = {
