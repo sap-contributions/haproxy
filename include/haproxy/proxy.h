@@ -102,6 +102,7 @@ void free_stick_rules(struct list *rules);
 void free_server_rules(struct list *srules);
 int proxy_init_per_thr(struct proxy *px);
 int proxy_finalize(struct proxy *px, int *err_code);
+int proxy_resolve_server_rules(struct proxy *px, int *err_code);
 
 int be_check_for_deletion(const char *bename, struct proxy **pb, const char **pm);
 

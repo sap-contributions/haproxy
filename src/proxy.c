@@ -1687,6 +1687,87 @@ int proxy_init_per_thr(struct proxy *px)
 	return 0;
 }
 
+/* Parse the server name of use-server rule <srule> as a log-format expression.
+ * If it resolves to a single static string, the expression is freed and
+ * srule->dynamic is left at 0 (the caller resolves srule->srv.name to a
+ * server); otherwise srule->dynamic is set to 1 and srule->srv.name is freed.
+ * Returns one of the SRV_RULE_RESOLVE_* values below.
+ */
+enum {
+	SRV_RULE_RESOLVE_ERR    = -1, /* parse error, an alert was emitted */
+	SRV_RULE_RESOLVE_STATIC =  0, /* static server name, srule->srv.name kept */
+	SRV_RULE_RESOLVE_DYN    =  1, /* dynamic log-format expr, srule->srv.name freed */
+};
+
+static int resolve_server_rule_expr(struct proxy *px, struct server_rule *srule)
+{
+	char *server_name = srule->srv.name;
+	char *err = NULL;
+
+	lf_expr_init(&srule->expr);
+	px->conf.args.ctx = ARGC_USRV;
+	px->conf.args.file = srule->file;
+	px->conf.args.line = srule->line;
+	if (!parse_logformat_string(server_name, px, &srule->expr, 0, SMP_VAL_FE_HRQ_HDR, &err)) {
+		ha_alert("Parsing [%s:%d]; use-server rule failed to parse log-format '%s' : %s.\n",
+		         srule->file, srule->line, server_name, err);
+		free(err);
+		return SRV_RULE_RESOLVE_ERR;
+	}
+
+	if (!lf_expr_isempty(&srule->expr)) {
+		struct logformat_node *node;
+
+		node = LIST_NEXT(&srule->expr.nodes.list, struct logformat_node *, list);
+		if (node->type != LOG_FMT_TEXT || node->list.n != &srule->expr.nodes.list) {
+			srule->dynamic = 1;
+			free(server_name);
+			return SRV_RULE_RESOLVE_DYN;
+		}
+		/* Only one element in the list, a simple string: free the expression and
+		 * fall back to static rule
+		 */
+		lf_expr_deinit(&srule->expr);
+	}
+
+	srule->dynamic = 0;
+	return SRV_RULE_RESOLVE_STATIC;
+}
+
+/* Resolve log-format expressions in use-server rules of <px>. This is called
+ * for defaults proxies, which are skipped by proxy_finalize(). A dynamic
+ * log-format rule (e.g. %[var(...)]) sets srule->dynamic=1 and populates
+ * srule->expr so process_server_rules() can evaluate it at request time.
+ * Returns the number of errors.
+ */
+int proxy_resolve_server_rules(struct proxy *px, int *err_code)
+{
+	struct server_rule *srule;
+	int cfgerr = 0;
+
+	list_for_each_entry(srule, &px->server_rules, list) {
+		int ret = resolve_server_rule_expr(px, srule);
+
+		if (ret == SRV_RULE_RESOLVE_ERR)
+			cfgerr++;
+		if (ret != SRV_RULE_RESOLVE_STATIC)
+			continue;
+
+		/* A static server name in a defaults section cannot be resolved:
+		 * defaults sections have no servers. Only dynamic log-format
+		 * expressions (e.g. %[var(...)]) are allowed here.
+		 */
+		ha_alert("Parsing [%s:%d]: use-server rule in a 'defaults' section requires a dynamic "
+		         "log-format expression (e.g. %%[var(...)]), not a static server name '%s'.\n",
+		         srule->file, srule->line, srule->srv.name);
+		cfgerr++;
+	}
+
+	if (cfgerr)
+		*err_code |= ERR_ALERT | ERR_FATAL;
+	return cfgerr;
+}
+
 int proxy_finalize(struct proxy *px, int *err_code)
 {
 	struct list tmp_list = LIST_HEAD_INIT(tmp_list);
@@ -2122,40 +2203,16 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	/* find the target server for 'use_server' rules */
 	list_for_each_entry(srule, &px->server_rules, list) {
 		struct server *target;
-		struct logformat_node *node;
-		char *server_name;
+		int ret;
 
-		/* We try to parse the string as a log format expression. If the result of the parsing
-		 * is only one entry containing a single string, then it's a standard string corresponding
-		 * to a static rule, thus the parsing is cancelled and we fall back to setting srv.ptr.
-		 */
-		server_name = srule->srv.name;
-		lf_expr_init(&srule->expr);
-		px->conf.args.ctx = ARGC_USRV;
-		err = NULL;
-		if (!parse_logformat_string(server_name, px, &srule->expr, 0, SMP_VAL_FE_HRQ_HDR, &err)) {
-			ha_alert("Parsing [%s:%d]; use-server rule failed to parse log-format '%s' : %s.\n",
-			         srule->file, srule->line, server_name, err);
-			free(err);
+		ret = resolve_server_rule_expr(px, srule);
+		if (ret == SRV_RULE_RESOLVE_ERR) {
 			cfgerr++;
 			continue;
 		}
-		node = LIST_NEXT(&srule->expr.nodes.list, struct logformat_node *, list);
+		if (ret == SRV_RULE_RESOLVE_DYN) /* resolved at request time */
+			continue;
 
-		if (!lf_expr_isempty(&srule->expr)) {
-			if (node->type != LOG_FMT_TEXT || node->list.n != &srule->expr.nodes.list) {
-				srule->dynamic = 1;
-				free(server_name);
-				continue;
-			}
-			/* Only one element in the list, a simple string: free the expression and
-			 * fall back to static rule
-			 */
-			lf_expr_deinit(&srule->expr);
-		}
-
-		srule->dynamic = 0;
-		srule->srv.name = server_name;
 		target = server_find_by_name(px, srule->srv.name);
 		*err_code |= warnif_tcp_http_cond(px, srule->cond);
 
@@ -2820,6 +2877,10 @@ int proxy_finalize(struct proxy *px, int *err_code)
 		    (px->defpx && !LIST_ISEMPTY(&px->defpx->tcp_req.inspect_rules)))
 			px->be_req_ana |= AN_REQ_INSPECT_BE;
 
+		if (!LIST_ISEMPTY(&px->server_rules) ||
+		    (px->defpx && !LIST_ISEMPTY(&px->defpx->server_rules)))
+			px->be_req_ana |= AN_REQ_SRV_RULES;
+
 		if (!LIST_ISEMPTY(&px->tcp_rep.inspect_rules) ||
 		    (px->defpx && !LIST_ISEMPTY(&px->defpx->tcp_rep.inspect_rules)))
                         px->be_rsp_ana |= AN_RES_INSPECT;
@@ -2936,6 +2997,7 @@ static void defaults_px_free(struct proxy *defproxy)
 	proxy_free_common(defproxy);
 
 	/* default proxy specific cleanup */
+	free_server_rules(&defproxy->server_rules);
 	if (defproxy->defsrv)
 		srv_free_params(defproxy->defsrv);
 	ha_free(&defproxy->defbe.name);
@@ -3146,6 +3208,13 @@ int proxy_ref_defaults(struct proxy *px, struct proxy *defpx, char **errmsg)
 		defpx->cap = (defpx->cap & ~PR_CAP_LISTEN) | (px->cap & PR_CAP_LISTEN);
 		defaults_px_ref(defpx, px);
 	}
+
+	/* server_rules (use-server) in a defaults section: backends that inherit
+	 * from it need a live reference to defpx so process_server_rules() can
+	 * walk defpx->server_rules at request time.
+	 */
+	if (!LIST_ISEMPTY(&defpx->server_rules) && (px->cap & PR_CAP_BE))
+		defaults_px_ref(defpx, px);
 
 	if (defpx->tcpcheck.rs && (defpx->tcpcheck.rs->flags & TCPCHK_RULES_PROTO_CHK) &&
 	    (px->cap & PR_CAP_LISTEN) == PR_CAP_BE) {

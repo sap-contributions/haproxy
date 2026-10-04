@@ -1,0 +1,90 @@
+varnishtest "use-server rules with a dynamic log-format expression in a defaults section"
+
+# A dynamic "use-server" rule (log-format expression) declared in a "defaults"
+# section must be inherited by backends and evaluated at request time. Here the
+# rule selects the target server from the "x-srv" request header, so we can
+# assert deterministically which server handled each request.
+
+feature ignore_unknown_macro
+
+#REGTEST_TYPE=devel
+
+server s1 {
+    rxreq
+    txresp -hdr "x-handled-by: s1"
+} -repeat 10 -start
+
+server s2 {
+    rxreq
+    txresp -hdr "x-handled-by: s2"
+} -repeat 10 -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+        # dynamic use-server rule shared by every backend inheriting this
+        # defaults section; only the log-format form is allowed here
+        use-server "%[req.hdr(x-srv)]" if { req.hdr(x-srv) -m found }
+
+    frontend fe
+        bind "fd@${feS}"
+        default_backend be
+
+    backend be
+        # s2 is a backup so that requests without an x-srv header (which fall
+        # through the use-server rule to load balancing) deterministically hit s1
+        server s1 ${s1_addr}:${s1_port}
+        server s2 ${s2_addr}:${s2_port} backup
+} -start
+
+# explicit dynamic selection of s2 through the inherited defaults rule
+client c1 -connect ${h1_feS_sock} {
+    txreq -hdr "x-srv: s2"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.x-handled-by == "s2"
+} -run
+
+# explicit dynamic selection of s1 through the inherited defaults rule
+client c2 -connect ${h1_feS_sock} {
+    txreq -hdr "x-srv: s1"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.x-handled-by == "s1"
+} -run
+
+# no x-srv header: the rule's condition is false, so we fall back to load
+# balancing and reach the primary server s1
+client c3 -connect ${h1_feS_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+    expect resp.http.x-handled-by == "s1"
+} -run
+
+# a static (non log-format) server name cannot be resolved in a defaults
+# section and must be rejected at parse time
+haproxy h2 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+        use-server s1 if { always_true }
+
+    backend be
+        server s1 ${s1_addr}:${s1_port}
+} -start -expectexit 1
